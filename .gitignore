@@ -1,0 +1,10 @@
+node_modules/
+_v_*.js
+_v_*.html
+_n_*.js
+_n_*.html
+_a.js
+_a.html
+*.zip
+.DS_Store
+Thumbs.db

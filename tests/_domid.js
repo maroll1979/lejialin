@@ -1,0 +1,15 @@
+const fs=require('fs');
+const js=fs.readFileSync('app.js','utf8'), html=fs.readFileSync('index.html','utf8');
+const used=new Set(); let m;
+const re=/\$\('#([A-Za-z0-9_-]+)'\)/g;
+while((m=re.exec(js))) used.add(m[1]);
+const re2=/\$\$\('#([A-Za-z0-9_-]+)/g;
+while((m=re2.exec(js))) used.add(m[1]);
+const have=new Set();
+const re3=/id="([A-Za-z0-9_-]+)"/g;
+while((m=re3.exec(html))) have.add(m[1]);
+const dyn=new Set(['toast','abRetry']);
+const missing=[...used].filter(x=>!have.has(x)&&!dyn.has(x));
+const unused=[...have].filter(x=>!used.has(x));
+console.log('MISSING:', missing.join(', ')||'(none)');
+console.log('UNUSED :', unused.join(', ')||'(none)');
