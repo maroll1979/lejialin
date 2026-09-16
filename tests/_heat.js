@@ -247,6 +247,24 @@ console.log('\n[7] Coinglass 接口解析（mock）');
   ok(/if \(lw > 0\) \{ hctx\.fillStyle = 'rgba\(18,161,80,\.72\)'/.test(src), '右侧分布条：多头（右）为绿色');
   ok(/绿色＝多头筹码/.test(src) && /红色＝空头筹码/.test(src), '热力图说明文案与配色一致');
 
+  /* 推算链路不能被说成真实爆仓位置：命名、假设披露、偏差说明三处都要守住。 */
+  console.log('[10] 潜在清算区模型的命名与假设披露');
+  ok(/const HEAT_MODEL = \{/.test(src), '存在统一的模型说明常量');
+  ok(/nameFull: '基于成交量与杠杆假设的潜在清算区模型'/.test(src), '模型全名含「成交量与杠杆假设」');
+  ok(/'K 线成交量'/.test(src) && /'假设杠杆分布'/.test(src) && /'形成密集区'/.test(src),
+    '披露完整推算链路：成交量 → 拆多空 → 假设杠杆 → 清算位 → 密集区');
+  const cvKeys = ['成交量 ≠ 未平仓量', '收盘位置推不出真实开仓方向', '多空比是账户数比例',
+    '杠杆档随图表跨度自适应', '清算公式是简化的'];
+  cvKeys.forEach(k => ok(src.includes(`t: '${k}'`), `列出假设：${k}`));
+  ok(/维持保证金/.test(src), '说明清算公式未含维持保证金等真实条件');
+  ok(/globalLongShortAccountRatio|账户数/.test(src), '说明多空比口径是账户数而非金额');
+  ok(/'历史爆仓记录 · CoinGlass'/.test(src), '真实链路标签为「历史爆仓记录」');
+  ok(/'潜在清算区模型 · Binance 成交校准'/.test(src), '半推算链路标签为「潜在清算区模型」');
+  ok(/'潜在清算区模型 · 仅 K 线推算'/.test(src), '纯推算链路标签为「潜在清算区模型」');
+  ok(!/'供应商模型|'自建估算/.test(src), '不再使用「供应商模型 / 自建估算」标签');
+  ok(/h\.model = h\.grade === 'real' \? null/.test(src), '真实清算记录不挂模型假设说明');
+  ok(/function renderHeatModel/.test(src), '存在模型假设面板渲染函数');
+
   console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);
   process.exit(fail ? 1 : 0);
 })();

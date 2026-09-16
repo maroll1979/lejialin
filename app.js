@@ -271,6 +271,7 @@ const S = {
   kvEnd: null,       // K 线可视右端索引，null = 贴住最新；向左拖可回看历史
   drag: null,        // 平移中的拖拽状态
 };
+if (typeof window !== 'undefined') window.MB_STATE = S;   // 端到端测试访问状态
 
 /* ============================ 行情聚合 ============================ */
 // 确定性伪随机：保证“参考报价”稳定，不随刷新闪烁
@@ -350,7 +351,8 @@ async function loadQuotes(symId) {
   S.quotes[symId] = {
     rows, refRows, median, hi, lo, spread, spreadPct, realCount, basePx,
     funding, fundingCount: fr.length,
-    ts: now() - t0,
+    ts: now(),             // 数据更新时间戳（用于判断过期）
+    dur: now() - t0,       // 本次请求耗时（毫秒）
     // 价差阈值判定必须显式判空：spreadPct 为 null 时 `null >= 0.10` 是 false，语义正确但容易被误读
     hit: spreadPct != null && spreadPct >= 0.10,
     price: mid ? mid.price : median,
@@ -521,6 +523,22 @@ function aggBars(bars, stepMs, minCount) {
   });
   return out;
 }
+/* P0-1：检测 K 线序列时间空洞。返回值 { gaps:[], maxGapMs, ok }，
+ * 用于界面提示「数据不连续」，也是自动交易禁止开仓的辅助依据。 */
+function klineGaps(bars, stepMs) {
+  if (!Array.isArray(bars) || bars.length < 2 || !(stepMs > 0)) return { gaps: [], maxGapMs: 0, ok: true };
+  const sorted = bars.slice().sort((a, b) => a.t - b.t);
+  const gaps = [];
+  let maxGapMs = 0;
+  for (let i = 1; i < sorted.length; i++) {
+    const g = sorted[i].t - sorted[i - 1].t;
+    if (g > stepMs * 1.5) {           // 允许 50% 的容差（交易所偶发缺失一根）
+      gaps.push({ from: sorted[i - 1].t, to: sorted[i].t, missing: Math.round(g / stepMs) - 1 });
+      if (g > maxGapMs) maxGapMs = g;
+    }
+  }
+  return { gaps, maxGapMs, ok: gaps.length === 0 };
+}
 /* ===== KBAR-MERGE-END ===== */
 
 /* K 线加载：只接受交易所真实返回。
@@ -551,10 +569,12 @@ async function loadKlines(symId, tfKey) {
   if (cached && cached.bars.length && cached.real === data.real) {
     cached.bars = mergeBars(cached.bars, data.bars, KBAR_CAP);
     cached.src = data.src;
+    cached.ts = now();                  // P2-1：记录取数时刻，界面要显示「这是几点的数据」
     cached.stale = false; cached.staleSince = 0;
     return cached;
   }
   data.stale = false; data.staleSince = 0;
+  data.ts = now();
   data.bars = mergeBars([], data.bars, KBAR_CAP);
   S.klines[symId][tfKey] = data;
   return data;
@@ -872,6 +892,72 @@ function kdjFeat(bars) {
  * 目的就是让「一张热力图单独定方向」在结构上不可能成立。 */
 const FUSE_W = { liq: 34, st: 22, macd: 16, obv: 14, boll: 14, kdj: 12 };
 
+/* ---- 因子同源分组：多个指标一致 ≠ 多份独立证据 ----
+ * 结构 / MACD / BOLL / KDJ 四个算法读的都是同一条 OHLC 收盘价序列，四个同向只能说明
+ * 「同一份数据被四种算法读出了同一个方向」，不构成互相验证。把它们放在同一个同源组里，
+ * 组内相关系数 ρ 是经验取值（不是统计估计）：ρ 越大，组内第 2、3、4 个同向因子
+ * 能补进来的独立信息越少。n 个同组因子折算后的「有效独立证据数」= (1-(1-ρ)^n)/ρ：
+ *   px 组 ρ=0.7 → 1 个 1.00 · 2 个 1.30 · 3 个 1.39 · 4 个 1.42（第四个几乎不增加信息）
+ * OBV 吃的是成交量（vol 组），清算流动性来自热力图（flow 组），与 px 组不同源。 */
+const FUSE_GROUP = { st: 'px', macd: 'px', boll: 'px', kdj: 'px', obv: 'vol', liq: 'flow' };
+const FUSE_RHO = { px: 0.7, vol: 0.2, flow: 0.15 };
+const FUSE_INDEP_FULL = 2.2;   // 拿到满额一致性加成所需的有效独立证据份数
+const FUSE_MIN_INDEP = 1.35;   // 低于此视为证据不足：只靠 1~2 个价格同源因子不给方向
+
+/* 有效独立证据数：先按同源组归类，组内按 ρ 折减后求和。 */
+function fuseIndep(items) {
+  const g = Object.create(null);
+  for (let i = 0; i < items.length; i++) {
+    const k = FUSE_GROUP[items[i].k] || 'other';
+    (g[k] || (g[k] = [])).push(items[i]);
+  }
+  let n = 0;
+  for (const k in g) {
+    const r = FUSE_RHO[k] == null ? 0.3 : FUSE_RHO[k];
+    const c = g[k].length;
+    n += r > 0 ? (1 - Math.pow(1 - r, c)) / r : c;
+  }
+  return n;
+}
+
+/* 「一致度」= 参与评分的因子里同方向因子所占的比例。它衡量的是证据的一致性，
+ * 不是胜率、也不是未来盈利概率。 */
+const CONF_NOTE = '因子一致度 = 参与评分的因子中同方向因子的占比，衡量证据一致性；'
+  + '它不是胜率，也不代表未来盈利概率 —— MACD / KDJ / BOLL / 结构同源，同向不等于互相独立验证。';
+const INDEP_NOTE = '有效独立证据：按同源分组折算后的证据份数（结构 / MACD / BOLL / KDJ 同源，'
+  + '四个同向只折算成约 1.4 份，不是 4 份；OBV 用成交量、清算用热力图，各算独立来源）。'
+  + '合成分的一致性加成按独立口径给：同源因子堆得再多也拿不到满额加成，'
+  + '有效独立证据不足 1.35 份时不给方向。';
+
+/* 扫单倾向分级。mmView 里的这个分值是「基础值＋密集区强度×系数＋距离×系数＋技术强度×系数」
+ * 拼出来的固定公式，没有任何历史样本校准。把它显示成「80%」会被读成
+ * 「十次有八次会扫」—— 那不是这个数的含义。这里保留分值用于排序，对外只给高 / 中 / 低三档。 */
+function sweepTendency(score) {
+  const p = clamp(score == null ? 0 : score, 0, 1);
+  if (p >= 0.62) return { level: 'high', txt: '高', cls: 'up', score: p };
+  if (p >= 0.45) return { level: 'mid', txt: '中', cls: 'flat', score: p };
+  return { level: 'low', txt: '低', cls: 'down', score: p };
+}
+const SWEEP_TENDENCY_NOTE = '「扫单倾向」是模型的相对评分（越高越像扫单结构），'
+  + '未经历史样本校准，不是概率、更不代表胜率。';
+
+/* 扫单分值的校准状态。
+ * 上面的分值是固定系数拼出来的，系数本身没有经过历史样本拟合，所以 0.62 / 0.45 这两个
+ * 分档阈值也只是「相对强弱」的切分，不代表「倾向高 = 62% 会扫」。
+ * 因此：calibrated 为 false 时，界面一律走 sweepTendency 的高 / 中 / 低，
+ * 任何地方都不许把这个分值渲染成百分比。等样本外验证（回放 / 实盘累计）凑够
+ * minSample 笔扫单样本、统计出每个档位实际被扫中的频率后，才允许切成概率显示。 */
+const SWEEP_CALIB = { calibrated: false, sample: 0, minSample: 200, byLevel: null };
+/* 唯一的扫单对外展示入口：未校准 → 只给档位；已校准 → 才给百分比。 */
+function sweepLabel(score) {
+  const t = sweepTendency(score);
+  const c = SWEEP_CALIB;
+  if (c.calibrated && c.sample >= c.minSample && c.byLevel && c.byLevel[t.level] != null) {
+    return Object.assign({}, t, { txt: Math.round(c.byLevel[t.level] * 100) + '%', calib: true });
+  }
+  return Object.assign({}, t, { calib: false });
+}
+
 function fuseSignal(symId, tfKey, bars) {
   const st = structFeat(bars), mc = macdFeat(bars), ob = obvFeat(bars), bl = bollFeat(bars), kd = kdjFeat(bars);
   const heat = (S.heats[symId] || {})[tfKey] || null;
@@ -900,7 +986,9 @@ function fuseSignal(symId, tfKey, bars) {
 
   /* 清算流动性只做「路径修正」，不参与定方向：
    * 与技术面同向 → 放大至多 32%；反向 → 削弱至多 32%。
-   * 这是乘性修正，永远改不了 base 的符号 —— 所以「一张清算热力图定方向」在结构上不可能。 */
+   * 这是乘性修正，永远改不了 base 的符号 —— 所以「一张清算热力图定方向」在结构上不可能。
+   * 另注：除 CoinGlass / AiCoin 真实清算记录外，这里的「清算带」来自潜在清算区模型
+   * （成交量 + 杠杆假设），是模型认为可能有流动性的价格带，不是真实未平仓强平价。 */
   const liqS = L ? clamp(L.score / 100, -1, 1) : null;
   let liqAdj = 0;
   if (liqS != null) liqAdj = (liqS * techS >= 0 ? 1 : -1) * 0.32 * Math.abs(liqS);
@@ -911,24 +999,43 @@ function fuseSignal(symId, tfKey, bars) {
   });
 
   // 一致性：只有明确表态（|s|>0.15）的因子参与，避免一堆 0 把置信度刷高
-  const act = (liqS != null ? f.concat([{ s: liqS }]) : f).filter(x => Math.abs(x.s) > 0.15);
-  const conf = act.length ? act.filter(x => (x.s > 0) === (raw > 0)).length / act.length : 0;
-  let sc = clamp(raw * (0.62 + 0.38 * conf), -100, 100);
+  const act = (liqS != null ? f.concat([{ k: 'liq', s: liqS }]) : f).filter(x => Math.abs(x.s) > 0.15);
+  const agree = act.filter(x => (x.s > 0) === (raw > 0));
+  const conf = act.length ? agree.length / act.length : 0;      // 原始一致度（占比口径，保留展示）
+
+  /* 独立口径一致度：先把表态因子按同源组折算成「有效独立证据数」再算占比。
+   * 结构 / MACD / BOLL / KDJ 四个同向 → 折算后只有 1.42 份证据，不是 4 份。
+   * 于是「四个价格指标同向、量能与流动性都反着」时，原始一致度是 80%，
+   * 独立口径只有 1.42/(1.42+1) ≈ 59% —— 同源的多数票不再能压过不同源的反对票。 */
+  const nEffAll = fuseIndep(act);
+  const nEff = fuseIndep(agree);
+  const confInd = nEffAll > 0 ? nEff / nEffAll : 0;
+
+  /* 加成还要看「独立证据的深度」：只有价格同源四因子同向（≈1.42 份）、
+   * 没有量能或流动性佐证时拿不到满额加成（1.42/2.2 ≈ 0.65 折）。
+   * 这是同源折减真正起作用的地方 —— 光堆同源指标，合成分涨不上去。 */
+  const indepDepth = clamp(nEff / FUSE_INDEP_FULL, 0, 1);
+  const confMult = 0.6 + 0.4 * confInd * indepDepth;
+  let sc = clamp(raw * confMult, -100, 100);
   let dir = sc > 15 ? 'long' : sc < -15 ? 'short' : 'wait';
   let weak = false;
-  if (act.length < 2 && dir !== 'wait') { dir = 'wait'; weak = true; }
+  /* 证据门槛也换成独立口径：只有 1~2 个价格同源因子表态（≤1.30 份）不给方向。
+   * 之前是「表态因子 ≥2 个」，等于承认「MACD + KDJ 同向」算两份证据 —— 那是同一份数据。 */
+  if (nEffAll < FUSE_MIN_INDEP && dir !== 'wait') { dir = 'wait'; weak = true; }
 
   const wd = (v, n) => (v > 0.15 ? '偏多' : v < -0.15 ? '偏空' : '中性') + `(${fmt(v * 100, 0)})`;
   const reasons = [
-    `技术面基准 ${Math.round(base)}（一致度 ${Math.round(conf * 100)}%）· ` +
-      contrib.filter(x => x.k !== 'liq').map(x => `${x.name} ${wd(x.s)}`).join(' · ') +
+    `技术面基准 ${Math.round(base)}（因子一致度 ${Math.round(conf * 100)}% → 独立口径 ${Math.round(confInd * 100)}%，`
+      + `有效独立证据 ${fmt(nEff, 2)}/${act.length} 份，非胜率）· `
+      + contrib.filter(x => x.k !== 'liq').map(x => `${x.name} ${wd(x.s)}`).join(' · ') +
       (liqS != null
         ? `；清算流动性 ${wd(liqS)}${liqAdj < 0 ? '（与技术面反向，合成分下调 ' : '（与技术面同向，合成分上调 '}${Math.abs(liqAdj * 100).toFixed(0)}%）`
         : '；无清算数据，方向完全由技术面给出'),
     ...(L ? L.reasons : []),
   ];
   return {
-    dir, score: sc, strength: Math.abs(sc), raw, conf, weak, base, techS, liqS, liqAdj,
+    dir, score: sc, strength: Math.abs(sc), raw, conf, confInd, nEff, nEffAll, confMult, indepDepth,
+    weak, base, techS, liqS, liqAdj,
     liq: L, heat, st, mc, ob, bl, kd, contrib, factors: f, reasons,
     px: bars[bars.length - 1].c,
     hasHeat: !!heat, grade: heat ? heat.grade : 'none', src: heat ? heat.label : '无清算数据',
@@ -1010,11 +1117,14 @@ function mmView(symId, tfKey, bars, F0) {
     if (ref) {
       const p = z ? z.mid : m.p;
       const dist = Math.abs(p / px - 1) * 100;
-      // 越近、越强、技术面越坚决 → 扫单概率越高
+      // 越近、越强、技术面越坚决 → 扫单倾向评分越高。
+      // 注意：这只是模型的相对评分（无历史样本校准，0.30~0.92 的上下限也只是为了排序时不至于
+      // 出现极端值），界面只展示成 高/中/低 三档，不显示百分比 —— 免得被读成
+      // 「十次有八次会扫」的胜率。字段名也刻意不叫 prob，避免以后被直接当概率渲染。
       const v = z ? Math.max(z.v, z.mass) : m.v;
-      const prob = clamp(0.32 + v * 0.34 + (1 - clamp(dist / 3, 0, 1)) * 0.2 + Math.abs(tech) * 0.16, 0.3, 0.92);
+      const score = clamp(0.32 + v * 0.34 + (1 - clamp(dist / 3, 0, 1)) * 0.2 + Math.abs(tech) * 0.16, 0.3, 0.92);
       sweep = {
-        side: wantUp ? 'up' : 'down', p, v, dpct: dist, prob,
+        side: wantUp ? 'up' : 'down', p, v, dpct: dist, score, tendency: sweepTendency(score),
         lo: z ? z.lo : p - a * 0.25, hi: z ? z.hi : p + a * 0.25,
         atrW: z ? z.atrW : 0.5, mass: z ? z.mass : v, zone: z,
       };
@@ -1061,8 +1171,9 @@ function mmView(symId, tfKey, bars, F0) {
   const bands = [
     sweep ? {
       kind: 'sweep', lo: sweep.lo, hi: sweep.hi, mid: sweep.p, v: sweep.v, mass: sweep.mass,
-      atrW: sweep.atrW, dpct: sgn(sweep.p), side: sweep.side, prob: sweep.prob,
-      why: `先扫${sweep.side === 'up' ? '上方空单' : '下方多单'}止损拿对手盘，再掉头${bias === 'long' ? '做多' : '做空'}（概率 ${Math.round(sweep.prob * 100)}%）`,
+      atrW: sweep.atrW, dpct: sgn(sweep.p), side: sweep.side, score: sweep.score,
+      tendency: sweepTendency(sweep.score),
+      why: `先扫${sweep.side === 'up' ? '上方空单' : '下方多单'}止损拿对手盘，再掉头${bias === 'long' ? '做多' : '做空'}（扫单倾向 ${sweepTendency(sweep.score).txt}）`,
     } : null,
     targetBand, failBand, entryBand,
   ].filter(Boolean);
@@ -1090,6 +1201,7 @@ function mmView(symId, tfKey, bars, F0) {
     zones: Z, zUp, zDn, bands,
     targetBand, failBand, entryBand, atr: a,
     conf: Math.round(F.conf * 100),
+    confInd: Math.round(F.confInd * 100), nEff: F.nEff, nEffAll: F.nEffAll,
   };
 }
 
@@ -1100,11 +1212,18 @@ function mmView(symId, tfKey, bars, F0) {
  *   止盈①= 顺方向第一清算带的近端（流动性被吃穿的位置，最容易成交）
  *   止盈②= 该带远端再上浮 0.35 ATR；若还有更远的同侧带，取更远那条的带心
  * 全部价位最后统一做一次单调性收敛：做多必须 sl < entry.lo ≤ entry.hi < tp1 < tp2，
- * 做空全部反向。否则会出现「止损比止盈还远」这种荒谬结果。 */
-function mmTrade(symId, tfKey, bars, F0) {
+ * 做空全部反向。否则会出现「止损比止盈还远」这种荒谬结果。
+ *
+ * forceBias：四周期融合决策调用时传入。总决策的方向可能与本周期自己的结论不同，
+ * 此时价位必须按总方向重算（bands 也按总方向取），否则会出现
+ * 「总决策做空、止损却放在多头结构上方」的错位。强制方向时本周期的 sweep 剧本不再适用，
+ * 直接置空 —— 那套「先扫再掉头」的前提就是本周期自己的流动性背离。 */
+function mmTrade(symId, tfKey, bars, F0, forceBias) {
   const M = mmView(symId, tfKey, bars, F0);
   const s = SYMS[symId], dp = s.dp, px = M.px, a = M.atr;
-  const bias = M.bias;
+  const bias = forceBias || M.bias;
+  const forced = !!forceBias && forceBias !== M.bias;
+  if (forced) { M.sweep = null; M.mode = forceBias === 'wait' ? 'stand' : 'follow'; }
 
   const eb = M.entryBand;
   const ebOK = eb && isFinite(eb.lo) && isFinite(eb.hi) && eb.hi > eb.lo;
@@ -1168,6 +1287,7 @@ function mmTrade(symId, tfKey, bars, F0) {
 
   return {
     bias, mode: M.mode, px, atr: a, dp, conf: M.conf, score: M.F.score,
+    confInd: M.confInd, nEff: M.nEff, nEffAll: M.nEffAll,
     entry: { lo: entryLo, hi: entryHi, mid: entryMid },
     sl, tp1, tp2, rr, riskPct, posPct,
     slWhy, tp1Why, tp2Why,
@@ -1256,6 +1376,275 @@ function analyzeOf(sym, tf, bars) {
   return _anCache.get(key);
 }
 
+/* ===================== 四周期融合决策（唯一总决策） =====================
+ * 之前四个周期各算各的：顶部「做市商结论」跟随当前选中的周期，模拟盘则用设置里的
+ * 单个周期（默认 1h）。于是会出现「15 分钟做多、4 小时做空，模拟盘却照着 1 小时开多」
+ * 这种自相矛盾的结果 —— 四周期只被展示，没有被融合。
+ *
+ * 这里把四层做成一条必须逐层通过的流水线，任何一层不过就没有总决策：
+ *   4h  趋势层 —— 定方向：只允许顺 4h 趋势做；4h 无方向则整体观望
+ *   1h  机会层 —— 定位置：1h 必须与 4h 同向且合成分够强，不同向就是噪音不是机会
+ *   30m 回调层 —— 定时机：追在 30m 极值上不算回调，等回撤进结构内再谈进场
+ *   15m 触发层 —— 定发令：15m 同向才扣扳机；15m 处于扫单模式则等扫单收回
+ *
+ * 输出只有一份：mtfDecision().bias。页面顶部结论与模拟盘开仓都只认它，
+ * 不再各自读一个周期的结论。
+ *
+ * 关于「一致度」：它是参与评分的因子里同方向因子的占比，不是胜率。
+ * 关于扫单评分：下面的固定公式没有历史样本校准，因此界面只展示成
+ * 「扫单倾向 高 / 中 / 低」，不再显示百分比 —— 见 sweepTendency()。
+ * 四层一致度同样不是胜率：4h / 1h / 30m / 15m 是同一份成交数据的不同聚合，
+ * 四层同向说明「这段行情在各尺度上方向一致」，不构成四份独立验证 —— 见 MTF_CONF_NOTE。
+ */
+
+/* 四层一致度的口径说明：权重按层给（趋势层最高），但四层读的是同一标的不同聚合周期的
+ * K 线 —— 4h 里就含着 1h、30m、15m 的成交，所以四层同向只是「各尺度方向一致」，
+ * 不是四份相互独立的证据，更不是胜率。 */
+const MTF_CONF_NOTE = '四层一致度 = 通过层的加权一致性，衡量 4h / 1h / 30m / 15m 四层是否同向；'
+  + '它不是胜率，也不代表未来盈利概率 —— 四层是同一份成交数据的不同聚合，同源，'
+  + '四层同向不等于四份独立验证。';
+
+/* ===== MTF-PIPE-START =====
+ * 纯计算段：不碰 DOM、不碰网络，输入是各周期已算好的 view，单测直接吃这一段。 */
+const MTF_TFS = ['4h', '1h', '30m', '15m'];
+const MTF_TREND_TF = '4h';         // 趋势层
+const MTF_SETUP_TF = '1h';         // 机会层
+const MTF_PULL_TF = '30m';         // 回调层
+const MTF_TRIG_TF = '15m';         // 触发层
+const MTF_MIN_BARS = 40;
+const MTF_SETUP_MIN_SCORE = 20;    // 机会层：1h 合成分门槛（低于此视为噪音）
+const MTF_PB_SHALLOW = 0.12;       // 回撤浅于此 = 追高 / 追低，等回调
+const MTF_PB_DEEP = 0.82;          // 回撤深于此 = 已到结构另一端，需 15m 强确认
+
+const MTF_LABEL = { '15m': '15 分钟', '30m': '30 分钟', '1h': '1 小时', '4h': '4 小时' };
+
+/* 扫单倾向分级见 07-fusion.js 的 sweepTendency() —— 放在那里是因为概率值由 mmView 产出，
+ * 而多因子段的单元测试只抽取到融合段为止，依赖必须就地可得。 */
+
+/* 回调层：判断当前是「回撤到位」还是「追在极值上」。
+ * 以最近 look 根的摆动区间为标尺：做多看从高点回落多少，做空看从低点反弹多少。
+ * 回撤 < 12% → 贴着极值，进场就是追；回撤 > 82% → 已经跌/涨到区间另一端，
+ * 那不是回调而是转势，必须让 15m 给出更强的确认。 */
+function mtfPullback(bars, bias, look) {
+  const n = bars.length;
+  const k = Math.min(look || 48, n);
+  const seg = bars.slice(n - k);
+  let hi = -Infinity, lo = Infinity;
+  for (const b of seg) { if (b.h > hi) hi = b.h; if (b.l < lo) lo = b.l; }
+  const px = bars[n - 1].c;
+  const span = hi - lo;
+  if (!(span > 0)) return { state: 'ok', retrace: 0, hi, lo, px, span: 0, bars: k };
+  const raw = bias === 'long' ? (hi - px) / span : (px - lo) / span;
+  const retrace = clamp(raw, 0, 1);
+  const state = retrace < MTF_PB_SHALLOW ? 'extension' : retrace > MTF_PB_DEEP ? 'deep' : 'ok';
+  return { state, retrace, hi, lo, px, span, bars: k };
+}
+
+/* 流水线本体。V 的形状：
+ *   { '4h': {bias,mode,score,conf,px,atr,ok}, '1h': {...}, '30m': {...}, '15m': {...} }
+ * 每一层都只接收上一层的结论，任何一层否决就立即返回，不再往下走。 */
+function mtfPipeline(V, opt) {
+  const o = opt || {};
+  const minScore = o.minScore == null ? MTF_SETUP_MIN_SCORE : o.minScore;
+  const V4 = V[MTF_TREND_TF], V1 = V[MTF_SETUP_TF], V30 = V[MTF_PULL_TF], V15 = V[MTF_TRIG_TF];
+  const L = MTF_LABEL;
+  const missing = [];
+  const layers = {};
+  const reasons = [];
+
+  const done = (ok, bias, stage, extra) => Object.assign({
+    ok, bias, stage, trendDir: layers.trend ? layers.trend.bias : null,
+    mode: (V15 && V15.mode) || (V1 && V1.mode) || 'stand',
+    conf: ok ? mtfConf(layers) : 0,
+    missing, degraded: missing.length > 0, layers, reasons,
+  }, extra || {});
+
+  /* ---- 第 1 层：4h 定趋势 ---- */
+  if (!V4) {
+    missing.push(MTF_TREND_TF);
+    reasons.push(`缺少 ${L[MTF_TREND_TF]} 数据，无法定趋势 —— 不给结论`);
+    return done(false, 'wait', 'none');
+  }
+  if (V4.bias !== 'long' && V4.bias !== 'short') {
+    layers.trend = { tf: MTF_TREND_TF, bias: 'wait', pass: false, view: V4 };
+    reasons.push(`${L[MTF_TREND_TF]}趋势层为观望（合成分 ${Math.round(V4.score || 0)}）—— 趋势未确立，整体不做`);
+    return done(false, 'wait', 'none');
+  }
+  layers.trend = {
+    tf: MTF_TREND_TF, bias: V4.bias, pass: true, mode: V4.mode,
+    score: V4.score, conf: V4.conf, px: V4.px,
+  };
+  const dir = V4.bias;
+  const dirTxt = dir === 'long' ? '做多' : '做空';
+  reasons.push(`${L[MTF_TREND_TF]}趋势层判定方向：${dirTxt}（${V4.mode === 'sweep' ? '处于扫单结构，取扫完后要去的方向' : V4.mode === 'follow' ? '顺势' : '因子分歧'}，合成分 ${Math.round(V4.score || 0)}）`);
+
+  /* ---- 第 2 层：1h 筛选机会 ---- */
+  if (!V1) {
+    missing.push(MTF_SETUP_TF);
+    reasons.push(`缺少 ${L[MTF_SETUP_TF]} 数据，无法筛选机会 —— 不给结论`);
+    return done(false, 'wait', 'none');
+  }
+  if (V1.bias !== dir) {
+    layers.setup = { tf: MTF_SETUP_TF, bias: V1.bias, pass: false, score: V1.score, view: V1 };
+    reasons.push(`${L[MTF_SETUP_TF]}机会层方向为${V1.bias === 'long' ? '做多' : V1.bias === 'short' ? '做空' : '观望'}，`
+      + `与 ${L[MTF_TREND_TF]}趋势（${dirTxt}）${V1.bias === 'wait' ? '不一致（无明确方向）' : '相反'} —— 不是机会，本档不做`);
+    return done(false, 'wait', 'trend');
+  }
+  if (Math.abs(V1.score || 0) < minScore) {
+    layers.setup = { tf: MTF_SETUP_TF, bias: V1.bias, pass: false, score: V1.score, view: V1 };
+    reasons.push(`${L[MTF_SETUP_TF]}机会层合成分 ${Math.round(V1.score || 0)}，低于门槛 ${minScore} —— 方向对但力度不够`);
+    return done(false, 'wait', 'trend');
+  }
+  layers.setup = { tf: MTF_SETUP_TF, bias: V1.bias, pass: true, mode: V1.mode, score: V1.score, conf: V1.conf, px: V1.px };
+  reasons.push(`${L[MTF_SETUP_TF]}机会层确认：方向一致，合成分 ${Math.round(V1.score || 0)}（${V1.mode === 'sweep' ? '扫单结构' : V1.mode === 'follow' ? '顺势' : '观望'}）`);
+
+  /* ---- 第 3 层：30m 观察回调 ---- */
+  if (!V30) {
+    missing.push(MTF_PULL_TF);
+    reasons.push(`缺少 ${L[MTF_PULL_TF]} 数据，回调层降级为通过（结论可信度下降）`);
+    layers.pullback = { tf: MTF_PULL_TF, pass: true, state: 'n/a', degraded: true };
+  } else {
+    const pb = V30.pull || mtfPullback(V30.bars, dir);
+    layers.pullback = { tf: MTF_PULL_TF, pass: pb.state !== 'extension', state: pb.state, retrace: pb.retrace, hi: pb.hi, lo: pb.lo, px: pb.px };
+    const pct = Math.round((pb.retrace || 0) * 100);
+    if (pb.state === 'extension') {
+      reasons.push(`${L[MTF_PULL_TF]}回调层：${dir === 'long' ? '价格仍贴着区间高点' : '价格仍贴着区间低点'}（回撤仅 ${pct}%）—— 这是追价不是回调，等回撤进结构再进`);
+      return done(false, 'wait', 'setup');
+    }
+    if (pb.state === 'deep') {
+      reasons.push(`${L[MTF_PULL_TF]}回调层：回撤已达 ${pct}%，接近区间${dir === 'long' ? '下' : '上'}沿 —— 更像是转势而非回调，需要 ${L[MTF_TRIG_TF]}给出强确认`);
+    } else {
+      reasons.push(`${L[MTF_PULL_TF]}回调层：回撤 ${pct}%，处于结构内的合理回调区`);
+    }
+  }
+
+  /* ---- 第 4 层：15m 触发进场 ---- */
+  if (!V15) {
+    missing.push(MTF_TRIG_TF);
+    reasons.push(`缺少 ${L[MTF_TRIG_TF]} 数据，无法确认触发 —— 本档不发令`);
+    return done(false, 'wait', 'pullback');
+  }
+  const deep = layers.pullback && layers.pullback.state === 'deep';
+  const needStrong = deep || (V15.bias === dir && Math.abs(V15.score || 0) >= minScore);
+  if (V15.bias !== dir) {
+    layers.trigger = { tf: MTF_TRIG_TF, bias: V15.bias, pass: false, score: V15.score, view: V15 };
+    reasons.push(`${L[MTF_TRIG_TF]}触发层方向为${V15.bias === 'long' ? '做多' : V15.bias === 'short' ? '做空' : '观望'}，`
+      + `与总方向（${dirTxt}）不一致 —— 不发令`);
+    return done(false, 'wait', 'pullback');
+  }
+  if (deep && Math.abs(V15.score || 0) < minScore * 1.5) {
+    layers.trigger = { tf: MTF_TRIG_TF, bias: V15.bias, pass: false, score: V15.score, view: V15 };
+    reasons.push(`${L[MTF_TRIG_TF]}触发层力度 ${Math.round(V15.score || 0)} 不足以确认深回调（需 ≥ ${Math.round(minScore * 1.5)}）—— 不发令`);
+    return done(false, 'wait', 'pullback');
+  }
+  layers.trigger = { tf: MTF_TRIG_TF, bias: V15.bias, pass: true, mode: V15.mode, score: V15.score, conf: V15.conf, px: V15.px };
+  reasons.push(`${L[MTF_TRIG_TF]}触发层发令：方向一致，合成分 ${Math.round(V15.score || 0)}，`
+    + (V15.mode === 'sweep' ? '但处于扫单结构，需价格进入扫单带收回后才进场' : '可直接进场'));
+
+  return done(true, dir, 'trigger', {
+    need: V15.mode === 'sweep' ? 'sweep' : null,
+    sweep: (V15.mm && V15.mm.sweep) ? {
+      lo: Math.min(V15.mm.sweep.lo, V15.mm.sweep.hi),
+      hi: Math.max(V15.mm.sweep.lo, V15.mm.sweep.hi),
+      p: V15.mm.sweep.p, dp: V15.dp, score: V15.mm.sweep.score,
+    } : null,
+    strong: !!needStrong,
+  });
+}
+
+/* 总可信度：四层里通过的层各占一份权重，趋势层权重最高。
+ * 它是「四层一致性」的度量，不是胜率 —— 界面上必须这么标注。 */
+function mtfConf(layers) {
+  const w = [['trend', 0.4], ['setup', 0.3], ['pullback', 0.1], ['trigger', 0.2]];
+  let s = 0, sum = 0;
+  for (const [k, wt] of w) {
+    const l = layers[k];
+    if (!l) continue;
+    sum += wt;
+    if (l.pass) s += wt * (0.55 + 0.45 * clamp((l.conf != null ? l.conf : 60) / 100, 0, 1));
+  }
+  return sum > 0 ? Math.round(clamp(s / sum, 0, 1) * 100) : 0;
+}
+/* ===== MTF-PIPE-END ===== */
+
+/* 取某一周期已算好的结论视图。数据不足返回 null（调用方据此判断缺失）。 */
+function mtfViewOf(sym, tf) {
+  const d = (S.klines[sym] || {})[tf];
+  if (!d || !d.bars || d.bars.length < MTF_MIN_BARS) return null;
+  const T = mmTradeOf(sym, tf, d.bars);
+  return {
+    tf, bars: d.bars, ok: true,
+    bias: T.bias, mode: T.mode, score: T.score, conf: T.conf,
+    atr: T.atr, px: T.px, dp: T.dp, sl: T.sl, tp1: T.tp1, tp2: T.tp2,
+    mm: T.mm, T,
+  };
+}
+
+/* 唯一的总决策入口。页面顶部结论与模拟盘开仓都调它。
+ * 四个周期各算一次 mmTrade 不便宜，按「各周期最后一根 K 线」做键缓存 5 秒，
+ * 避免 renderMtf / renderMM / 模拟盘在同一次刷新里重复算四遍。 */
+let _mtfCache = { key: '', at: 0, val: null };
+function mtfDecision(sym) {
+  const ds = MTF_TFS.map(tf => (S.klines[sym] || {})[tf]);
+  const key = sym + '|' + ds.map(d => (d && d.bars && d.bars.length)
+    ? d.bars.length + ':' + d.bars[d.bars.length - 1].t : 'x').join(',');
+  const t = now();
+  if (_mtfCache.key === key && t - _mtfCache.at < 5000) return _mtfCache.val;
+  const V = {};
+  for (const tf of MTF_TFS) {
+    const v = mtfViewOf(sym, tf);
+    if (v) V[tf] = v;
+  }
+  const val = mtfPipeline(V);
+  _mtfCache.key = key; _mtfCache.at = t; _mtfCache.val = val;
+  return val;
+}
+
+/* 总决策 + 可执行价位。价位取自「执行周期」（默认 1h）：
+ * 15m 的 ATR 太窄、4h 太宽，1h 的结构风险距离最适合当止损基准。
+ * 关键：方向强制为总决策的方向 —— 执行周期自己若是反的，价位必须按总方向重算，
+ * 否则就会出现「总决策做空、价位却是做多结构」的错位。 */
+function mtfPlan(sym, execTf) {
+  const dec = mtfDecision(sym);
+  const tf = execTf || MTF_SETUP_TF;
+  const d = (S.klines[sym] || {})[tf];
+  let plan = null;
+  if (d && d.bars && d.bars.length >= MTF_MIN_BARS) {
+    /* 总决策观望时也必须强制观望。否则价位会沿用本周期自己的方向，
+     * 又变成「顶部写观望、下面却给出一整套做多价位」的错位。 */
+    plan = mmTrade(sym, tf, d.bars, null,
+      (dec.bias === 'long' || dec.bias === 'short') ? dec.bias : 'wait');
+    /* 两个「一致度」不是一个东西，必须分开存，不能互相覆盖：
+     *   plan.conf    = 本周期五因子的因子一致度（mmTrade 已算好，保留原值）
+     *   plan.mtfConf = 四周期流水线的四层一致度（未通过时为 0 —— 那不是「0% 把握」，
+     *                   而是「四层没走完，谈不上一致」，界面要显示成「—」而不是 0%）
+     * 之前把 plan.conf 直接改成 dec.conf，结果观望时结论区出现「因子一致度 0%、
+     * 独立口径 71%」这种自相矛盾的显示。 */
+    plan.mtfConf = dec.conf;
+    plan.mtf = { stage: dec.stage, ok: dec.ok, need: dec.need, sweep: dec.sweep, conf: dec.conf };
+  }
+  return { dec, plan, tf, px: d && d.bars && d.bars.length ? d.bars[d.bars.length - 1].c : null };
+}
+
+/* 端到端测试访问（app.js 在严格模式下求值，内部函数不会自动挂到 window） */
+if (typeof window !== 'undefined') {
+  window.mtfPipeline = mtfPipeline;
+  window.mtfPullback = mtfPullback;
+  window.mtfDecision = mtfDecision;
+  window.mtfPlan = mtfPlan;
+  window.mtfViewOf = mtfViewOf;
+  window.sweepTendency = sweepTendency;
+}
+
+/* 一句话概括流水线状态，用于界面与单据标注。 */
+function mtfStageTxt(dec) {
+  if (!dec) return '—';
+  const map = {
+    none: '未通过趋势层', trend: '趋势通过 · 机会未过',
+    setup: '机会通过 · 等回调', pullback: '回调到位 · 等触发', trigger: '四层全通过',
+  };
+  return map[dec.stage] || '—';
+}
 /* ============================ K 线绘制 ============================ */
 const cv = $('#kline'), ctx = cv.getContext('2d');
 let view = null;
@@ -1677,6 +2066,32 @@ function renderQuote() {
   else { dot.className = 'dot err pulse'; txt.textContent = '无实时源 · 重试中'; }
   txt.title = relaySummary();
   if (NET.switches) txt.title += `\n\n已自动切换通道 ${NET.switches} 次`;
+  renderQuoteStamp();
+}
+
+/* P2-1：把「数据时间 + 来源」钉在价格正下方。
+ * 价格是决策依据，但不知道它是几点几分、来自哪几个交易所，这个价格本身就不可信 ——
+ * 之前只有顶栏一个「N 秒前」，看不出具体时刻，也看不出是直连还是转发。 */
+function renderQuoteStamp() {
+  const el = $('#qStamp');
+  if (!el) return;
+  const q = S.quotes[S.sym];
+  if (!q) { el.innerHTML = '<span class="mut">尚无报价</span>'; return; }
+  const age = Math.max(0, Math.round((now() - (q.ts || 0)) / 1000));
+  const abs = (q.ts ? new Date(q.ts) : new Date()).toLocaleTimeString('zh-CN', { hour12: false });
+  const via = NET.relay === 'direct' ? '直连' : '转发 · ' + NET.relayName;
+  const names = (q.rows || []).map(r => r.name).join(' / ') || '无';
+  const refNames = (q.refRows || []).map(r => r.name).join(' / ') || '无';
+  el.innerHTML = `数据时间 <b>${abs}</b>`
+    + ` · <span class="${age > 30 ? 'stale' : ''}">${age} 秒前</span>`
+    + ` · ${q.realCount} 源永续 · ${via}`;
+  el.title = [
+    `报价时间：${(q.ts ? new Date(q.ts) : new Date()).toLocaleString('zh-CN', { hour12: false })}`,
+    `参与价差对比（永续）：${names}`,
+    `仅作参考（现货 / 期货）：${refNames}`,
+    `取数耗时 ${q.dur || 0} ms · 通道：${via}`,
+    age > 30 ? '⚠ 报价超过 30 秒未更新' : '',
+  ].filter(Boolean).join('\n');
 }
 
 function renderVenues() {
@@ -1751,7 +2166,9 @@ function renderSignals() {
     const dirTxt = a.dir === 'long' ? '做多' : a.dir === 'short' ? '做空' : '观望';
     const dirCls = a.dir === 'long' ? 'up' : a.dir === 'short' ? 'down' : 'flat';
     const barW = clamp(a.strength, 0, 100);
-    const gTag = L ? (a.grade === 'real' ? 'CoinGlass 真实' : a.grade === 'semi' ? '合约推算' : '模型估算')
+    /* 分级标签：只有 CoinGlass / AiCoin 的真实清算记录才配叫「历史爆仓」，
+     * 其余两条链路都是「潜在清算区模型」—— 用词上不许让人误以为是真实爆仓位置。 */
+    const gTag = L ? (a.grade === 'real' ? '历史爆仓记录' : '潜在清算区模型')
                    : '无清算数据';
     const gCls = L ? (a.grade === 'real' ? 'g-real' : a.grade === 'semi' ? 'g-semi' : 'g-est') : 'g-est';
 
@@ -1806,7 +2223,9 @@ function renderSignals() {
       </div>
       <div class="sig-rows">${rows}</div>
       ${fz}
-      <div class="sig-act">${act}<br><span class="mut">五因子合成 ${Math.round(a.score)} · 一致度 ${Math.round((FZ ? FZ.conf : 0) * 100)}% · 建议仓位 ≤ 保证金的 ${Math.round(a.posPct)}%</span></div>
+      <div class="sig-act">${act}<br><span class="mut" title="${CONF_NOTE} ${INDEP_NOTE}">五因子合成 ${Math.round(a.score)} · 因子一致度 ${Math.round((FZ ? FZ.conf : 0) * 100)}%（非胜率）`
+        + (FZ ? ` · 独立口径 ${Math.round(FZ.confInd * 100)}% · 有效独立证据 ${fmt(FZ.nEff, 2)} 份` : '')
+        + ` · 建议仓位 ≤ 保证金的 ${Math.round(a.posPct)}%</span></div>
     </div>`;
   }).join('');
 }
@@ -1820,7 +2239,7 @@ function mmThesis(el, s) {
     const dirW = el.bias === 'long' ? '做多' : '做空';
     return `流动性偏向<b>${sw}</b>：${sw} <b>${fmt(el.sweep.p, dp)}</b> 有强度 ${Math.round(el.sweep.v * 100)}% 的${kind}清算带（距现价 ${fmt(el.sweep.dpct, 2)}%），`
       + `但结构 / 动能 / 量能指向<b>${el.tech > 0 ? '上行' : '下行'}</b>。做市商更可能先<b>向${up ? '上' : '下'}扫</b>掉这批止损拿够对手盘再掉头 —— `
-      + `判定为<b>扫单后反转（Judas）</b>，不是趋势延续。最终偏向 <b>${dirW}</b>，扫单发生概率约 <b>${Math.round(el.sweep.prob * 100)}%</b>。`;
+      + `判定为<b>扫单后反转（Judas）</b>，不是趋势延续。最终偏向 <b>${dirW}</b>，扫单倾向 <b>${sweepLabel(el.sweep.score).txt}</b>（模型相对评分，未经样本校准，不是概率）。`;
   }
   if (el.mode === 'follow') {
     const side = el.bias === 'long' ? '上方' : el.bias === 'short' ? '下方' : '';
@@ -1932,7 +2351,7 @@ function renderZones(el, s) {
     </div>`;
   };
   const ops = [
-    opCard(el.bands.find(b => b.kind === 'sweep'), el.sweep ? `先扫区间 · 概率 ${Math.round(el.sweep.prob * 100)}%` : '先扫区间', 'o-sweep'),
+    opCard(el.bands.find(b => b.kind === 'sweep'), el.sweep ? `先扫区间 · 倾向${sweepLabel(el.sweep.score).txt}` : '先扫区间', 'o-sweep'),
     opCard(el.bands.find(b => b.kind === 'target'), '目标区间', 'o-target'),
     opCard(el.bands.find(b => b.kind === 'fail'), '失效区间', 'o-fail'),
     opCard(el.bands.find(b => b.kind === 'entry'), '挂单区间', 'o-entry'),
@@ -1955,27 +2374,34 @@ function renderZones(el, s) {
   </div>`;
 }
 
-/* 报价条里的「做市商方向」：把做市商结论提到最显眼的位置，一眼看到结论再往下看理由。 */
+/* 报价条里的「做市商方向」：把做市商结论提到最显眼的位置，一眼看到结论再往下看理由。
+ * 方向取自四周期融合决策（不是当前选中的周期），价位仍按选中周期的结构给出。 */
 function renderDirCell() {
   const d = S.klines[S.sym]?.[S.tf];
   const elCell = $('#qDir'), sub = $('#qDirSub'), tfEl = $('#qDirTf');
   if (!elCell) return;
-  if (tfEl) tfEl.textContent = (TF_MAP[S.tf] || {}).label || S.tf;
+  if (tfEl) tfEl.textContent = '四周期融合 · 价位按 ' + ((TF_MAP[S.tf] || {}).label || S.tf);
   if (!d || !d.bars.length) { elCell.textContent = '—'; elCell.className = 'q-v'; sub.textContent = 'K 线加载中…'; return; }
-  const el = mmView(S.sym, S.tf, d.bars);
+  const dec = mtfDecision(S.sym);
+  const mtf = mtfPlan(S.sym, S.tf);
+  const el = (mtf.plan && mtf.plan.mm) || mmView(S.sym, S.tf, d.bars);
   const s = SYMS[S.sym];
-  const txt = el.bias === 'long' ? '做多' : el.bias === 'short' ? '做空' : '观望';
-  const cls = el.bias === 'long' ? 'up' : el.bias === 'short' ? 'down' : 'flat';
+  const bias = dec.bias;
+  const txt = bias === 'long' ? '做多' : bias === 'short' ? '做空' : '观望';
+  const cls = bias === 'long' ? 'up' : bias === 'short' ? 'down' : 'flat';
   elCell.textContent = txt;
   elCell.className = 'q-v ' + cls;
 
-  const modeW = el.mode === 'sweep' ? '扫单后反转' : el.mode === 'follow' ? '顺势' : '观望';
+  const modeW = !dec.ok ? '四层未通过'
+    : dec.need === 'sweep' ? '等扫单收回' : el.mode === 'sweep' ? '扫单后反转' : el.mode === 'follow' ? '顺势' : '观望';
   const b = el.bands.find(x => x.kind === 'target');
-  const tail = el.mode === 'sweep' && el.sweep
-    ? `先扫${el.sweep.side === 'up' ? '上' : '下'} ${fmt(el.sweep.lo, s.dp)}–${fmt(el.sweep.hi, s.dp)}，再${txt}`
-    : b ? `目标 ${fmt(b.lo, s.dp)}–${fmt(b.hi, s.dp)}` : '无明确目标带';
+  const tail = !dec.ok
+    ? (dec.reasons[dec.reasons.length - 1] || '多周期未达成一致')
+    : el.mode === 'sweep' && el.sweep
+      ? `先扫${el.sweep.side === 'up' ? '上' : '下'} ${fmt(el.sweep.lo, s.dp)}–${fmt(el.sweep.hi, s.dp)}，再${txt}`
+      : b ? `目标 ${fmt(b.lo, s.dp)}–${fmt(b.hi, s.dp)}` : '无明确目标带';
   sub.innerHTML = `${modeW} · ${tail}`;
-  sub.title = `${modeW}｜一致度 ${el.conf}%｜${tail}`;
+  sub.title = `${modeW}｜四层一致度 ${dec.conf}%（非胜率，四层同源）｜${tail}\n${dec.reasons.join('\n')}\n${MTF_CONF_NOTE}`;
 }
 
 /* ---- 结论区：一句话方向 + 四个可执行价位 ----
@@ -1993,7 +2419,7 @@ function renderVerdict(el, T, s) {
   const sub = [];
   if (el.trap) sub.push(`<b style="color:var(--warn)">陷阱</b>：${el.trap.why}`);
   if (el.mode === 'sweep' && el.sweep)
-    sub.push(`先扫${el.sweep.side === 'up' ? '上方' : '下方'} ${fmt(el.sweep.lo, dp)}–${fmt(el.sweep.hi, dp)}（概率 ${Math.round(el.sweep.prob * 100)}%），扫完再${biasTxt}。`);
+    sub.push(`先扫${el.sweep.side === 'up' ? '上方' : '下方'} ${fmt(el.sweep.lo, dp)}–${fmt(el.sweep.hi, dp)}（扫单倾向${sweepLabel(el.sweep.score).txt}），扫完再${biasTxt}。`);
   if (!F_hasHeat(el)) sub.push('本周期无清算数据，价位由 ATR 与结构推导，精度低于有清算带时。');
   sub.push(`依据：结构 ${Math.round(el.F.st.s * 100)} · MACD ${Math.round(el.F.mc.s * 100)} · OBV ${Math.round(el.F.ob.s * 100)} · BOLL ${Math.round(el.F.bl.s * 100)} · KDJ ${Math.round(el.F.kd.s * 100)}。`);
 
@@ -2004,8 +2430,10 @@ function renderVerdict(el, T, s) {
        <div class="vd-s">${sub.join(' ')}</div>
      </div>
      <div class="vd-meta">
-       <div><span>一致度</span><b>${T.conf}%</b></div>
-       <div><span>合成分</span><b>${T.score >= 0 ? '+' : ''}${Math.round(T.score)}</b></div>
+       <div title="${CONF_NOTE} ${INDEP_NOTE}"><span>因子一致度</span><b>${T.conf}%</b>
+         <u class="vd-sub">独立口径 ${T.confInd == null ? '—' : T.confInd + '%'} · 证据 ${fmt(T.nEff == null ? 0 : T.nEff, 2)} 份</u></div>
+       <div title="合成分 = 原始合成分（技术五因子加权分，再经清算因子最多 ±32% 的乘性修正）× 一致性加成；加成按有效独立证据折算，详见因子一致度说明"><span>合成分</span><b>${T.score >= 0 ? '+' : ''}${Math.round(T.score)}</b>
+         <u class="vd-sub">原始 ${Math.round(el.F.raw)} × ${fmt(el.F.confMult, 2)}</u></div>
        <div><span>现价</span><b>${fmt(T.px, dp)}</b></div>
      </div>`;
 
@@ -2041,6 +2469,60 @@ function renderVerdict(el, T, s) {
 }
 function F_hasHeat(el) { return !!(el && el.F && el.F.hasHeat); }
 
+/* ============================ 渲染：四周期融合决策（唯一总决策） ============================
+ * 四个周期之前只是并排展示，结论却是各读各的 —— 顶部跟随选中周期、模拟盘跟随设置周期，
+ * 于是「15m 做多 / 4h 做空」的行情里模拟盘仍照着 1h 开多。
+ * 这里把流水线画出来：4h 定趋势 → 1h 筛选机会 → 30m 观察回调 → 15m 触发进场，
+ * 任何一层不过就整体观望。顶部结论的价位、模拟盘的开仓，都只认这一个结论。 */
+const MTF_STEPS = [
+  { tf: '4h', key: 'trend', n: 1, role: '趋势层', duty: '定方向' },
+  { tf: '1h', key: 'setup', n: 2, role: '机会层', duty: '定位置' },
+  { tf: '30m', key: 'pullback', n: 3, role: '回调层', duty: '定时机' },
+  { tf: '15m', key: 'trigger', n: 4, role: '触发层', duty: '定发令' },
+];
+function renderMtf() {
+  const box = $('#mtfBox');
+  if (!box) return null;
+  const dec = mtfDecision(S.sym);
+  const dirTxt = dec.bias === 'long' ? '做多' : dec.bias === 'short' ? '做空' : '观望';
+  const dirCls = dec.bias === 'long' ? 'up' : dec.bias === 'short' ? 'down' : 'flat';
+  const nPass = MTF_STEPS.filter(x => dec.layers[x.key] && dec.layers[x.key].pass).length;
+
+  const steps = MTF_STEPS.map(x => {
+    const L = dec.layers[x.key];
+    const st = !L ? 'nodata' : L.pass ? 'pass' : 'fail';
+    let val = '—', sub = '';
+    if (L) {
+      if (x.key === 'pullback') {
+        val = L.state === 'ok' ? '回调到位' : L.state === 'extension' ? '追价中' : L.state === 'deep' ? '回撤过深' : '无数据';
+        sub = L.retrace != null ? `回撤 ${Math.round(L.retrace * 100)}%` : '';
+      } else {
+        val = L.bias === 'long' ? '做多' : L.bias === 'short' ? '做空' : '观望';
+        sub = L.score != null ? `合成分 ${Math.round(L.score)}` : '';
+      }
+    }
+    return `<div class="mtf-step ${st}">
+      <div class="mtf-n">${x.n}</div>
+      <div class="mtf-b"><span>${MTF_LABEL[x.tf]}</span><b>${x.role} · ${x.duty}</b></div>
+      <div class="mtf-v ${st === 'pass' ? dirCls : ''}">${val}</div>
+      <div class="mtf-s">${sub || (st === 'nodata' ? '数据未就绪' : st === 'fail' ? '未通过' : '')}</div>
+    </div>`;
+  }).join('<i class="mtf-arrow">›</i>');
+
+  const why = dec.reasons.map(r => `<li>${r}</li>`).join('');
+  box.innerHTML = `
+    <div class="mtf-hd">
+      <span class="mtf-t">四周期融合决策</span>
+      <span class="mtf-badge ${dirCls}">${dirTxt}</span>
+      <span class="mut" style="font-size:11px">四层流水线 · 通过 ${nPass}/4 · ${mtfStageTxt(dec)}</span>
+      <span class="mtf-conf" title="${MTF_CONF_NOTE}">四层一致度 ${dec.ok ? dec.conf + '%' : '—'}（非胜率 · 四层同源）</span>
+      ${dec.degraded ? '<span class="atag skip">降级：缺 ' + dec.missing.map(t => MTF_LABEL[t]).join('/') + '</span>' : ''}
+    </div>
+    <div class="mtf-pipe">${steps}</div>
+    <ul class="mtf-why">${why}</ul>`;
+  return dec;
+}
+
 function renderMM() {
   const d = S.klines[S.sym]?.[S.tf];
   const s = SYMS[S.sym];
@@ -2059,11 +2541,15 @@ function renderMM() {
     if (rrb) rrb.innerHTML = '';
     return;
   }
-  const el = mmView(S.sym, S.tf, d.bars);
+  /* 方向一律取自四周期融合决策；价位按当前选中的周期给（15m 的 ATR 太窄、4h 太宽，
+   * 用选中周期的结构风险距离当止损基准最合适）。mmTrade 的 forceBias 保证二者不会打架。 */
+  const dec = renderMtf();
+  const mtf = mtfPlan(S.sym, S.tf);
+  const el = (mtf.plan && mtf.plan.mm) || mmView(S.sym, S.tf, d.bars);
   const F = el.F;
-  const T = mmTrade(S.sym, S.tf, d.bars, F);
+  const T = mtf.plan || mmTrade(S.sym, S.tf, d.bars, F);
   S.trade = T;                              // 供「套用结论价」按钮与下单面板复用
-  src.textContent = `技术面定方向 · 清算图定路径 · ${TF_MAP[S.tf].label} · ${F.hasHeat ? F.src : '无清算数据'}`;
+  src.textContent = `方向＝四周期融合 · 价位＝${TF_MAP[S.tf].label}结构 · ${F.hasHeat ? F.src : '无清算数据'}`;
   src.className = 'src ' + (F.hasHeat && F.grade === 'real' ? 'real' : 'syn');
   ts.textContent = '更新 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
 
@@ -2075,7 +2561,7 @@ function renderMM() {
   $('#mmHd').innerHTML =
     `<span class="mm-mode ${el.mode}">${modeTxt}</span>` +
     `<span class="mm-bias ${biasCls}">${biasTxt}</span>` +
-    `<span class="mm-sub">一致度 ${el.conf}% · 合成 ${Math.round(F.score)} · 现价 ${fmt(el.px, s.dp)}</span>`;
+    `<span class="mm-sub" title="${CONF_NOTE} ${INDEP_NOTE}">因子一致度 ${el.conf}%（非胜率） · 独立口径 ${el.confInd}% · 有效独立证据 ${fmt(el.nEff, 2)} 份 · 合成 ${Math.round(F.score)} · 现价 ${fmt(el.px, s.dp)}</span>`;
 
   renderVerdict(el, T, s);                  // 结论 + 四个可执行价位（本页重点）
 
@@ -2133,10 +2619,12 @@ function renderMM() {
     <div class="v">${L ? `上方 ${fmt(L.upPct, 1)}% / 下方 ${fmt(L.dnPct, 1)}%` : '本周期无清算数据'}</div>
     <div class="v mut" style="font-size:10.5px;margin-top:4px">${L && L.magUp ? `上带 ${fmt(L.magUp.p, s.dp)}（${fmt(L.magUp.dpct, 2)}%）` : '上带 —'}${L && L.magDn ? ` · 下带 ${fmt(L.magDn.p, s.dp)}（${fmt(L.magDn.dpct, 2)}%）` : ' · 下带 —'}</div>
   </div>`;
+  const sw = el.sweep ? sweepLabel(el.sweep.score) : null;
   const swCard = `<div class="mm-c">
-    <div class="k"><span>扫单目标</span><em>${el.sweep ? Math.round(el.sweep.prob * 100) + '%' : '—'}</em></div>
+    <div class="k" title="${SWEEP_TENDENCY_NOTE}"><span>扫单倾向${sw && !sw.calib ? '<i class="mut" style="font-style:normal;opacity:.65">未校准</i>' : ''}</span><em class="${sw ? sw.cls : ''}">${sw ? sw.txt : '—'}</em></div>
     <div class="v">${el.sweep ? `${el.sweep.side === 'up' ? '先扫上方' : '先扫下方'} <b>${fmt(el.sweep.p, s.dp)}</b>` : (el.mode === 'follow' ? '与结构同向，无需扫单' : '未定位到扫单位')}</div>
     <div class="v mut" style="font-size:10.5px;margin-top:4px">${el.sweep ? `${el.sweep.side === 'up' ? '空单' : '多单'}清算带 · 强度 ${Math.round(el.sweep.v * 100)}% · 距现价 ${fmt(el.sweep.dpct, 2)}%` : '做市商需流动性才推得动价格'}</div>
+    <div class="v mut" style="font-size:10px;margin-top:4px;color:var(--tx-3)">${SWEEP_TENDENCY_NOTE}</div>
   </div>`;
   const structCard = `<div class="mm-c">
     <div class="k"><span>K 线结构</span><em>${F.st.trend === 'up' ? '上升' : F.st.trend === 'down' ? '下降' : F.st.trend === 'expand' ? '扩张' : F.st.trend === 'contract' ? '收敛' : '震荡'}</em></div>
@@ -2148,7 +2636,14 @@ function renderMM() {
   renderZones(el, s);                     // 价格带区间（做市商板块内的核心输出）
   $('#mmPlan').innerHTML = mmThesis(el, s) + '<br>' + mmPlan(el, s);
   $('#mmNote').innerHTML = '「扫单后反转」指做市商/主力为获取对手盘，先把价格推向止损密集的一侧，成交后再掉头 —— 表现为假突破。'
-    + '该结论由清算热力图、K 线结构、MACD、OBV、BOLL 五项共同给出，<b>任一因子都不能单独定方向</b>。不构成投资建议。';
+    + '该结论由清算热力图、K 线结构、MACD、OBV、BOLL 五项共同给出，<b>任一因子都不能单独定方向</b>。'
+    + '<br><b>方向来自四层流水线</b>：4h 定趋势 → 1h 筛选机会 → 30m 观察回调 → 15m 触发进场，'
+    + '任何一层不过就整体观望；本卡片的价位按当前选中周期的结构给出，方向则强制与总决策一致。'
+    + `<br>${CONF_NOTE}`
+    + `<br>${INDEP_NOTE}`
+    + `<br>${MTF_CONF_NOTE}`
+    + `<br>${SWEEP_TENDENCY_NOTE}`
+    + '不构成投资建议。';
 }
 
 /* ============================ AiCoin · 1 小时多空爆单（建仓前提示） ============================ */
@@ -2202,7 +2697,7 @@ async function fetchAicoinLiq(symId) {
   let tot24 = num(d.liq24h);
   if (tot24 == null || tot24 < (lg24 + sh24) * 0.98) tot24 = lg24 + sh24;
   return {
-    coinKey, ts: now(), grade: 'real', src: 'AiCoin · 真实爆仓统计',
+    coinKey, ts: now(), grade: 'real', src: '历史爆仓 · AiCoin',
     long1h: lg || 0, short1h: sh || 0, tot1h: tot || 0,
     long24h: lg24, short24h: sh24, tot24h: tot24,
     maxLiq: num(d.maxLiq), maxMarket: d.maxLiqMarket || d.liq24HMaxMarket || '',
@@ -2233,7 +2728,7 @@ function acFallback(symId) {
   const tot = p.upRaw + p.dnRaw;
   if (!(tot > 0)) return null;
   return {
-    ts: now(), grade: 'semi', src: '清算热力图推算 · 非真实爆仓额', ratioOnly: true,
+    ts: now(), grade: 'semi', src: '潜在清算区模型 · 热力图推算', ratioOnly: true,
     short1h: p.upRaw, long1h: p.dnRaw, tot1h: tot,      // 上方=空单清算，下方=多单清算
   };
 }
@@ -2355,6 +2850,9 @@ function renderEntry() {
   const srcEl = $('#entSrc');
   srcEl.textContent = a.src;
   srcEl.className = 'src ' + (a.grade === 'real' ? 'real' : a.grade === 'semi' ? 'syn' : '');
+  srcEl.title = a.grade === 'real' ? '历史爆仓：交易所/数据商真实清算记录'
+    : a.grade === 'semi' ? '潜在清算区模型：由 K 线成交量 + 杠杆假设推算，非真实爆仓数据'
+    : '数据不足';
   $('#entTs').textContent = a.ok ? new Date(a.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
 
   $('#entHd').innerHTML = a.ok
@@ -2368,9 +2866,10 @@ function renderEntry() {
     $('#entBar').innerHTML = ''; $('#entBl').innerHTML = '';
     $('#entStats').innerHTML = ''; $('#entItems').innerHTML = '';
     $('#entNote').innerHTML =
-      '爆仓「量」取自 AiCoin 开放 API <b>/v2/mix/liq</b>（1 小时多空分项爆仓额），' +
-      '爆仓「价」取自本页 1 小时筹码清算热力图的关键带，两者在下方分别标注来源。' +
-      '点右上角「配置 AiCoin」填入密钥后取真实数据；未配置时退化为热力图推算（只显示占比、不显示金额）。' +
+      '「历史爆仓」量取自 AiCoin 开放 API <b>/v2/mix/liq</b>（1 小时多空分项真实爆仓额）。' +
+      '未配置 AiCoin 时退化为「潜在清算区模型」：由 K 线成交量按杠杆假设推算多空占比，不显示真实金额。' +
+      '爆仓「价」取自本页 1 小时清算热力图关键带 —— 那也是模型推算的潜在清算区，不是真实爆仓位置。' +
+      '两种来源（历史爆仓记录 / 潜在清算区模型）在界面中分别标注，不会混淆。' +
       '以上仅为风险提示，不构成投资建议。';
     return;
   }
@@ -2395,10 +2894,12 @@ function renderEntry() {
   ).join('');
 
   $('#entNote').innerHTML = a.ratioOnly
-    ? '当前比例由 <b>1 小时清算热力图</b> 推算，<b>不是真实爆仓金额</b>；爆仓价位同样来自热力图关键带。' +
-      '点「配置 AiCoin」填入密钥后可取真实的 1 小时多空爆仓额。仅为风险提示，不构成投资建议。'
-    : `爆仓「量」：<b>AiCoin 开放 API /v2/mix/liq</b>${a.coinKey ? `（币种 ${a.coinKey}）` : ''}，1 小时多空分项真实统计；` +
-      '爆仓「价」：本页 <b>1 小时筹码清算热力图</b> 的关键带（该接口不返回逐笔爆仓价格）。' +
+    ? '当前为 <b>潜在清算区模型</b>：由 1 小时清算热力图（成交量 + 杠杆假设）推算多空爆仓占比，<b>不是真实爆仓金额</b>；' +
+      '爆仓价位同样来自热力图关键带，即模型认为的潜在清算区，而非市场真实爆仓位置。' +
+      '点「配置 AiCoin」填入密钥后可切换为「历史爆仓」真实数据。仅为风险提示，不构成投资建议。'
+    : '当前为 <b>历史爆仓</b>：' +
+      `爆仓「量」取自 <b>AiCoin 开放 API /v2/mix/liq</b>${a.coinKey ? `（币种 ${a.coinKey}）` : ''}，1 小时多空分项真实统计；` +
+      '爆仓「价」取自本页 <b>1 小时清算热力图</b> 关键带（该接口不返回逐笔爆仓价格）。' +
       'AiCoin 免费档 15 次/分钟、2 万次/月，本页已按 60 秒缓存。仅为风险提示，不构成投资建议。';
 }
 
@@ -2426,12 +2927,37 @@ function bindEntry() {
 }
 
 /* ============================ 多空筹码热力图 ============================ */
-// 三条数据链路（界面显式标注来源，绝不把估算伪装成真实清算数据）：
-//   1) Coinglass —— 真实清算记录，需自备 API Key + CORS 代理
-//   2) Binance 合约 —— 真实 K 线成交量分布 + 真实多空持仓比/主动买卖比，按杠杆推算清算密集区
-//   3) 本地估算 —— K 线不可用时用合成序列，标注「非真实」
+/* 这条数据链路有两类完全不同的东西，界面必须分开标注，绝不能把推算结果说成真实爆仓位置：
+ *   1) 历史爆仓记录 —— CoinGlass / AiCoin 的真实清算记录（需自备 API Key + CORS 代理）
+ *   2) 潜在清算区模型 —— 由已成交 K 线 + 杠杆假设反推「可能」的清算密集区。
+ *      它回答的是「若这些筹码仍在场内、且使用这些杠杆，强平价大概落在哪」，
+ *      **不是**交易所真实未平仓合约的强平价分布。
+ */
 let CG_KEY   = localStorage.getItem('mb_cgkey') || '';
 let HEAT_MODE= localStorage.getItem('mb_heatsrc') || 'auto';
+
+/* 推算链路与关键假设 —— 页面「模型假设」面板直接读这里，改模型时只改一处。
+ * 每一条都是**假设**，不是事实；写出来的目的是让人知道这张图能信到什么程度。 */
+const HEAT_MODEL = {
+  name: '潜在清算区模型',
+  nameFull: '基于成交量与杠杆假设的潜在清算区模型',
+  chain: [
+    'K 线成交量',
+    '按收盘位置（CLV）拆分多空',
+    '假设杠杆分布',
+    '推算清算位置',
+    '形成密集区',
+  ],
+  caveats: [
+    { t: '成交量 ≠ 未平仓量', d: '成交量是这段时间「换手了多少」，不是「还有多少仓位没平」。已平仓的筹码不该再有清算价，模型却一视同仁。' },
+    { t: '收盘位置推不出真实开仓方向', d: '用 CLV=(2C−H−L)/(H−L) 把一根 K 线的量拆成多空，只是几何近似；同一根 K 线里买卖双方实际成交了多少手，交易所不公开。' },
+    { t: '多空比是账户数比例', d: '币安 globalLongShortAccountRatio 统计的是「多少人做多」，不是「多少钱做多」。一个大户的仓位可以顶一万个散户，两者不能直接换算。' },
+    { t: '杠杆档随图表跨度自适应', d: '代码按图跨度反推可见杠杆档位，不是读取交易者真实杠杆。跨度变了，同一批筹码会被推到不同的清算位。' },
+    { t: '清算公式是简化的', d: '只用了「清算价 = 开仓价×(1∓1/杠杆)」，没有完整表达保证金率、维持保证金、逐仓/全仓、追加保证金等真实条件。' },
+  ],
+  verdict: '因此图上每个「清算区」都应读作「模型认为可能有流动性堆积的价格带」，'
+    + '而不是「市场真实的爆仓位置」。它可以作为位置参考，不能当作清算事实。',
+};
 const HEAT_LEV = [[10, .45], [25, .32], [50, .23]];   // 参考杠杆与权重（跨度未知时兜底）
 // 周期不同，关注的价格尺度不同：短周期看近处的高杠杆清算，长周期看更远的结构
 const TF_SPAN = { '15m': 0.020, '30m': 0.028, '1h': 0.040, '4h': 0.070 };
@@ -2924,7 +3450,7 @@ function buildHeatFromCG(list, px, minSpan) {
     ? Array.from({ length: nCol }, (_, j) => t0 + (t1 - t0) * (j + 0.5) / nCol)
     : [];
   return finishHeat({ grid, rows, pLo, pHi, step, px: mid, maxV, times,
-                      label: 'CoinGlass · 真实清算', grade: 'real', lsInfo: null });
+                      label: '历史爆仓记录 · CoinGlass', grade: 'real', lsInfo: null });
 }
 
 /* --- 汇总关键区间 --- */
@@ -2951,6 +3477,12 @@ function finishHeat(h) {
   h.shortPct = tot > 0 ? ts / tot * 100 : 50;
   h.netBias  = tot > 0 ? (tl - ts) / tot * 100 : 0;
   h.bandMax  = Math.max(bl.v, bs.v, 1);
+  /* 真实清算记录链路没有假设；推算链路一律挂上模型说明，
+   * 让界面任何一处引用这张图时都能顺手拿到「它是什么、哪里不可信」。 */
+  h.model = h.grade === 'real' ? null : Object.assign({}, HEAT_MODEL, {
+    levs: (h.levs && h.levs.length) ? h.levs : null,
+    calibrated: !!(h.lsInfo && h.lsInfo.ls > 0),
+  });
   return h;
 }
 
@@ -2983,7 +3515,7 @@ async function buildHeatFor(symId, tfKey, bars, px, minSpan) {
   if (HEAT_MODE !== 'local' && binSym(s) && bars.length >= 8) {
     const ls = await fetchBinanceLS(symId).catch(() => null);
     const hm = buildHeatFromBars(bars, px, ls,
-      ls ? 'Binance 合约 · 真实成交' : 'Binance K线 · 多空未校准',
+      ls ? '潜在清算区模型 · Binance 成交校准' : '潜在清算区模型 · Binance K线（无多空比校准）',
       ls ? 'semi' : 'est', span);
     if (hm) return hm;
   }
@@ -2992,7 +3524,7 @@ async function buildHeatFor(symId, tfKey, bars, px, minSpan) {
    * 旧版会用 mkBars 造 240 根假 K 线去推「本地估算」热力图 —— 那张图看着像筹码分布，
    * 实际是随机数画出来的，做市商结论却建立在它上面。宁可显示「无清算数据」。 */
   if (bars.length < 8) { S.heatErr = 'K 线数据不足，无法推算筹码分布'; return null; }
-  return buildHeatFromBars(bars, px, null, '本地估算 · 由真实K线推算', 'est', span);
+  return buildHeatFromBars(bars, px, null, '潜在清算区模型 · 仅 K 线推算', 'est', span);
 }
 
 /* --- 带缓存的按周期热力图：四格信号各自取一份，价格波动小于 0.08% 时复用 --- */
@@ -3262,6 +3794,7 @@ function renderHeatMeta() {
     const why = S.heatErr
       || (!(kd && kd.bars.length) ? `${(TF_MAP[S.tf] || {}).label || S.tf} 没有可用的真实 K 线` : '本周期清算数据不足');
     $('#heatNote').textContent = `${why} —— 页面不会用合成数据填充热力图。`;
+    renderHeatModel(null);
     drawHeat();                       // 擦掉上一个品种的热力图，避免留一张不属于当前品种的图
     return;
   }
@@ -3314,17 +3847,52 @@ function renderHeatMeta() {
   const ls = H.lsInfo;
   const levTxt = (H.levs && H.levs.length === 3) ? `${H.levs[0]}/${H.levs[1]}/${H.levs[2]} 倍` : '10/25/50 倍';
   const bits = [];
-  if (H.grade === 'real') bits.push('数据源：CoinGlass 真实清算记录（需自备 Key + 代理）。');
-  else if (H.grade === 'semi') bits.push(`数据源：Binance 合约真实 K 线成交量 + 真实多空持仓比，按 ${levTxt} 杠杆加权推算清算密集区（杠杆档随周期跨度自适应，落在图外的清算位不计入）。`);
-  else bits.push('数据源：本地估算，<b>非交易所真实清算数据</b>，仅用于展示算法形态。');
-  if (ls && ls.ls) bits.push(`币安全网多空持仓人数比 ${ls.ls.toFixed(2)}（已向 50% 收缩后校准，避免长期看空）。`);
+  if (H.grade === 'real') {
+    bits.push('数据来源：<b>历史爆仓记录 · CoinGlass</b> —— 真实发生的清算记录（需自备 Key + 代理），非模型推算。');
+  } else {
+    bits.push(`数据来源：<b>${HEAT_MODEL.nameFull}</b> —— `
+      + (H.grade === 'semi'
+        ? `由 Binance 合约真实 K 线成交量，按 ${levTxt} 杠杆假设反推的<b>潜在</b>清算密集区`
+        : '仅由当前品种真实 K 线成交量按杠杆假设反推')
+      + '。<b>它不是交易所真实未平仓合约的强平价分布</b>。');
+  }
+  if (ls && ls.ls) bits.push(`币安全网多空持仓人数比 ${ls.ls.toFixed(2)}（已向 50% 收缩后校准，避免长期看空）—— 注意这是<b>账户数</b>比例，不是持仓金额比例。`);
   if (S.heatErr) bits.push(`CoinGlass 未生效：${S.heatErr}`);
   if (!binSym(SYMS[S.sym])) bits.push('该品种无币安永续合约映射，无法获取合约多空数据，已按永续 K 线成交量估算。');
   $('#heatNote').innerHTML = bits.join(' ') +
     ' 热力图纵轴为价格、横轴为时间：<b>圆点越大表示该价区筹码越密集</b>（面积正比于密度），绿色＝多头筹码（下方为多单强平风险区），红色＝空头筹码（上方为空单强平风险区）；'
     + '虚线框为识别出的清算区间，框内标注<b>价格区间与强度百分比</b>，鼠标悬停可读出每一档的多空金额。' +
     `<br><b>四格方向的算法</b>：比较本图现价上方「空单清算池」与下方「多单清算池」的距离加权引力（±52）、最近且够厚的清算墙（±22）、趋势确认（±18）、资金费率拥挤（±12）；` +
-    '每个周期按自身跨度单独成图，短周期看近处高杠杆清算，长周期看更远结构。推算模型基于杠杆假设，与交易所实际清算存在偏差，不构成投资建议。';
+    '每个周期按自身跨度单独成图，短周期看近处高杠杆清算，长周期看更远结构。' +
+    (H.grade === 'real' ? '' : '<b>推算模型基于成交量与杠杆假设，与交易所实际清算存在偏差</b>，详见下方「模型假设与偏差」。') +
+    ' 不构成投资建议。';
+  renderHeatModel(H);
+}
+
+/* 模型假设面板：把推算链路和每一条假设摊开写清楚。
+ * 这张图最容易被误读成「市场真实的爆仓位置」，所以偏差说明必须和图形同屏可见，
+ * 而不是藏在文档里。 */
+function renderHeatModel(H) {
+  const box = $('#heatModel');
+  if (!box) return;
+  const M = H && H.model;
+  if (!M) {
+    box.innerHTML = '';
+    box.style.display = 'none';
+    return;
+  }
+  box.style.display = '';
+  const chain = M.chain.join(' → ');
+  box.innerHTML = `<details class="sub hmodel">
+      <summary>模型假设与偏差 · ${M.name}${M.calibrated ? '（已用多空比校准）' : '（未校准）'}</summary>
+      <div class="hm-chain">推算链路：<b>${chain}</b></div>
+      <div class="hm-cv">${M.caveats.map(c =>
+        `<div class="hm-row"><b>${c.t}</b><span>${c.d}</span></div>`).join('')}</div>
+      ${M.levs && M.levs.length === 3
+        ? `<div class="hm-lev">本图使用的杠杆档：<b>${M.levs[0]}× / ${M.levs[1]}× / ${M.levs[2]}×</b>（按图表跨度自适应，非交易者真实杠杆）</div>`
+        : ''}
+      <div class="hm-vd">${M.verdict}</div>
+    </details>`;
 }
 
 function renderHeatTabs() {
@@ -3366,7 +3934,8 @@ function renderOverview() {
     const cls = chg == null ? 'flat' : chg >= 0 ? 'up' : 'down';
     const modeTxt = mm ? (mm.mode === 'follow' ? '顺势' : mm.mode === 'sweep' ? '扫单后反转' : '观望') : '';
     const tip = mm
-      ? `${modeTxt} · 一致度 ${mm.conf}%\n` + mm.reasons.join('\n')
+      ? `${modeTxt} · 因子一致度 ${mm.conf}%（非胜率）· 独立口径 ${mm.confInd}% · 有效独立证据 ${fmt(mm.nEff, 2)} 份\n`
+        + mm.reasons.join('\n') + `\n${INDEP_NOTE}`
       : (a ? '五因子融合加载中…' : '1h 数据未就绪');
     return `<button class="ov-i ${showDir || 'wait'} ${s.id === S.sym ? 'on' : ''}" data-sym="${s.id}" title="${tip.replace(/"/g, '')}">
       <div class="ov-h"><b>${s.label}</b><span>${s.cn}</span>${mm && mm.mode !== 'follow' ? `<span class="ov-mode ${mm.mode}">${modeTxt}</span>` : ''}</div>
@@ -3396,14 +3965,32 @@ async function refreshOverview() {
 function renderChartHead() {
   const d = S.klines[S.sym]?.[S.tf];
   const el = $('#kSrc');
-  el.textContent = d ? (d.real ? `真实 K 线 · ${d.src}` : `合成 K 线 · ${d.src}`) : '—';
-  el.className = 'src ' + (d && d.real ? 'real' : 'syn');
-  renderLegend(d);
+  const tf = TF_MAP[S.tf];
+  const gap = d && d.bars ? klineGaps(d.bars, (tf ? tf.m : 60) * 60000) : { ok: true, gaps: [] };
+  let txt = d ? (d.real ? `真实 K 线 · ${d.src}` : `合成 K 线 · ${d.src}`) : '—';
+  if (d && !gap.ok) txt += ` · 缺失 ${gap.gaps.length} 段`;
+  /* P2-1：K 线来源后面直接跟取数时刻。stale 时显示的是「上一次成功取数」的时刻，
+   * 不是当前时刻 —— 否则界面上看起来数据是新的。 */
+  if (d && d.ts) txt += ` · ${new Date(d.ts).toLocaleTimeString('zh-CN', { hour12: false })}`;
+  el.textContent = txt;
+  el.className = 'src ' + (d && d.real ? (gap.ok ? 'real' : '') : 'syn');
+  if (!gap.ok) el.classList.add('warn');
+  if (d) {
+    const lastBar = d.bars && d.bars.length ? d.bars[d.bars.length - 1] : null;
+    el.title = [
+      `K 线来源：${d.src}`,
+      `取数时间：${d.ts ? new Date(d.ts).toLocaleString('zh-CN', { hour12: false }) : '—'}`,
+      lastBar ? `最后一根：${new Date(lastBar.t).toLocaleString('zh-CN', { hour12: false })}（${TF_MAP[S.tf].label}）` : '',
+      d.bars ? `共 ${d.bars.length} 根` : '',
+      d.stale ? '⚠ 本次刷新失败，沿用上一次成功拉取的真实数据' : '',
+    ].filter(Boolean).join('\n');
+  }
+  renderLegend(d, gap);
 }
 
 /* 图例由 JS 渲染：读数必须跟着最新一根 K 线走，写死在 HTML 里的静态图例会给出过期数字，
  * 而且加一个因子（KDJ）就要手工改一次 HTML —— 这里改成按指标数组自动出列。 */
-function renderLegend(d) {
+function renderLegend(d, gap) {
   const el = $('#legend');
   if (!el) return;
   const s = SYMS[S.sym], dp = s.dp;
@@ -3421,6 +4008,9 @@ function renderLegend(d) {
   const cross = KD.K[i - 1] != null && KD.D[i - 1] != null
     ? (KD.K[i - 1] <= KD.D[i - 1] && k > dd ? '金叉' : KD.K[i - 1] >= KD.D[i - 1] && k < dd ? '死叉' : '—')
     : '—';
+  const gapHtml = (gap && !gap.ok)
+    ? `<span class="lg" style="border-color:#f6cccc;background:#fff2f2;color:#8a2626" title="K 线时间序列存在空洞，指标与自动交易均可能失真">数据不连续 <b style="color:#8a2626">缺失 ${gap.gaps.length} 段</b></span>`
+    : '';
   el.innerHTML =
     `<span class="lg px">现价 <b class="${bars[i].c >= bars[i].o ? 'up' : 'down'}">${fmt(bars[i].c, dp)}</b></span>`
     + lg('BOLL', BL.up[i] != null ? `${fmt(BL.dn[i], dp)}/${fmt(BL.mid[i], dp)}/${fmt(BL.up[i], dp)}` : '—', CB_BOLL)
@@ -3433,6 +4023,7 @@ function renderLegend(d) {
     + `<span class="lg">RSI(14) <b>${fmt(F.rsi, 1)}</b></span>`
     + `<span class="lg">ATR <b>${fmt(F.atrPct, 2)}%</b></span>`
     + `<span class="lg">${TF_MAP[S.tf].label} <b>${bars.length} 根</b></span>`
+    + gapHtml
     + (d.stale ? `<span class="lg" style="border-color:#f6cccc;background:#fff2f2;color:#8a2626">已停止更新 <b style="color:#8a2626">${d.staleSince ? new Date(d.staleSince).toLocaleTimeString('zh-CN', { hour12: false }) : ''}</b></span>` : '');
 }
 
@@ -3943,8 +4534,13 @@ function renderRfAge() {
   if (!_lastOkT) { el.textContent = '尚未取到数据'; el.className = 'rf-age'; return; }
   const sec = Math.max(0, Math.round((now() - _lastOkT) / 1000));
   const txt = sec < 60 ? sec + ' 秒前' : sec < 3600 ? Math.floor(sec / 60) + ' 分前' : Math.floor(sec / 3600) + ' 小时前';
-  el.innerHTML = `数据 <b>${txt}</b>`;
+  /* P2-1：相对时间说不清「这一版数据是几点拉的」，补上绝对时刻。 */
+  const abs = new Date(_lastOkT).toLocaleTimeString('zh-CN', { hour12: false });
+  el.innerHTML = `数据 <b>${abs}</b> · ${txt}`;
   el.className = 'rf-age' + (sec > 90 ? ' stale' : '');
+  el.title = `本页最后一次成功取数：${new Date(_lastOkT).toLocaleString('zh-CN', { hour12: false })}\n`
+    + `通道：${NET.relay === 'direct' ? '直连' : '转发 · ' + NET.relayName}\n`
+    + `超过 90 秒未更新会变红，此时下单判断不可靠。`;
 }
 
 async function refreshQuotes() {                  // 轻量：只刷新多平台报价与估算，不碰 K 线
@@ -4042,9 +4638,14 @@ function bindRefresh() {
  *   2. 市价成交，每单保证金 1000 USDT，杠杆 10×（名义 10000）
  *   3. 止盈止损自动设置、到价即执行，不做任何二次确认
  *   4. 单据永不清除，按天列表，每单标注下单信号
- *   5. 24 小时按自然时间运作；页面重开时按网格补单（上限 48 单）
+ *   5. 24 小时按自然时间运作；浏览器关闭期间错过的档位不再补开新单，仅记为 skip
  *   6. 仅 ETH 参与，其余品种不动
  *   7. 盈亏比固定 1 : 1.5（TP1 / SL）
+ * 新增约束（P0 修复）：
+ *   · 数据过期 / K 线 stale / 网络取数失败时禁止产生新订单
+ *   · 不再按当前行情补记历史交易（catchup 只生成 skip 记录）
+ *   · 页面策略与执行条件对齐：sweep（扫单后反转）模式真实等待扫单收回，
+ *     价格进入扫单带才触发反向开仓，未触发则该档 skip
  * 底线：不接任何交易所 API，不产生真实成交；拿不到真实价或真实 K 线时不下单（不编造价格）。
  */
 
@@ -4053,8 +4654,148 @@ function bindRefresh() {
 const AUTO_FEE = 0.0005;        // 单边 taker 费率 0.05%，开平各一次
 const AUTO_IV_DEF = 30;         // 默认间隔（分钟）
 const AUTO_CATCH_CAP = 48;      // 补单上限：断线一天最多补 48 单，重开页面不会刷出上百条
+const AUTO_SLIP_BPS = 1;        // 除买卖价差外的额外冲击成本（1 bp）
+const AUTO_FUND_MS = 8 * 3600 * 1000;   // 资金费每 8 小时结算一次（UTC 0 / 8 / 16 点）
+const AUTO_MMR = 0.005;         // 维持保证金率 0.5%（逐仓）：权益跌到名义的 0.5% 即被强平
 
 function autoR2(p) { return Math.round(p * 100) / 100; }
+
+/* ---- 强平价：杠杆越高，强平线离入场价越近，可能比止损还近 ----
+ * 之前完全没有强平这一层，于是高杠杆下「止损还没到、仓位早该被打掉」的单子
+ * 会被记成一笔正常止损，亏损额也只算到止损位 —— 实际上那时本金已经没了。
+ * 逐仓强平：亏损把保证金吃到只剩维持保证金时触发，
+ *   多：liq = entry × (1 − 1/杠杆 + 维持率)　空：liq = entry × (1 + 1/杠杆 − 维持率)
+ * 10 倍时强平在 −9.5%，止损通常只有 −1%，止损先触发；125 倍时强平在 −0.3%，比止损更近，
+ * 这时先被强平。出场判定统一走 autoExitHit()：谁离入场价更近谁先触发。 */
+function autoLiqPx(o) {
+  if (!(o && o.entry > 0) || !(o.lev > 0)) return 0;
+  const k = 1 / o.lev - AUTO_MMR;
+  if (!(k > 0)) return 0;                       // 杠杆高到维持率都兜不住：开仓即强平，不模拟这种
+  return o.side === 'long' ? o.entry * (1 - k) : o.entry * (1 + k);
+}
+
+/* 出场命中判定（含强平）。止损与强平谁离入场价更近，谁就是实际先被觸到的那条线；
+ * 同一段区间里止损与止盈都够得着时，按亏损口径先算 —— 宁可少赚也不能把
+ * 「先扫损再反弹」记成止盈。返回 { hit: 'liq'|'sl'|'tp', lvl, stop }。 */
+function autoExitHit(o, lo, hi) {
+  if (!(lo > 0) || !(hi > 0) || o.status !== 'open') return null;
+  if (!isFinite(o.sl) || !isFinite(o.tp1)) return null;
+  const liq = autoLiqPx(o);
+  if (o.side === 'long') {
+    const byLiq = liq > 0 && liq > o.sl;         // 强平线在止损上方 = 离入场价更近
+    const stop = byLiq ? liq : o.sl;
+    if (lo <= stop) return { hit: byLiq ? 'liq' : 'sl', lvl: stop, stop };
+    if (hi >= o.tp1) return { hit: 'tp', lvl: o.tp1, stop };
+    return null;
+  }
+  if (o.side === 'short') {
+    const byLiq = liq > 0 && liq < o.sl;
+    const stop = byLiq ? liq : o.sl;
+    if (hi >= stop) return { hit: byLiq ? 'liq' : 'sl', lvl: stop, stop };
+    if (lo <= o.tp1) return { hit: 'tp', lvl: o.tp1, stop };
+    return null;
+  }
+  return null;
+}
+
+/* ---- 滑点：不再「按预设止损 / 止盈价原价成交」 ----
+ * 真实成交不可能正好落在挂单价上：买单吃卖一、卖单吃买一，中间隔着整个买卖价差，
+ * 单子还要额外推动盘口。这里用「当前报价买卖价差的一半 + 1bp 冲击成本」作滑点，
+ * 取不到价差时按 0.02% 兜底 —— 宁可账面难看一点，也不要给出一份「零成本完美成交」的记录。
+ * 方向：做多开仓 / 做空平仓是买入，往上滑；做空开仓 / 做多平仓是卖出，往下滑。 */
+function autoSlipFrac(spreadPct) {
+  const sp = (spreadPct != null && isFinite(spreadPct)) ? Math.max(0, spreadPct) : 0.02;
+  return sp / 100 / 2 + AUTO_SLIP_BPS / 10000;
+}
+function autoSlipPx(px, side, isEntry, spreadPct) {
+  if (!(px > 0)) return px;
+  const up = (side === 'long') === !!isEntry;
+  const f = autoSlipFrac(spreadPct);
+  return px * (1 + (up ? f : -f));
+}
+
+/* ---- 资金费：持仓跨过结算点就要付 / 收 ----
+ * 之前完全没算，等于白拿了永续的多空失衡收益。按 8 小时一段计：
+ * 费率为正时多头付给空头，为负时反向。取不到资金费率就记 0，不编造。 */
+function autoFundCount(t0, t1) {
+  if (!(t1 > t0)) return 0;
+  return Math.floor(t1 / AUTO_FUND_MS) - Math.floor(t0 / AUTO_FUND_MS);
+}
+function autoFundFee(o, exitT, funding) {
+  if (funding == null || !isFinite(funding)) return 0;
+  const n = autoFundCount(o.t, exitT);
+  if (n <= 0) return 0;
+  return -funding * n * (o.notional || 0) * (o.side === 'long' ? 1 : -1);
+}
+
+/* ---- 用 K 线高低区间判定出场 ----
+ * 报价轮询约 7 秒一次，期间「插针到止损又反弹」的行情会被完全漏掉，
+ * 结果是模拟盘胜率被系统性高估。K 线的 high/low 记录了那根 bar 走过的全部区间，
+ * 用它补判就不会漏。跳空（开盘已在触发价之外）按开盘价成交 —— 这正是真实执行的样子：
+ * 跳空穿过止盈成交得更好，跳空穿过止损则更差。 */
+function autoExitScan(o, bars, spreadPct) {
+  if (!bars || !bars.length || o.status !== 'open') return null;
+  const from = o.chkT || o.t;
+  for (const b of bars) {
+    if (!(b.t > from)) continue;
+    const h = autoExitHit(o, b.l, b.h);
+    if (!h) continue;
+    // 跳空：开盘已在触发价之外。强平不按开盘价成交 —— 那是被交易所按强平价接管的，亏到只剩维持保证金为止。
+    const gapped = h.hit === 'liq'
+      ? false
+      : (o.side === 'long' ? (h.hit === 'sl' ? b.o < h.lvl : b.o > h.lvl)
+        : (h.hit === 'sl' ? b.o > h.lvl : b.o < h.lvl));
+    const raw = (gapped && h.hit !== 'liq') ? b.o : h.lvl;
+    return {
+      hit: h.hit, gap: gapped, src: 'bar', exitT: b.t,
+      exitPx: h.hit === 'liq' ? autoR2(raw)
+        : autoR2(autoSlipPx(raw, o.side, false, spreadPct)),
+    };
+  }
+  return null;
+}
+
+/* ---- 风控预算：单笔保证金由权益倒推，不再无脑每单固定 ----
+ * 四条约束取最紧的一条：
+ *   1) 单笔风险金额 ≤ 权益 × riskPerTradePct%
+ *   2) 单笔保证金   ≤ 权益 × maxMarginPct%
+ *   3) 在持风险 + 新单风险 ≤ 权益 × maxRiskTotalPct%
+ *   4) 在持名义 + 新单名义 ≤ 权益 × maxLevNotional 倍
+ * 返回 { ok, margin, notional, risk, why }。want 是用户设定的每单保证金，只作上界。 */
+function autoBudget(px, sl, lev, cfg) {
+  const c = cfg || {};
+  const eq = c.equity || 0;
+  const riskPctOfPx = px > 0 ? Math.abs(px - sl) / px : 0;
+  if (!(eq > 0) || !(px > 0) || !(riskPctOfPx > 0) || !(lev > 0)) {
+    return { ok: false, margin: 0, notional: 0, risk: 0, why: '参数无效' };
+  }
+  const capRisk = eq * (c.riskPerTradePct / 100);
+  const capMargin = eq * (c.maxMarginPct / 100);
+  const leftRisk = Math.max(0, eq * (c.maxRiskTotalPct / 100) - (c.usedRisk || 0));
+  const leftNotional = Math.max(0, eq * (c.maxLevNotional || 0) - (c.usedNotional || 0));
+
+  // 名义 = 风险金额 / 风险比例；保证金 = 名义 / 杠杆
+  const byRisk = (capRisk / riskPctOfPx) / lev;
+  const byLeftRisk = (leftRisk / riskPctOfPx) / lev;
+  const byLeftNotional = leftNotional / lev;
+  const margin = Math.min(c.want || Infinity, byRisk, capMargin, byLeftRisk, byLeftNotional);
+  if (!isFinite(margin) || margin < 10) {
+    const why = (byLeftRisk <= byRisk && byLeftRisk <= byLeftNotional)
+      ? `总风险额度不足（已用 ${Math.round(c.usedRisk || 0)} / 上限 ${Math.round(eq * c.maxRiskTotalPct / 100)}）`
+      : (byLeftNotional <= byRisk)
+        ? `总名义敞口已达上限（权益 × ${c.maxLevNotional}）`
+        : `单笔风险上限 ${c.riskPerTradePct}% 下保证金不足 10 USDT`;
+    return { ok: false, margin: 0, notional: 0, risk: 0, why };
+  }
+  const notional = margin * lev;
+  return { ok: true, margin, notional, risk: notional * riskPctOfPx, why: '' };
+}
+
+/* 单笔风险金额：|入场 − 止损| / 入场 × 名义。保证金制下这才是真正会亏掉的钱。 */
+function autoRiskAmt(o) {
+  if (!(o.entry > 0) || o.sl == null) return 0;
+  return Math.abs(o.entry - o.sl) / o.entry * (o.notional || 0);
+}
 
 /* 价位：以做市商给出的「结构风险距离」定止损，再按盈亏比推止盈。
  * 为什么不直接用 mmTrade 的 tp1：它取的是清算带近端，盈亏比可能是 0.6 也可能是 4；
@@ -4085,14 +4826,16 @@ function autoHit(side, sl, tp1, lo, hi) {
   return null;
 }
 
-/* 盈亏：名义 = 保证金 × 杠杆；毛盈亏按价格变动 × 张数；成本 = 双边手续费。 */
-function autoPnl(o, exitPx) {
+/* 盈亏：名义 = 保证金 × 杠杆；毛盈亏按价格变动 × 张数；
+ * 成本 = 双边手续费 + 持仓跨越的资金费。三者分开记，账单才看得懂钱花在哪。 */
+function autoPnl(o, exitPx, exitT, funding) {
   const qty = o.notional / o.entry;
   const dir = o.side === 'long' ? 1 : -1;
   const gross = (exitPx - o.entry) * qty * dir;
   const fee = o.notional * AUTO_FEE * 2;
-  const pnl = gross - fee;
-  return { gross, fee, pnl, pnlPct: o.margin > 0 ? pnl / o.margin * 100 : 0 };
+  const fund = autoFundFee(o, exitT == null ? (o.exitT || o.t) : exitT, funding);
+  const pnl = gross - fee + fund;
+  return { gross, fee, fund, pnl, pnlPct: o.margin > 0 ? pnl / o.margin * 100 : 0 };
 }
 
 /* 自然时间网格：档位 = nextAt + k×间隔。不用「执行时刻 + 间隔」，
@@ -4115,6 +4858,16 @@ const AUTO_DEF = {
   nextAt: 0,
   orders: [],            // 规则 4：只增不删
   startedAt: 0,
+  pendingSweep: null,    // P0-4：正在等待的扫单收回状态
+  maxOpen: 5,            // 最大同时持仓笔数（笔数上限）
+  /* ---- 账户与风控（P2：之前只有「每单固定 1000」，没有账户约束）----
+   * 之前定时追加订单、不看账户余额，可以累积出远超实际资金承受能力的仓位。
+   * 这里补上权益口径：权益 = 初始资金 + 累计已实现盈亏，所有仓位都由它倒推。 */
+  balance: 10000,        // 初始资金（USDT）
+  riskPerTradePct: 2,    // 单笔最大亏损 ≤ 权益 2%
+  maxRiskTotalPct: 6,    // 在持风险合计 ≤ 权益 6%
+  maxLevNotional: 20,    // 总名义敞口 ≤ 权益 20 倍
+  maxMarginPct: 40,      // 单笔保证金 ≤ 权益 40%
 };
 
 function autoLoad() {
@@ -4128,13 +4881,44 @@ function autoLoad() {
   a.ivMin = clamp(+a.ivMin || AUTO_IV_DEF, 1, 720);
   a.rr = clamp(+a.rr || 1.5, 1, 10);
   if (!TF_MAP[a.tf]) a.tf = '1h';
+  a.maxOpen = clamp(+a.maxOpen || 5, 1, 50);
+  a.balance = clamp(+a.balance || 10000, 100, 1e9);
+  a.riskPerTradePct = clamp(+a.riskPerTradePct || 2, 0.1, 20);
+  a.maxRiskTotalPct = clamp(+a.maxRiskTotalPct || 6, 0.5, 50);
+  a.maxLevNotional = clamp(+a.maxLevNotional || 20, 1, 200);
+  a.maxMarginPct = clamp(+a.maxMarginPct || 40, 5, 100);
+  // 扫单状态持久化：页面刷新后仍继续等待
+  if (a.pendingSweep && !(a.pendingSweep.deadline > 0)) a.pendingSweep = null;
   return a;
 }
 let AUTO = autoLoad();
+if (typeof window !== 'undefined') window.AUTO = AUTO;   // 便于端到端测试访问状态
 function autoSave() {
   try { localStorage.setItem(AUTO_KEY, JSON.stringify(AUTO)); } catch (e) { /* 配额满：不阻断交易 */ }
 }
 const autoIvMs = () => Math.max(1, AUTO.ivMin) * 60000;
+
+/* ---- 账户权益 ----
+ * 权益 = 初始资金 + 累计已实现盈亏。在持仓位的浮动盈亏不计入（未落袋），
+ * 但已占用的风险与名义敞口要计 —— 那是实实在在被锁住的额度。 */
+function autoRealized() {
+  return AUTO.orders.reduce((s, o) =>
+    s + ((o.status === 'win' || o.status === 'loss') ? (o.pnl || 0) : 0), 0);
+}
+function autoEquity() { return Math.max(0, (AUTO.balance || 0) + autoRealized()); }
+function autoOpenOrders() { return AUTO.orders.filter(o => o.status === 'open'); }
+function autoUsedRisk() { return autoOpenOrders().reduce((s, o) => s + autoRiskAmt(o), 0); }
+function autoUsedNotional() { return autoOpenOrders().reduce((s, o) => s + (o.notional || 0), 0); }
+function autoUsedMargin() { return autoOpenOrders().reduce((s, o) => s + (o.margin || 0), 0); }
+/* 当前报价的买卖价差（百分数）。滑点由它推导，取不到时用兜底值。 */
+function autoSpreadPct() {
+  const q = S.quotes[AUTO.sym];
+  return (q && isFinite(q.spreadPct)) ? Math.max(0, q.spreadPct) : null;
+}
+function autoFundingRate() {
+  const q = S.quotes[AUTO.sym];
+  return (q && isFinite(q.funding)) ? q.funding : null;
+}
 function dayKey(ts) {
   const d = new Date(ts), p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
@@ -4155,26 +4939,140 @@ function autoBars() {
   return (d && d.bars && d.bars.length >= 40) ? d.bars : null;
 }
 
-let _autoQT = 0, _autoBT = 0;
+/* 四周期数据是否齐备且新鲜。融合决策要读 4h/1h/30m/15m 四份 K 线，
+ * 缺任何一份都不该开仓 —— 否则又变成「只看一个周期就下单」。
+ * 除了 stale 标志，还要看最后一根 bar 的时间戳：缓存里留着旧数据也是「数据停止更新」的一种。 */
+function autoMtfReady() {
+  const miss = [];
+  for (const tf of MTF_TFS) {
+    const d = (S.klines[AUTO.sym] || {})[tf];
+    const lab = MTF_LABEL[tf] || tf;
+    if (!d || !d.bars || d.bars.length < MTF_MIN_BARS) { miss.push(lab + ' 不足'); continue; }
+    if (d.stale) { miss.push(lab + ' 停更'); continue; }
+    const step = (TF_MAP[tf] ? TF_MAP[tf].m : 60) * 60000;
+    const last = d.bars[d.bars.length - 1];
+    if (now() - last.t > step * 2.5 + 60000) miss.push(lab + ' 过期');
+    else if (!klineGaps(d.bars, step).ok) miss.push(lab + ' 断档');
+  }
+  return { ok: miss.length === 0, miss };
+}
+
+/* P0-2：数据过期时禁止开仓。
+ * 检查报价时间戳、K 线 stale 标志、K 线时间空洞、最后一根 bar 的时间戳、
+ * 网络最近一次成功取数时间。返回 { ok, why }，供开仓逻辑决策。 */
+function autoCanTrade() {
+  const q = S.quotes[AUTO.sym];
+  if (!q || !(q.price > 0)) return { ok: false, why: '无实时价' };
+  const qAge = now() - (q.ts || 0);
+  if (qAge > 30000) return { ok: false, why: `报价已过期 ${Math.round(qAge / 1000)}s` };
+  const d = (S.klines[AUTO.sym] || {})[AUTO.tf];
+  if (!d || !d.bars || d.bars.length < 40) return { ok: false, why: 'K 线不足' };
+  if (d.stale) return { ok: false, why: 'K 线已停止更新' };
+  const tf = TF_MAP[AUTO.tf];
+  const gap = klineGaps(d.bars, (tf ? tf.m : 60) * 60000);
+  if (!gap.ok) return { ok: false, why: `K 线不连续，缺失 ${gap.gaps.length} 段` };
+  const last = d.bars[d.bars.length - 1];
+  const barAge = now() - last.t;
+  const step = (tf ? tf.m : 60) * 60000;
+  if (barAge > step * 2.5 + 60000) {
+    return { ok: false, why: `最后一根 K 线已过去 ${Math.round(barAge / 60000)} 分钟` };
+  }
+  const netAge = now() - NET.lastOk;
+  if (netAge > 90000) return { ok: false, why: '网络取数失败超过 90s' };
+  const mt = autoMtfReady();
+  if (!mt.ok) return { ok: false, why: '四周期数据不齐：' + mt.miss.join(' / ') };
+  return { ok: true };
+}
+
+/* ---- 模拟盘的假设与偏差 ----
+ * 和清算热力图同一个道理：模拟结果好不好，取决于它说清楚了自己没算什么。
+ * 这里把「已计入」和「仍未计入」分开列，避免把一份理想化成交记录当成实盘战绩。 */
+const AUTO_ASSUME = {
+  name: '模拟成交模型',
+  counted: [
+    ['双边手续费', '开平各一次，taker 0.05%'],
+    ['成交滑点', '买卖价差的一半 + 1bp 冲击成本；跳空按开盘价成交'],
+    ['资金费', '持仓每跨过一次 8 小时结算点计一次，取当前费率；取不到就记 0，不编造'],
+    ['出场判定', '轮询价 + K 线 high/low 双路径，7 秒轮询间隙里的插针不会漏'],
+    ['仓位约束', '单笔风险 / 总风险 / 名义敞口 / 单笔保证金四条取最紧，由账户权益倒推'],
+    ['强平线', '逐仓维持保证金率 0.5%，谁离入场价更近谁先触发（高杠杆可能先于止损被强平）'],
+  ],
+  missing: [
+    ['盘口深度', '不做分笔成交，也不按挂单量额外加冲击成本'],
+    ['资金费时变', '按平仓时的费率计全程，持仓期间费率变化未跟踪'],
+    ['执行环境', '不模拟下单延迟、交易所宕机、断线期间的行情'],
+    ['止盈成交', '按 taker 滑点算，实际挂单成交可能是 maker（结果偏保守）'],
+    ['错过档位', '页面未运行时错过的档位只记「错过档位」，不按当前行情补开'],
+    ['保证金占用', '逐仓、不交叉，也未模拟真实资金与借贷成本'],
+  ],
+  verdict: '模拟盘用于检验策略逻辑是否自洽，不等于实盘收益：它给的是「在这套假设下会怎样」，不是「真这么干能赚多少」。',
+};
+function renderAutoModel() {
+  const box = $('#autoModel');
+  if (!box) return;
+  const row = (k, v) => `<div class="hm-row"><b>${k}</b><span>${v}</span></div>`;
+  box.innerHTML = `<details class="sub hmodel">
+      <summary>模拟盘假设与偏差 · ${AUTO_ASSUME.name}</summary>
+      <div class="hm-chain">已计入的成本与规则：</div>
+      <div class="hm-cv">${AUTO_ASSUME.counted.map(c => row(c[0], c[1])).join('')}</div>
+      <div class="hm-chain" style="margin-top:8px">仍未计入、会系统性偏差的地方：</div>
+      <div class="hm-cv">${AUTO_ASSUME.missing.map(c => row(c[0], c[1])).join('')}</div>
+      <div class="hm-vd">${AUTO_ASSUME.verdict}</div>
+    </details>`;
+}
+
+/* 多周期方向不再由「投票 + 主周期兜底」给出 —— 那套口径会让 15m 做多 / 4h 做空时
+ * 以主周期（默认 1h）的结论开仓，等于小周期能推翻大周期。
+ * 现在唯一入口是 mtfDecision()：4h 定趋势 → 1h 筛选 → 30m 看回调 → 15m 触发，
+ * 见 08a-mtf.js。这里不再保留任何并行口径，避免以后又被接回开仓路径。 */
+// 端到端测试访问（app.js 在严格模式下求值，内部函数不会挂到 window）
+if (typeof window !== 'undefined') {
+  window.autoCanTrade = autoCanTrade;
+  window.autoOpenOnce = autoOpenOnce;
+}
+
+/* P0-3：把一档记为 skip，原因写清楚。 */
+function autoPushSkip(atT, catchup, px0, reason) {
+  AUTO.orders.push({
+    id: 'A' + (AUTO.orders.length + 1) + '-' + String(atT).slice(-6),
+    t: atT, day: dayKey(atT), sym: AUTO.sym, tf: AUTO.tf,
+    margin: AUTO.margin, lev: AUTO.lev, notional: AUTO.margin * AUTO.lev,
+    catchup: !!catchup, px0: px0 || 0,
+    side: 'wait', status: 'skip', sig: { text: '—', conf: 0, score: 0 },
+    reason,
+  });
+}
+
+let _autoQT = 0;
+const _autoKT = {};                                  // 各周期上次拉 K 线的时刻
+const AUTO_K_IV = { '15m': 240000, '30m': 240000, '1h': 600000, '4h': 1800000 };
 async function autoEnsureData(force) {
   if (!AUTO.on) return;
   const t = now();
-  const needQ = force || t - _autoQT > 7000;      // 报价 7 秒一次
-  const needB = force || t - _autoBT > 240000;    // K 线 4 分钟一次：结论周期最短 15 分钟，够用
+  const needQ = force || t - _autoQT > 7000;         // 报价 7 秒一次
   if (needQ) _autoQT = t;
-  if (needB) _autoBT = t;
   const jobs = [];
   if (needQ) jobs.push(loadQuotes(AUTO.sym).catch(() => {}));
-  if (needB) jobs.push(loadKlines(AUTO.sym, AUTO.tf).catch(() => {}));
+  /* 四周期融合要读 15m/30m/1h/4h 四份 K 线，只拉一个周期就永远做不出总决策。
+   * 短周期 4 分钟一刷、1h 十分钟、4h 半小时 —— 4h 一根要走四小时，半小时足够。 */
+  for (const tf of MTF_TFS) {
+    const iv = AUTO_K_IV[tf] || 240000;
+    if (force || t - (_autoKT[tf] || 0) > iv) {
+      _autoKT[tf] = t;
+      jobs.push(loadKlines(AUTO.sym, tf).catch(() => {}));
+    }
+  }
   /* 只有 force（启动 / 补单 / 页面重新可见）才等结果：平时 tick 每秒一次，
    * 等待会把每次 tick 拖成串行请求，界面刷新和持仓检查都被卡住。 */
   if (force) await Promise.all(jobs);
 }
 
-/* 信号标注：把做市商结论压成一句话，写进每一笔单据。 */
-function autoSigOf(T) {
-  const F = T.mm && T.mm.F, kd = F && F.kd, mc = F && F.mc, st = F && F.st;
-  if (!F) return { text: '—', conf: 0, score: 0 };
+/* 信号标注：把「四周期融合决策 + 执行周期结论」压成一句话，写进每一笔单据。
+ * 之前只标执行周期的结论，于是单据上写着「顺势 · 结构上升」，实际却是被 4h 趋势否决的单，
+ * 事后完全没法复盘。现在把流水线状态也写进去。 */
+function autoSigOf(T, dec) {
+  const F = T && T.mm && T.mm.F, kd = F && F.kd, mc = F && F.mc, st = F && F.st;
+  if (!F) return { text: (dec ? mtfStageTxt(dec) : '—'), conf: dec ? dec.conf : 0, score: 0 };
   const kdTxt = !kd ? '—'
     : kd.cross === 1 ? 'KDJ 刚金叉' : kd.cross === -1 ? 'KDJ 刚死叉'
     : (kd.k > kd.d ? 'KDJ K 在 D 上' : 'KDJ K 在 D 下');
@@ -4185,67 +5083,217 @@ function autoSigOf(T) {
     : st.trend === 'expand' ? '高低点扩张' : st.trend === 'contract' ? '高低点收敛' : '区间震荡') : '—';
   const modeTxt = T.mode === 'follow' ? '顺势' : T.mode === 'sweep' ? '扫单反转' : '观望';
   return {
-    text: `${modeTxt} · ${trendTxt} · ${kdTxt} · ${mcTxt}`,
-    conf: T.conf || 0, score: Math.round(T.score || 0),
+    text: `${dec ? mtfStageTxt(dec) + ' · ' : ''}${modeTxt} · ${trendTxt} · ${kdTxt} · ${mcTxt}`,
+    conf: dec ? dec.conf : (T.conf || 0), score: Math.round(T.score || 0),
+    stage: dec ? dec.stage : null,
   };
 }
 
-/* 下一单：到点执行。catchup = 补单（页面没开时错过的档位，用补单时刻的真实市价成交）。 */
+/* 用风控预算 + 滑点成交开一单。所有开仓路径（定时档 / 扫单触发）都必须走这里，
+ * 否则「定时档有风控、扫单触发没有」这种漏口径迟早会出事。 */
+function autoPlace(atT, bias, plan, dec, reason) {
+  const px = autoPx();
+  if (!(px > 0)) return null;
+  // 先算含滑点的成交价，再以它为基准挂止损止盈 —— 实盘就是以实际成交价为基准设止损的，
+  // 这样盈亏比也才是真的 1:1.5（用未滑点的报价算，RR 会被滑点吃掉几个百分点）。
+  const fill = autoSlipPx(px, bias, true, autoSpreadPct());
+  const dist = (plan && plan.sl != null) ? Math.abs(plan.px - plan.sl) : 0;
+  const L = autoLevels(fill, bias, dist || (plan && plan.atr) || px * 0.01, AUTO.rr);
+  if (!L) return null;
+  const B = autoBudget(px, L.sl, AUTO.lev, {
+    equity: autoEquity(), riskPerTradePct: AUTO.riskPerTradePct,
+    maxMarginPct: AUTO.maxMarginPct, maxRiskTotalPct: AUTO.maxRiskTotalPct,
+    maxLevNotional: AUTO.maxLevNotional,
+    usedRisk: autoUsedRisk(), usedNotional: autoUsedNotional(), want: AUTO.margin,
+  });
+  if (!B.ok) return { err: B.why };
+  // 市价单按买卖价差滑点成交，不再是「报价即成交价」
+  const entry = autoR2(fill);
+  return {
+    order: {
+      id: 'A' + (AUTO.orders.length + 1) + '-' + String(atT).slice(-6),
+      t: atT, day: dayKey(atT), sym: AUTO.sym, tf: AUTO.tf,
+      margin: Math.round(B.margin * 100) / 100, lev: AUTO.lev,
+      notional: Math.round(B.notional * 100) / 100,
+      catchup: false, px0: px, side: bias, status: 'open',
+      entry, sl: L.sl, tp1: L.tp1,
+      tp2: (plan && plan.tp2 != null) ? autoR2(plan.tp2) : null,
+      risk: autoR2(Math.abs(L.sl - entry)), sig: autoSigOf(plan, dec),
+      chkT: atT,                                   // K 线区间扫描的起点
+      slip: autoR2(entry - px),                    // 开仓滑点（正＝买贵 / 卖便宜）
+      liqP: autoR2(autoLiqPx({ entry, side: bias, lev: AUTO.lev })),   // 强平价：杠杆越高离入场越近
+      reason,
+    },
+    budget: B, entry, px,
+  };
+}
+
+/* 下一单：到点执行。
+ * P0-2：数据过期禁止开仓。
+ * P0-3：catchup（页面没开时错过的档位）不再按当前行情补开新单，只记 skip。
+ * P0-4：页面策略与执行对齐 —— 需要扫单收回时真实等待价格进带。
+ * P2：方向只来自四周期融合决策；仓位由账户权益与总风险约束倒推。 */
 function autoOpenOnce(atT, catchup) {
   const iv = autoIvMs();
+  const can = autoCanTrade();
   const px = autoPx();
-  const bars = autoBars();
-  if (!(px > 0) || !bars) return false;            // 数据不全：不推进网格，下个 tick 重试
-  const T = mmTradeOf(AUTO.sym, AUTO.tf, bars);
-  const base = {
-    id: 'A' + (AUTO.orders.length + 1) + '-' + String(atT).slice(-6),
-    t: atT, day: dayKey(atT), sym: AUTO.sym, tf: AUTO.tf,
-    margin: AUTO.margin, lev: AUTO.lev, notional: AUTO.margin * AUTO.lev,
-    catchup: !!catchup, px0: T.px,
-  };
-  if (T.bias !== 'long' && T.bias !== 'short') {
-    AUTO.orders.push(Object.assign(base, {
-      side: 'wait', status: 'skip', sig: autoSigOf(T),
-      reason: '做市商结论为观望，本档不下单',
-    }));
+
+  // 数据过期：不产生新订单，但该档必须推进（避免永远卡住）
+  if (!can.ok) {
+    autoPushSkip(atT, catchup, px || 0, '数据过期禁止开仓：' + can.why);
     AUTO.nextAt += iv; autoSave(); renderAuto(); return true;
   }
-  const dist = Math.abs(T.px - T.sl) || T.atr || px * 0.01;
-  const L = autoLevels(px, T.bias, dist, AUTO.rr);
-  if (!L) { AUTO.nextAt += iv; autoSave(); return true; }
-  AUTO.orders.push(Object.assign(base, {
-    side: T.bias, status: 'open',
-    entry: autoR2(px), sl: L.sl, tp1: L.tp1, tp2: T.tp2 != null ? autoR2(T.tp2) : null,
-    risk: autoR2(Math.abs(L.sl - px)), sig: autoSigOf(T),
-    reason: '市价开仓 · 自动挂止盈止损，到价即执行',
-  }));
+  if (!(px > 0)) return false;                     // 数据不全：不推进网格，下个 tick 重试
+
+  // P0-3：取消按当前行情补记历史交易
+  if (catchup) {
+    autoPushSkip(atT, true, px, '错过档位，按规则不补开新单（历史回放另行实现）');
+    AUTO.nextAt += iv; autoSave(); renderAuto(); return true;
+  }
+
+  // 笔数上限
+  const openCount = autoOpenOrders().length;
+  if (openCount >= AUTO.maxOpen) {
+    autoPushSkip(atT, false, px, `持仓笔数上限：当前 ${openCount} 笔 ≥ ${AUTO.maxOpen} 笔`);
+    AUTO.nextAt += iv; autoSave(); renderAuto(); return true;
+  }
+
+  /* 唯一的方向来源：四周期融合决策（4h 趋势 → 1h 机会 → 30m 回调 → 15m 触发）。
+   * 不再读「设置里的单个周期」—— 那是「15m 做多、4h 做空照样开多」的根源。 */
+  const dec = mtfDecision(AUTO.sym);
+  if (dec.bias !== 'long' && dec.bias !== 'short') {
+    autoPushSkip(atT, false, px,
+      `四周期融合决策观望（${mtfStageTxt(dec)}）：${dec.reasons[dec.reasons.length - 1] || '四层未达成一致'}`);
+    AUTO.nextAt += iv; autoSave(); renderAuto(); return true;
+  }
+
+  const mtf = mtfPlan(AUTO.sym, AUTO.tf);
+  const plan = mtf.plan;
+  if (!plan) {
+    autoPushSkip(atT, false, px, `执行周期 ${MTF_LABEL[AUTO.tf] || AUTO.tf} 数据不足，无法定价`);
+    AUTO.nextAt += iv; autoSave(); renderAuto(); return true;
+  }
+
+  // P0-4：15m 处于扫单结构 —— 真实等价格进带再反向开仓
+  if (dec.need === 'sweep' && dec.sweep) {
+    const lo = Math.min(dec.sweep.lo, dec.sweep.hi), hi = Math.max(dec.sweep.lo, dec.sweep.hi);
+    AUTO.pendingSweep = {
+      atT, px0: px, bias: dec.bias, sweepLo: lo, sweepHi: hi,
+      deadline: atT + iv, sig: autoSigOf(plan, dec),
+      T: { px: plan.px, sl: plan.sl, tp2: plan.tp2, atr: plan.atr, dp: plan.dp, mode: 'sweep' },
+    };
+    autoPushSkip(atT, false, px,
+      `等待扫单收回：${fmt(lo, plan.dp)} – ${fmt(hi, plan.dp)}（${dec.bias === 'long' ? '跌进带后做多' : '涨进带后做空'}）`
+      + ` · 15m 扫单倾向${sweepTendency(dec.sweep.score).txt}`);
+    AUTO.nextAt += iv; autoSave(); renderAuto(); return true;
+  }
+
+  const r = autoPlace(atT, dec.bias, plan, dec,
+    `市价开仓 · 四层全通过（${mtfStageTxt(dec)}）· 自动挂止盈止损`);
+  if (r && r.order) {
+    AUTO.orders.push(r.order);
+  } else {
+    autoPushSkip(atT, false, px, '风控拒绝开仓：' + ((r && r.err) || '价位计算失败'));
+  }
   AUTO.nextAt += iv; autoSave(); renderAuto(); return true;
 }
 
-/* 持仓检查：到价即平，不做任何确认。 */
+/* 持仓检查（轮询价路径）：到价即平，不做任何确认。
+ * 成交价 = 触发价 ± 滑点；跳空由 K 线区间路径 autoCheckBars 负责。 */
 function autoCheckOpen(px) {
+  if (!(px > 0)) return false;
+  const spread = autoSpreadPct(), fund = autoFundingRate();
   let changed = false;
   for (const o of AUTO.orders) {
     if (o.status !== 'open') continue;
-    const hit = autoHit(o.side, o.sl, o.tp1, px, px);
-    if (!hit) continue;
-    const exitPx = hit === 'sl' ? o.sl : o.tp1;
-    const p = autoPnl(o, exitPx);
-    o.status = hit === 'sl' ? 'loss' : 'win';
-    o.exitT = now(); o.exitPx = exitPx;
-    o.gross = p.gross; o.fee = p.fee; o.pnl = p.pnl; o.pnlPct = p.pnlPct;
-    o.reason = hit === 'sl' ? '触发止损（按触发价成交）' : '触发止盈（按触发价成交）';
+    const h = autoExitHit(o, px, px);              // 与 K 线路径同一判定：含强平线
+    if (!h) continue;
+    const exitPx = h.hit === 'liq' ? autoR2(h.lvl)
+      : autoR2(autoSlipPx(h.lvl, o.side, false, spread));
+    autoClose(o, { hit: h.hit, exitPx, exitT: now(), gap: false, src: 'quote' }, fund);
     changed = true;
   }
   if (changed) { autoSave(); renderAuto(); }
+  return changed;
 }
 
-/* 每秒 tick：刷新数据、检查持仓、到点下单。 */
+/* 平仓：两条出场路径（轮询价 / K 线区间）共用，保证口径一致 —— 手续费、资金费、
+ * 滑点、状态标记只在这里算一次，不会出现「同一笔单两种算法」。 */
+function autoClose(o, r, funding) {
+  const p = autoPnl(o, r.exitPx, r.exitT, funding);
+  o.status = r.hit === 'tp' ? 'win' : 'loss';
+  o.exitT = r.exitT; o.exitPx = r.exitPx;
+  o.gross = p.gross; o.fee = p.fee; o.fund = p.fund;
+  o.pnl = p.pnl; o.pnlPct = p.pnlPct;
+  o.exitSrc = r.src || 'quote';
+  o.exitGap = !!r.gap;
+  o.liquidated = r.hit === 'liq';
+  o.reason = r.hit === 'liq'
+    ? '触发强平（保证金吃到维持线，按强平价接管）'
+    : (r.hit === 'sl' ? '触发止损' : '触发止盈')
+      + `（${r.gap ? '跳空按开盘价' : '按触发价'}成交${r.src === 'bar' ? ' · K 线区间判定' : ''}）`;
+}
+
+/* K 线区间出场：7 秒一次的轮询价会漏掉「插针到止损又反弹」，
+ * 这里用已收盘（含正在形成）K 线的 high/low 补判，漏不掉。 */
+function autoCheckBars() {
+  const bars = autoBars();
+  if (!bars || !bars.length) return false;
+  const spread = autoSpreadPct(), fund = autoFundingRate();
+  let changed = false;
+  for (const o of AUTO.orders) {
+    if (o.status !== 'open') continue;
+    const r = autoExitScan(o, bars, spread);
+    if (!r) continue;
+    autoClose(o, r, fund);
+    changed = true;
+  }
+  if (changed) { autoSave(); renderAuto(); }
+  return changed;
+}
+
+/* P0-4：扫单触发 —— 价格进入等待中的扫单带时立即按 bias 反向开仓。
+ * 同样走 autoPlace，享受同一套风控与滑点，不另开一条口径。 */
+function autoSweepTrigger(px) {
+  const p = AUTO.pendingSweep;
+  if (!p || !(px > 0)) return false;
+  if (px < p.sweepLo || px > p.sweepHi) return false;
+  const plan = { px: p.T.px, sl: p.T.sl, tp2: p.T.tp2, atr: p.T.atr, dp: p.T.dp, mode: 'sweep', mm: null };
+  const r = autoPlace(now(), p.bias, plan, null,
+    `扫单收回触发 · 现价 ${fmt(px, p.T.dp)} 进入 ${fmt(p.sweepLo, p.T.dp)} – ${fmt(p.sweepHi, p.T.dp)}，反向${p.bias === 'long' ? '做多' : '做空'}`);
+  if (r && r.order) { r.order.sig = p.sig; AUTO.orders.push(r.order); }
+  else autoPushSkip(now(), false, px, '扫单触发但风控拒绝开仓：' + ((r && r.err) || '价位计算失败'));
+  AUTO.pendingSweep = null;
+  autoSave(); renderAuto();
+  return true;
+}
+
+/* P0-4：扫单超时 —— 到下一档仍未触发，skip。 */
+function autoSweepExpire() {
+  const p = AUTO.pendingSweep;
+  if (!p || now() < p.deadline) return false;
+  autoPushSkip(p.atT, false, autoPx() || 0,
+    `等待扫单收回超时：${fmt(p.sweepLo, p.T.dp)} – ${fmt(p.sweepHi, p.T.dp)} 在 ${Math.round((p.deadline - p.atT) / 60000)} 分钟内未触发`);
+  AUTO.pendingSweep = null;
+  autoSave(); renderAuto();
+  return true;
+}
+
+/* 每秒 tick：刷新数据、检查持仓、检查扫单触发/超时、到点下单。 */
 function autoTick() {
   if (!AUTO.on) return;
   autoEnsureData(false);
   const px = autoPx();
+  // 两条出场路径并行：轮询价即时，K 线区间补上轮询问隙里被漏掉的插针
   if (px > 0) autoCheckOpen(px);
+  autoCheckBars();
+
+  // P0-4：扫单状态处理
+  if (AUTO.pendingSweep) {
+    autoSweepTrigger(px);
+    autoSweepExpire();
+  }
+
   if (AUTO.nextAt <= 0) AUTO.nextAt = now() + autoIvMs();
   let guard = 0;
   while (now() >= AUTO.nextAt && guard++ < 6) {     // 单 tick 最多补 6 单，避免一次性补几百单卡死
@@ -4254,15 +5302,16 @@ function autoTick() {
   renderAutoLight();
 }
 
-/* 页面重开时按自然时间补单：把没开页面期间错过的档位补齐（上限 AUTO_CATCH_CAP）。 */
+/* 页面重开时按自然时间补齐错过的档位记录（上限 AUTO_CATCH_CAP）。
+ * P0-3：不再按当前行情补开新单，错过的档位统一记为 skip。 */
 async function autoCatchUp() {
   if (!AUTO.on) return;
-  await autoEnsureData(true);                       // 补单前必须拿到真实价与真实 K 线，否则补不出单
+  await autoEnsureData(true);                       // 仍尝试拿数据，确保到点后的第一档能正常执行
   const iv = autoIvMs();
   if (AUTO.nextAt <= 0) { AUTO.nextAt = now() + iv; autoSave(); return; }
   const n = autoCatchCount(AUTO.nextAt, now(), iv, AUTO_CATCH_CAP);
   for (let i = 0; i < n; i++) {
-    if (!autoOpenOnce(AUTO.nextAt, true)) break;
+    if (!autoOpenOnce(AUTO.nextAt, true)) break;    // catchup=true → autoOpenOnce 生成 skip 记录
   }
   if (AUTO.nextAt < now()) AUTO.nextAt = now() + iv;   // 落后太多（超过补单上限）：网格拉回当前时刻
   autoSave(); renderAuto();
@@ -4277,6 +5326,7 @@ function autoStatsOf(list) {
     total: list.length, open: list.filter(o => o.status === 'open').length,
     skip: list.filter(o => o.status === 'skip').length,
     win, loss: closed.length - win,
+    liq: closed.filter(o => o.liquidated).length,
     rate: closed.length ? win / closed.length * 100 : null,
     net,
   };
@@ -4286,21 +5336,23 @@ function autoRowHtml(o) {
   const sideTxt = o.side === 'long' ? '做多' : o.side === 'short' ? '做空' : '观望';
   const sideCls = o.side === 'long' ? 'up' : o.side === 'short' ? 'down' : '';
   const tag = o.status === 'open' ? '<span class="atag hold">持仓中</span>'
-    : o.status === 'win' ? '<span class="atag win">止盈</span>'
-    : o.status === 'loss' ? '<span class="atag loss">止损</span>'
-    : '<span class="atag skip">跳过</span>';
+    : o.liquidated ? '<span class="atag loss">强平</span>'
+      : o.status === 'win' ? '<span class="atag win">止盈</span>'
+        : o.status === 'loss' ? '<span class="atag loss">止损</span>'
+          : '<span class="atag skip">跳过</span>';
   const pnlHtml = (o.status === 'win' || o.status === 'loss')
     ? `<b class="num ${o.pnl >= 0 ? 'up' : 'down'}">${o.pnl >= 0 ? '+' : ''}${fmt(o.pnl, 2)}</b>`
       + `<div class="mut" style="font-size:10px">${o.pnlPct >= 0 ? '+' : ''}${fmt(o.pnlPct, 2)}%</div>`
     : '<span class="mut">—</span>';
   const lv = o.status === 'skip' ? '<span class="mut">—</span>'
-    : `<div>${fmt(o.entry, 2)}</div><div class="mut" style="font-size:10px">SL ${fmt(o.sl, 2)} · TP ${fmt(o.tp1, 2)}</div>`;
+    : `<div>${fmt(o.entry, 2)}</div><div class="mut" style="font-size:10px">SL ${fmt(o.sl, 2)} · TP ${fmt(o.tp1, 2)}`
+      + (o.liqP ? ` · 强平 ${fmt(o.liqP, 2)}` : '') + `</div>`;
   const exitCell = o.exitPx ? `<div>${fmt(o.exitPx, 2)}</div>
       <div class="mut" style="font-size:10px">${new Date(o.exitT).toLocaleTimeString('zh-CN', { hour12: false })}</div>` : '<span class="mut">—</span>';
   return `<tr>
-    <td>${t}${o.catchup ? ' <span class="atag skip">补单</span>' : ''}</td>
+    <td>${t}${o.catchup ? ' <span class="atag skip">错过档位</span>' : ''}</td>
     <td class="${sideCls}">${sideTxt}</td>
-    <td class="sig">${(o.sig && o.sig.text) || '—'}<div class="mut" style="font-size:10px">一致度 ${(o.sig && o.sig.conf) || 0}% · 合成 ${(o.sig && o.sig.score) || 0}</div></td>
+    <td class="sig">${(o.sig && o.sig.text) || '—'}<div class="mut" style="font-size:10px">四层一致度 ${(o.sig && o.sig.conf) || 0}%（非胜率） · 合成 ${(o.sig && o.sig.score) || 0}</div></td>
     <td>${lv}</td>
     <td>${exitCell}</td>
     <td>${tag}</td>
@@ -4312,6 +5364,7 @@ const AUTO_TB = `<table class="al-tb"><thead><tr>
 </tr></thead><tbody>`;
 
 function renderAuto() {
+  renderAutoModel();
   const st = $('#autoState'), tg = $('#autoToggle');
   if (st) {
     st.textContent = AUTO.on ? '运行中 · 仅 ETH' : '已停止';
@@ -4328,10 +5381,16 @@ function renderAuto() {
   const S2 = autoStatsOf(todayList);
 
   const cell = (label, val, cls) => `<div class="st"><span>${label}</span><b class="${cls || ''}">${val}</b></div>`;
+  const eq = autoEquity(), uRisk = autoUsedRisk(), uNot = autoUsedNotional();
+  const riskPct = eq > 0 ? uRisk / eq * 100 : 0;
+  const notX = eq > 0 ? uNot / eq : 0;
   $('#autoStats').innerHTML =
-    cell('累计单据', S1.total)
+    cell('账户权益', fmt(eq, 0), eq > 0 ? '' : 'down')
+    + cell('在持风险', `${fmt(uRisk, 0)} · ${fmt(riskPct, 1)}%`, riskPct >= AUTO.maxRiskTotalPct ? 'down' : '')
+    + cell('名义敞口', `${fmt(uNot, 0)} · ${fmt(notX, 1)}×`, notX >= AUTO.maxLevNotional ? 'down' : '')
+    + cell('累计单据', S1.total)
     + cell('持仓中', S1.open, S1.open ? '' : 'mut')
-    + cell('止盈 / 止损', `${S1.win} / ${S1.loss}`)
+    + cell('止盈 / 止损', `${S1.win} / ${S1.loss}${S1.liq ? `（含强平 ${S1.liq}）` : ''}`)
     + cell('胜率', S1.rate == null ? '—' : S1.rate.toFixed(0) + '%')
     + cell('累计净盈亏', (S1.net >= 0 ? '+' : '') + fmt(S1.net, 2), S1.net >= 0 ? 'up' : 'down')
     + cell('今日 / 盈亏', `${S2.total} · ${(S2.net >= 0 ? '+' : '') + fmt(S2.net, 2)}`, S2.net >= 0 ? 'up' : 'down');
@@ -4340,18 +5399,27 @@ function renderAuto() {
   const px = autoPx();
   const oi = $('#autoOpenInfo');
   if (oi) {
-    if (!open.length) {
-      oi.innerHTML = '<span class="mut">当前无持仓' + (AUTO.on ? '，等待下一档' : '') + '</span>';
-    } else {
-      oi.innerHTML = open.map(o => {
+    const parts = [];
+    // P0-4：显示正在等待的扫单状态
+    if (AUTO.pendingSweep) {
+      const p = AUTO.pendingSweep;
+      const left = Math.max(0, p.deadline - now());
+      const m = Math.floor(left / 60000), s = Math.floor((left % 60000) / 1000);
+      parts.push(`<span><b class="${p.bias === 'long' ? 'up' : 'down'}">等待扫单收回</b>
+        <span class="mut">${fmt(p.sweepLo, p.T.dp)} – ${fmt(p.sweepHi, p.T.dp)} · ${p.bias === 'long' ? '跌进后做多' : '涨进后做空'} · 剩余 ${m}:${String(s).padStart(2, '0')}</span></span>`);
+    }
+    if (open.length) {
+      parts.push(...open.map(o => {
         const fl = (px > 0) ? autoPnl(o, px) : null;
         const cls = fl ? (fl.pnl >= 0 ? 'up' : 'down') : '';
         return `<span><b class="${o.side === 'long' ? 'up' : 'down'}">${o.side === 'long' ? '做多' : '做空'}</b>
           ${fmt(o.entry, 2)} → 现 ${px ? fmt(px, 2) : '—'}
-          <span class="mut">SL ${fmt(o.sl, 2)} · TP ${fmt(o.tp1, 2)}</span></span>
+          <span class="mut">SL ${fmt(o.sl, 2)} · TP ${fmt(o.tp1, 2)} · 保证金 ${fmt(o.margin, 0)} · 风险 ${fmt(autoRiskAmt(o), 0)}</span></span>
           <span class="num ${cls}">${fl ? (fl.pnl >= 0 ? '+' : '') + fmt(fl.pnl, 2) + '（' + (fl.pnlPct >= 0 ? '+' : '') + fmt(fl.pnlPct, 1) + '%）' : '—'}</span>`;
-      }).join('');
+      }));
     }
+    oi.innerHTML = parts.length ? parts.join('')
+      : '<span class="mut">当前无持仓' + (AUTO.on ? '，等待下一档' : '') + '</span>';
   }
 
   const tk = $('#autoTodayKey');
@@ -4373,11 +5441,22 @@ function renderAuto() {
   const nt = $('#autoNote');
   if (nt) {
     nt.innerHTML = '模拟盘：不接任何交易所 API，不产生真实成交，所有价位与成交均为按真实行情推演的账面记录。'
-      + '每单方向取自做市商结论（做多 / 做空；观望则跳过该档）；市价成交，止损用结构风险距离、止盈按 '
-      + fmt(AUTO.rr, 2) + ' : 1 反推，两位小数，到价即执行、不再确认；单据只增不删。'
-      + '手续费按 taker ' + (AUTO_FEE * 100).toFixed(3) + '% × 2（开平各一次）计入。'
-      + '<b>浏览器完全关闭期间脚本不会运行</b>，重开页面时会按自然时间网格补齐错过的档位（最多 '
-      + AUTO_CATCH_CAP + ' 单，标注「补单」，成交价取补单时刻的真实市价）。';
+      + '<br><b>方向只来自四周期融合决策</b>：4h 定趋势 → 1h 筛选机会 → 30m 观察回调 → 15m 触发进场，'
+      + '任何一层不过就整体观望；不再读「设置里的单个周期」。价位按执行周期 '
+      + (MTF_LABEL[AUTO.tf] || AUTO.tf) + ' 的结构给出，方向强制与总决策一致。'
+      + '15m 处于扫单结构时，需价格真正进入扫单带才反向开仓（页面写「等扫单收回」，执行也真的等）。'
+      + '<br><b>成交与成本</b>：市价成交按当前买卖价差的一半 + 1bp 冲击成本计滑点，不再是「报价即成交价」；'
+      + '止盈止损除轮询价外，还用 K 线 high/low 区间补判（避免 7 秒轮询漏掉插针），跳空按开盘价成交。'
+      + '手续费 taker ' + (AUTO_FEE * 100).toFixed(3) + '% × 2（开平各一次）；'
+      + '持仓跨越 8 小时结算点计资金费（取不到费率记 0）。'
+      + '<br><b>仓位与风控</b>：保证金由权益倒推，单笔风险 ≤ 权益 ' + fmt(AUTO.riskPerTradePct, 1) + '%、'
+      + '在持风险合计 ≤ ' + fmt(AUTO.maxRiskTotalPct, 1) + '%、总名义敞口 ≤ 权益 ' + fmt(AUTO.maxLevNotional, 0) + ' 倍、'
+      + '单笔保证金 ≤ 权益 ' + fmt(AUTO.maxMarginPct, 0) + '%，同时持仓不超过 ' + AUTO.maxOpen + ' 笔；任一条不满足即跳过该档。'
+      + '<br><b>数据新鲜度</b>：报价超过 30s、K 线停更 / 断档 / 最后一根过期、四周期任一份缺失、'
+      + '网络取数失败超过 90s，一律禁止开仓。'
+      + '<br><b>浏览器完全关闭期间脚本不会运行</b>，重开页面时错过的档位统一记为「跳过」，'
+      + '不再按当前行情补开新单（要评估历史表现请用下面的离线回放）。'
+      + '<br>' + CONF_NOTE + ' ' + INDEP_NOTE + ' ' + SWEEP_TENDENCY_NOTE;
   }
   renderAutoLight();
 }
@@ -4386,7 +5465,11 @@ function renderAutoLight() {
   const n = $('#autoNext');
   if (n) {
     if (!AUTO.on) { n.textContent = '未启动'; }
-    else {
+    else if (AUTO.pendingSweep) {
+      const left = Math.max(0, AUTO.pendingSweep.deadline - now());
+      const m = Math.floor(left / 60000), s = Math.floor((left % 60000) / 1000);
+      n.textContent = `扫单倒计时 ${m}:${String(s).padStart(2, '0')}`;
+    } else {
       const left = Math.max(0, AUTO.nextAt - now());
       const m = Math.floor(left / 60000), s = Math.floor((left % 60000) / 1000);
       n.textContent = `下一单 ${m}:${String(s).padStart(2, '0')}`;
@@ -4412,21 +5495,38 @@ function bindAuto() {
     const lv = parseFloat($('#autoLv').value);
     const rr = parseFloat($('#autoRr').value);
     const tf = $('#autoTf').value;
+    const mo = parseInt($('#autoMaxOpen').value, 10);
+    const bl = parseFloat($('#autoBalance').value);
+    const rp2 = parseFloat($('#autoRiskPct').value);
+    const rt = parseFloat($('#autoRiskTot').value);
+    const mn = parseFloat($('#autoMaxNot').value);
+    const mp = parseFloat($('#autoMarginPct').value);
     AUTO.ivMin = clamp(isFinite(iv) ? iv : AUTO_IV_DEF, 1, 720);
     AUTO.margin = clamp(isFinite(mg) ? mg : 1000, 10, 1e6);
     AUTO.lev = clamp(isFinite(lv) ? lv : 10, 1, 125);
     AUTO.rr = clamp(isFinite(rr) ? rr : 1.5, 1, 10);
+    AUTO.maxOpen = clamp(isFinite(mo) ? mo : 5, 1, 50);
+    AUTO.balance = clamp(isFinite(bl) ? bl : 10000, 100, 1e9);
+    AUTO.riskPerTradePct = clamp(isFinite(rp2) ? rp2 : 2, 0.1, 20);
+    AUTO.maxRiskTotalPct = clamp(isFinite(rt) ? rt : 6, 0.5, 50);
+    AUTO.maxLevNotional = clamp(isFinite(mn) ? mn : 20, 1, 200);
+    AUTO.maxMarginPct = clamp(isFinite(mp) ? mp : 40, 5, 100);
     if (TF_MAP[tf]) AUTO.tf = tf;
     autoSave(); renderAuto(); toast('参数已保存');
   };
   const ex = $('#autoExport');
   if (ex) ex.onclick = () => {
-    const head = ['时间', '品种', '周期', '方向', '入场', '止损', '止盈', '出场', '状态', '盈亏', '盈亏%', '信号', '一致度', '补单'];
+    const head = ['时间', '品种', '周期', '方向', '保证金', '名义', '入场', '止损', '止盈', '出场',
+      '状态', '出场方式', '毛盈亏', '手续费', '资金费', '盈亏', '盈亏%', '信号', '四层一致度', '错过档位'];
     const rows = AUTO.orders.map(o => [
       new Date(o.t).toLocaleString('zh-CN', { hour12: false }), o.sym, o.tf,
       o.side === 'long' ? '做多' : o.side === 'short' ? '做空' : '观望',
+      o.margin || '', o.notional || '',
       o.entry || '', o.sl || '', o.tp1 || '', o.exitPx || '',
-      o.status, o.pnl != null ? o.pnl.toFixed(2) : '', o.pnlPct != null ? o.pnlPct.toFixed(2) : '',
+      o.status, o.exitGap ? '跳空' : (o.exitSrc === 'bar' ? 'K线区间' : '报价'),
+      o.gross != null ? o.gross.toFixed(2) : '', o.fee != null ? o.fee.toFixed(2) : '',
+      o.fund != null ? o.fund.toFixed(2) : '',
+      o.pnl != null ? o.pnl.toFixed(2) : '', o.pnlPct != null ? o.pnlPct.toFixed(2) : '',
       (o.sig && o.sig.text) || '', (o.sig && o.sig.conf) || '', o.catchup ? 'Y' : '',
     ]);
     const csv = '\ufeff' + [head, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
@@ -4435,13 +5535,280 @@ function bindAuto() {
     a.download = 'auto-orders-' + dayKey(now()) + '.csv';
     a.click();
   };
+  const rp = $('#replayRun');
+  if (rp) rp.onclick = async () => {
+    const label = rp.textContent;
+    rp.disabled = true; rp.textContent = '回放中…';
+    try {
+      let d = (S.klines[AUTO.sym] || {})[AUTO.tf];
+      if (!d || !d.bars || d.bars.length < 60) {
+        try { await loadKlines(AUTO.sym, AUTO.tf); } catch (e) { /* 取数失败时 renderReplay 会给出提示 */ }
+        d = (S.klines[AUTO.sym] || {})[AUTO.tf];
+      }
+      renderReplay();
+    } finally { rp.disabled = false; rp.textContent = label; }
+  };
   // 参数面板回填当前值
   const iv = $('#autoIv'), mg = $('#autoMg'), lv = $('#autoLv'), rr = $('#autoRr'), tf = $('#autoTf');
+  const mo = $('#autoMaxOpen'), bl = $('#autoBalance'), rp2 = $('#autoRiskPct');
+  const rt = $('#autoRiskTot'), mn = $('#autoMaxNot'), mp = $('#autoMarginPct');
   if (iv) iv.value = AUTO.ivMin;
   if (mg) mg.value = AUTO.margin;
   if (lv) lv.value = AUTO.lev;
   if (rr) rr.value = AUTO.rr;
   if (tf) tf.value = AUTO.tf;
+  if (mo) mo.value = AUTO.maxOpen;
+  if (bl) bl.value = AUTO.balance;
+  if (rp2) rp2.value = AUTO.riskPerTradePct;
+  if (rt) rt.value = AUTO.maxRiskTotalPct;
+  if (mn) mn.value = AUTO.maxLevNotional;
+  if (mp) mp.value = AUTO.maxMarginPct;
+}
+
+/* ============================ P1-3：历史回放与样本外验证 ============================
+ * 用已加载的一段真实 K 线离线跑一遍策略，只写回放结果，不污染真实 AUTO 订单。
+ * 输出：总单数、胜率、净盈亏、最大回撤、手续费、不同市况表现。
+ * 样本外验证：按时间把序列切成 前 70%（样本内） / 后 30%（样本外），
+ * 两段分别统计 —— 若样本外明显劣化，说明参数大概率过拟合，不能上真实盘。
+ * 注意：回放窗口受 KBAR_CAP（1000 根）限制，样本量有限，结论只能作参考。 */
+function replayStatsOf(list) {
+  const closed = list.filter(o => o.status !== 'open');
+  const win = closed.filter(o => o.pnl > 0).length;
+  let eq = 0, peak = 0, dd = 0;
+  for (const o of list) {
+    eq += o.pnl;
+    if (eq > peak) peak = eq;
+    const d = peak - eq;
+    if (d > dd) dd = d;
+  }
+  const byReg = { up: [], down: [], range: [] };
+  for (const o of list) (byReg[o.regime] || byReg.range).push(o);
+  const regOf = k => {
+    const l = byReg[k] || [];
+    const c = l.filter(o => o.status !== 'open');
+    const w = c.filter(o => o.pnl > 0).length;
+    return { n: l.length, win: w, loss: c.length - w, net: l.reduce((s, o) => s + o.pnl, 0) };
+  };
+  return {
+    total: list.length, closed: closed.length, open: list.length - closed.length,
+    win, loss: closed.length - win,
+    rate: closed.length ? win / closed.length * 100 : null,
+    net: list.reduce((s, o) => s + o.pnl, 0),
+    fees: list.reduce((s, o) => s + o.fee, 0),
+    maxDd: dd,
+    regimes: { up: regOf('up'), down: regOf('down'), range: regOf('range') },
+  };
+}
+function autoReplay(bars, params) {
+  const { ivMin = AUTO.ivMin, margin = AUTO.margin, lev = AUTO.lev, rr = AUTO.rr } = params || {};
+  const ivMs = Math.max(1, ivMin) * 60000;
+  const n = bars.length;
+  if (n < 60) return { error: 'K 线不足 60 根，无法回放' };
+  const step = bars[1].t - bars[0].t;
+  if (!(step > 0)) return { error: 'K 线时间戳异常' };
+  const ivBars = Math.max(1, Math.round(ivMs / step));
+  const orders = [];
+  let i = 50;                            // 等足够历史让指标热身
+  while (i < n) {
+    const visible = bars.slice(0, i + 1);
+    const px = bars[i].c;
+    const T = mmTradeOf(AUTO.sym, AUTO.tf, visible);
+    if (T.bias !== 'long' && T.bias !== 'short') { i += ivBars; continue; }
+    const dist = Math.abs(T.px - T.sl) || T.atr || px * 0.01;
+    const L = autoLevels(px, T.bias, dist, rr);
+    if (!L) { i += ivBars; continue; }
+
+    /* 与实盘同口径：入场/出场都计滑点，持仓跨越 8 小时结算点计资金费。
+     * 回放原本是「零滑点完美成交」，胜率与净盈亏都被系统性高估 —— 用它验证出来的
+     * 参数放到实盘只会更差。这里改成跟模拟盘一模一样的口径，才有对比意义。 */
+    const spread = autoSpreadPct(), fund = autoFundingRate();
+    const entryPx = autoSlipPx(px, T.bias, true, spread);
+    let exit = null, exitPx = null, exitIdx = i;
+    for (let j = i + 1; j < n; j++) {
+      const hit = autoHit(T.bias, L.sl, L.tp1, bars[j].l, bars[j].h);
+      if (hit) {
+        exit = hit;
+        const lvl = hit === 'sl' ? L.sl : L.tp1;
+        const gapped = T.bias === 'long'
+          ? (hit === 'sl' ? bars[j].o < L.sl : bars[j].o > L.tp1)
+          : (hit === 'sl' ? bars[j].o > L.sl : bars[j].o < L.tp1);
+        exitPx = autoSlipPx(gapped ? bars[j].o : lvl, T.bias, false, spread);
+        exitIdx = j;
+        break;
+      }
+    }
+    if (!exit) { exit = 'open'; exitPx = bars[n - 1].c; exitIdx = n - 1; }
+
+    const notional = margin * lev;
+    const qty = notional / entryPx;
+    const gross = (exitPx - entryPx) * qty * (T.bias === 'long' ? 1 : -1);
+    const fee = notional * AUTO_FEE * 2;
+    const fund0 = fund == null ? 0
+      : -fund * autoFundCount(bars[i].t, bars[exitIdx].t) * notional * (T.bias === 'long' ? 1 : -1);
+    const pnl = gross - fee + fund0;
+
+    /* 市况分类：用「区间涨跌 vs 同期噪声尺度」判断，而不是拍一个固定百分比 ——
+     * 固定阈值在不同品种、不同周期上会整体偏向趋势或震荡，失去参考价值。
+     * 噪声尺度 = 单根平均绝对涨跌 × √根数（随机游走的位移量级）。 */
+    const look = Math.min(20, i);
+    const prev = bars[i - look].c;
+    const chg = (px / prev - 1) * 100;
+    let noise = 0;
+    for (let k = i - look + 1; k <= i; k++) noise += Math.abs(bars[k].c / bars[k - 1].c - 1) * 100;
+    noise = noise / look * Math.sqrt(look);
+    const regime = chg > noise ? 'up' : chg < -noise ? 'down' : 'range';
+
+    orders.push({
+      idx: i, exitIdx, side: T.bias, entry: entryPx, sl: L.sl, tp1: L.tp1,
+      exitPx, status: exit === 'open' ? 'open' : (exit === 'tp' ? 'win' : 'loss'),
+      gross, fee, fund: fund0, pnl, pnlPct: pnl / margin * 100, regime,
+      mode: T.mode,
+    });
+    i = exitIdx + ivBars;
+  }
+
+  /* 按时间切分：前 70% 样本内，后 30% 样本外。样本外段从未来得及参与「调参」的角度
+   * 检验策略，两段表现接近才说明结论稳健。 */
+  const cut = Math.floor(n * 0.7);
+  return {
+    orders, n, cut, from: bars[0].t, to: bars[n - 1].t,
+    stats: replayStatsOf(orders),
+    ins: replayStatsOf(orders.filter(o => o.idx < cut)),
+    oos: replayStatsOf(orders.filter(o => o.idx >= cut)),
+  };
+}
+
+function renderReplay() {
+  const el = $('#replayResult'), meta = $('#replayMeta');
+  if (!el) return;
+  const symId = AUTO.sym, tfKey = AUTO.tf;
+  const s0 = SYMS[symId] || { label: symId }, tf0 = TF_MAP[tfKey] || { label: tfKey };
+  const d = (S.klines[symId] || {})[tfKey];
+  const setMeta = t => { if (meta) meta.textContent = t; };
+  if (!d || !d.bars || d.bars.length < 60) {
+    setMeta(`${s0.label} · ${tf0.label} · K 线不足`);
+    el.innerHTML = '<span class="mut">当前品种/周期的 K 线不足 60 根，无法回放。点「运行回放」会先尝试拉取。</span>';
+    return;
+  }
+  const r = autoReplay(d.bars, { ivMin: AUTO.ivMin, margin: AUTO.margin, lev: AUTO.lev, rr: AUTO.rr });
+  if (r.error) { setMeta('回放失败'); el.innerHTML = `<span class="mut">${r.error}</span>`; return; }
+
+  const day = t => new Date(t).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+  setMeta(`${s0.label} · ${tf0.label} · ${r.n} 根 K 线 · ${day(r.from)} – ${day(r.to)} · 前 ${Math.round(r.cut / r.n * 100)}% 样本内 / 后 ${Math.round((r.n - r.cut) / r.n * 100)}% 样本外`);
+
+  const cell = (label, val, cls) => `<div class="st"><span>${label}</span><b class="${cls || ''}">${val}</b></div>`;
+  const block = (title, s, note) => {
+    if (!s || !s.total) return `<div class="mut" style="margin-top:6px">${title}：无成交样本</div>`;
+    return `<div style="margin-top:8px;font-size:11px;font-weight:700">${title}${note ? ` <span class="mut" style="font-weight:400">${note}</span>` : ''}</div>`
+      + `<div class="auto-stat" style="margin-top:4px">`
+      + cell('单数', s.total)
+      + cell('胜率', s.rate == null ? '—' : s.rate.toFixed(0) + '%')
+      + cell('净盈亏', (s.net >= 0 ? '+' : '') + fmt(s.net, 2), s.net >= 0 ? 'up' : 'down')
+      + cell('最大回撤', fmt(s.maxDd, 2), 'down')
+      + cell('手续费', fmt(s.fees, 2))
+      + `</div>`;
+  };
+  const reg = s => {
+    if (!s || !s.total) return '';
+    const nm = { up: '上升', down: '下降', range: '震荡' };
+    return ['up', 'down', 'range'].map(k => {
+      const x = s.regimes[k];
+      return `${nm[k]} ${x.n} 单 · ${(x.net >= 0 ? '+' : '') + fmt(x.net, 2)} · 胜率 ${x.n ? Math.round(x.win / x.n * 100) : '—'}%`;
+    }).join(' ／ ');
+  };
+  el.innerHTML = block('全段', r.stats, '已平 ' + r.stats.closed + ' 单')
+    + `<div class="mut" style="margin-top:4px;line-height:1.7">市况：${reg(r.stats)}</div>`
+    + block('样本内 · 前 70%', r.ins)
+    + block('样本外 · 后 30%', r.oos, r.oos && r.oos.total ? '未参与调参' : '')
+    + `<div class="mut" style="margin-top:8px;line-height:1.7">`
+    + `样本外与样本内表现接近 → 参数较稳健；样本外明显劣化 → 大概率过拟合，勿用于真实资金。<br>`
+    + `回放为离线模拟，已计入买卖价差滑点与资金费率，口径与实时自动下单一致；`
+    + `但它跑的是单周期（${tf0.label}）结论，不含四周期融合过滤，因此比实时模拟盘更宽松 —— 这是保守方向的偏差。`
+    + `</div>`;
+}
+// 端到端测试访问（app.js 在严格模式下求值，内部函数不会挂到 window）
+if (typeof window !== 'undefined') {
+  window.autoReplay = autoReplay;
+  window.replayStatsOf = replayStatsOf;
+  window.renderReplay = renderReplay;
+}
+
+/* ============================ P2-2：密钥与本机数据 ============================
+ * 现状：这是纯静态页面，没有后端，所以密钥只能落在浏览器 localStorage。
+ * 这里要做三件事：1) 把「配了什么、值是什么（掩码）」显式摆出来；
+ * 2) 提供一键清除，不留「配过但忘了在哪」的隐患；
+ * 3) 提供持久化记录的备份 / 恢复，避免清缓存把模拟持仓和自动交易单据一起带走。
+ * 真正的「后端安全存储」需要服务端：密钥存环境变量、记录存数据库、前端只拿临时票据，
+ * 静态页做不到 —— 这一点在页面上写明了，不假称安全。 */
+function maskSec(v) {
+  if (!v) return '未配置';
+  const s = String(v);
+  if (s.length <= 7) return s.slice(0, 1) + '•••••';
+  return s.slice(0, 4) + '•'.repeat(Math.min(10, s.length - 7)) + s.slice(-3);
+}
+function backupBlob() {
+  const data = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith('mb_')) data[k] = localStorage.getItem(k);
+  }
+  return { app: 'market-board', ver: 2, at: new Date().toISOString(), data };
+}
+function initSecPanel() {
+  const setTxt = (sel, txt) => { const el = $(sel); if (el) el.textContent = txt; };
+  const show = () => {
+    const pos = (JSON.parse(localStorage.getItem('mb_pos') || '[]')).length;
+    const ord = (JSON.parse(localStorage.getItem('mb_auto_v1') || '{}')).orders;
+    setTxt('#kAcKey', maskSec(localStorage.getItem('mb_ackey')));
+    setTxt('#kCgKey', maskSec(localStorage.getItem('mb_cgkey')));
+    setTxt('#kProxy', PROXY ? PROXY.replace(/^https?:\/\//, '').slice(0, 46) : '未配置（浏览器直连）');
+    setTxt('#kRecStat', `模拟持仓 ${pos} 笔 · 自动交易单据 ${Array.isArray(ord) ? ord.length : 0} 条`);
+  };
+  const clear = (keys, tip) => {
+    keys.forEach(k => localStorage.removeItem(k));
+    show(); toast(tip);
+  };
+  const b1 = $('#kAcClear');
+  if (b1) b1.onclick = () => {
+    AC_KEY = ''; AC_SEC = '';
+    clear(['mb_ackey', 'mb_acsec'], 'AiCoin Key 已清除');
+  };
+  const b2 = $('#kCgClear');
+  if (b2) b2.onclick = () => { CG_KEY = ''; clear(['mb_cgkey'], 'CoinGlass Key 已清除'); };
+  const b3 = $('#kProxyClear');
+  if (b3) b3.onclick = () => {
+    PROXY = ''; clear(['mb_proxy'], '代理已清除，改为直连');
+    Object.keys(S.venues).forEach(k => delete S.venues[k]); S.klines = {}; refresh(true);
+  };
+  const bk = $('#kBackup');
+  if (bk) bk.onclick = () => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(backupBlob(), null, 2)], { type: 'application/json' }));
+    a.download = 'market-board-backup-' + dayKey(now()) + '.json';
+    a.click();
+    toast('已导出备份（含密钥，请妥善保管）');
+  };
+  const rs = $('#kRestore'), rf = $('#kRestoreFile');
+  if (rs && rf) {
+    rs.onclick = () => rf.click();
+    rf.onchange = () => {
+      const f = rf.files && rf.files[0];
+      if (!f) return;
+      const fr = new FileReader();
+      fr.onload = () => {
+        try {
+          const j = JSON.parse(String(fr.result));
+          if (!j || j.app !== 'market-board' || !j.data) throw new Error('不是本看板的备份文件');
+          if (!confirm(`将用备份覆盖当前本机数据（${Object.keys(j.data).length} 项），并重新加载页面。继续？`)) return;
+          Object.keys(j.data).forEach(k => localStorage.setItem(k, j.data[k]));
+          location.reload();
+        } catch (e) { toast('恢复失败：' + (e.message || e)); }
+        rf.value = '';
+      };
+      fr.readAsText(f);
+    };
+  }
+  show();
 }
 
 (async function init() {
@@ -4455,6 +5822,7 @@ function bindAuto() {
   bindRefresh();
   bindEntry();
   bindAuto();
+  initSecPanel();
   renderAuto();
   renderHeatMeta();
   drawHeat();
@@ -4464,6 +5832,7 @@ function bindAuto() {
   await refreshOverview();                            // 五品种总览
   applyRefresh();                                     // 按当前刷新间隔启动定时刷新
   if (AUTO.on) await autoCatchUp();                   // 自动交易：按自然时间补齐错过的档位
+  if (AUTO.on && AUTO.pendingSweep) autoSweepExpire(); // 页面重开后若扫单已超时，立即 skip
 
   /* 自动交易用独立心跳，不受顶栏「暂停刷新」影响 —— 暂停只该停界面刷新，
    * 停掉自动交易会让人以为在跑其实没跑。浏览器把后台标签的 timer 节流到分钟级，

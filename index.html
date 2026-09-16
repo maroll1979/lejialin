@@ -112,6 +112,18 @@ body{padding-bottom:48px}
 .hero-name .mut{font-size:11px}
 .hero-px{font-size:42px;font-weight:600;letter-spacing:-1.2px;line-height:1.05;margin-top:6px}
 .hero-chg{font-size:16px;font-weight:700;margin-top:2px}
+/* P2-1：数据时间与来源必须紧跟价格显示 —— 价格再准，不知道几点的数据也无法决策 */
+.hero-stamp{font-size:10.5px;color:var(--tx-3);margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hero-stamp b{font-family:var(--mono);font-weight:600;color:var(--tx-2)}
+.hero-stamp .stale{color:var(--down);font-weight:600}
+.src-line{font-size:10.5px;color:var(--tx-3);margin-top:4px;line-height:1.6}
+.src-line b{color:var(--tx-2);font-weight:600}
+/* P2-2：密钥与本机数据面板 */
+.keyline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:1px dashed var(--line-2)}
+.keyline:last-of-type{border-bottom:0}
+.keyline-k{width:132px;flex:none;font-size:11.5px;color:var(--tx-2)}
+.keyline code{font-family:var(--mono);font-size:11.5px;color:var(--tx);background:var(--soft);
+  border:1px solid var(--line);border-radius:5px;padding:2px 7px}
 .metrics{display:flex;gap:24px;margin-left:auto;flex-wrap:wrap;align-items:flex-end}
 .metric span{display:block;font-size:10.5px;color:var(--tx-3);letter-spacing:.05em;margin-bottom:2px}
 .metric b{font-size:17px;font-weight:600;display:block}
@@ -129,6 +141,7 @@ body{padding-bottom:48px}
 .src{font-size:10px;color:var(--tx-3);padding:2px 7px;border:1px solid var(--line);border-radius:4px;white-space:nowrap}
 .src.real{color:var(--up);border-color:#c4e9d5;background:#f2fbf6}
 .src.syn{color:var(--warn);border-color:#ecdfc4;background:#fdf8ec}
+.src.warn{color:var(--down);border-color:#f6cccc;background:#fff2f2}
 .cv-wrap{position:relative;padding:8px 0 0}
 #kline{display:block;width:100%;height:440px;cursor:crosshair;touch-action:none}
 @media(max-width:820px){#kline{height:340px}}
@@ -401,6 +414,38 @@ select.inp{font-family:inherit;cursor:pointer}
 .rf-now.busy{opacity:.62;pointer-events:none}
 .icon-btn.sm2{width:28px;height:28px;font-size:11px}
 
+/* ---------- 四周期融合决策（唯一总决策） ---------- */
+.mtf{border:1px solid var(--line);border-radius:10px;background:var(--soft);
+  padding:11px 13px 12px;margin-bottom:12px}
+.mtf-hd{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:10px}
+.mtf-t{font-size:12.5px;font-weight:800;letter-spacing:.02em}
+.mtf-badge{font-size:12px;font-weight:800;color:#fff;padding:3px 12px;border-radius:6px;
+  letter-spacing:.05em;line-height:1.5}
+.mtf-badge.up,.mtf-badge.long{background:var(--up)}
+.mtf-badge.down,.mtf-badge.short{background:var(--down)}
+.mtf-badge.flat{background:#8a93a6}
+.mtf-conf{font-size:10.5px;color:var(--tx-3);border:1px dashed var(--line-2);
+  border-radius:5px;padding:1px 7px;cursor:help}
+.mtf-pipe{display:flex;align-items:stretch;gap:0;flex-wrap:nowrap;overflow-x:auto;padding-bottom:2px}
+.mtf-step{position:relative;flex:1 1 0;min-width:118px;border:1px solid var(--line);
+  border-radius:8px;background:var(--card);padding:8px 9px 9px}
+.mtf-step.pass{border-color:#bfe3cd;background:#f4fbf7}
+.mtf-step.fail{border-color:#f0d3d3;background:#fdf6f6}
+.mtf-step.nodata{opacity:.55}
+.mtf-n{position:absolute;top:-8px;left:8px;width:17px;height:17px;border-radius:50%;
+  background:var(--tx-3);color:#fff;font-size:10.5px;font-weight:800;line-height:17px;text-align:center}
+.mtf-step.pass .mtf-n{background:var(--up)}
+.mtf-step.fail .mtf-n{background:var(--down)}
+.mtf-b{display:flex;flex-direction:column;gap:1px;margin:3px 0 5px}
+.mtf-b span{font-size:11px;font-weight:700}
+.mtf-b b{font-size:10px;font-weight:500;color:var(--tx-3)}
+.mtf-v{font-size:14px;font-weight:800;line-height:1.2}
+.mtf-s{font-size:10px;color:var(--tx-3);margin-top:2px;min-height:13px}
+.mtf-arrow{align-self:center;flex:0 0 auto;font-size:17px;color:var(--tx-3);
+  font-style:normal;padding:0 5px;line-height:1}
+.mtf-why{margin:9px 0 0;padding-left:16px;font-size:11px;color:var(--tx-2);line-height:1.75}
+.mtf-why li{margin:0}
+
 /* ---------- 做市商结论（重点区） ---------- */
 .vd{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap;
   border:1px solid var(--line);border-radius:10px;background:var(--soft);padding:13px 15px 14px}
@@ -416,6 +461,8 @@ select.inp{font-family:inherit;cursor:pointer}
 .vd-meta div{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 11px;min-width:78px}
 .vd-meta span{display:block;font-size:10px;color:var(--tx-3);letter-spacing:.04em}
 .vd-meta b{font-size:15px;font-weight:700;font-family:var(--mono);letter-spacing:-.3px}
+.vd-meta u.vd-sub{display:block;font-size:9.5px;color:var(--tx-3);text-decoration:none;
+  font-family:var(--mono);margin-top:1px;letter-spacing:-.2px}
 @media(max-width:760px){.vd-meta{margin-left:0}}
 
 .lv4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
@@ -464,6 +511,24 @@ details.sub .mm-hd{margin-top:12px}
 .hz .rg{font-family:var(--mono);font-weight:600;letter-spacing:-.2px}
 .hz .mt{font-size:10.5px;color:var(--tx-3);font-family:var(--mono)}
 .hz .wg{margin-left:auto;font-size:10.5px;color:var(--tx-2);font-family:var(--mono);white-space:nowrap}
+/* 模型假设面板：和热力图同屏，避免把推算结果当成真实爆仓位置 */
+.hmodel{margin:10px 0 0;border:1px solid #f0d9a8;border-radius:8px;background:#fffbf2}
+.hmodel>summary{cursor:pointer;padding:8px 12px;font-size:11.5px;font-weight:700;color:#8a6212;
+  list-style:none;user-select:none}
+.hmodel>summary::-webkit-details-marker{display:none}
+.hmodel>summary::before{content:'▸ ';font-size:10px}
+.hmodel[open]>summary::before{content:'▾ '}
+.hmodel[open]>summary{border-bottom:1px solid #f0e2c4}
+.hm-chain{padding:9px 12px 0;font-size:11.5px;color:var(--tx-2);line-height:1.7}
+.hm-chain b{font-family:var(--mono);color:var(--tx-1);font-weight:600}
+.hm-cv{padding:8px 12px 0;display:flex;flex-direction:column;gap:6px}
+.hm-row{display:flex;gap:8px;font-size:11px;line-height:1.65}
+.hm-row b{flex:0 0 132px;color:#8a6212;font-weight:600}
+.hm-row span{color:var(--tx-2)}
+.hm-lev{padding:8px 12px 0;font-size:11px;color:var(--tx-2)}
+.hm-lev b{font-family:var(--mono);color:var(--tx-1)}
+.hm-vd{margin:8px 12px 10px;padding:7px 10px;border-radius:6px;background:#fdf3e0;
+  font-size:11px;line-height:1.7;color:#7a5510}
 .hlegend{display:flex;gap:12px;flex-wrap:wrap;padding:8px 14px 0;font-size:10.5px;color:var(--tx-3)}
 .hlegend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:-1px}
 
@@ -561,6 +626,7 @@ a.btn{text-decoration:none;display:inline-block;line-height:1.4}
       <div class="hero-name"><b id="qName">—</b><span class="badge" id="qBadge">—</span></div>
       <div class="hero-px num" id="qPx">—</div>
       <div class="hero-chg num" id="qChg">—</div>
+      <div class="hero-stamp" id="qStamp">—</div>
     </div>
     <div class="metrics">
       <div class="metric"><span>永续最高</span><b class="num up" id="qHi">—</b><i id="qHiV">—</i></div>
@@ -587,6 +653,7 @@ a.btn{text-decoration:none;display:inline-block;line-height:1.4}
           </div>
         </div>
         <div class="card-b">
+          <div class="mtf" id="mtfBox"></div>
           <div class="vd" id="mmVerdict"></div>
           <div class="lv4" id="mmLevels"></div>
           <div class="rr" id="mmRr"></div>
@@ -616,13 +683,14 @@ a.btn{text-decoration:none;display:inline-block;line-height:1.4}
           <div class="auto-open" id="autoOpenInfo">—</div>
 
           <details class="sub" id="autoSet">
-            <summary>参数 · 间隔 / 保证金 / 杠杆 / 盈亏比 / 周期</summary>
+            <summary>参数 · 间隔 / 保证金 / 杠杆 / 盈亏比 / 执行周期 / 账户风控</summary>
             <div class="auto-form">
               <label>下单间隔 <input class="inp" id="autoIv" type="number" min="1" max="720" step="1" value="30"> 分钟</label>
-              <label>每单保证金 <input class="inp" id="autoMg" type="number" min="10" step="10" value="1000"> USDT</label>
+              <label>每单保证金上限 <input class="inp" id="autoMg" type="number" min="10" step="10" value="1000"> USDT</label>
               <label>杠杆 <input class="inp" id="autoLv" type="number" min="1" max="125" step="1" value="10"> ×</label>
               <label>盈亏比 <input class="inp" id="autoRr" type="number" min="1" step="0.1" value="1.5"> : 1</label>
-              <label>结论周期
+              <label>最大持仓 <input class="inp" id="autoMaxOpen" type="number" min="1" max="50" step="1" value="5"> 笔</label>
+              <label>执行周期
                 <select class="inp" id="autoTf" style="width:96px">
                   <option value="15m">15 分钟</option>
                   <option value="30m">30 分钟</option>
@@ -630,8 +698,18 @@ a.btn{text-decoration:none;display:inline-block;line-height:1.4}
                   <option value="4h">4 小时</option>
                 </select>
               </label>
-              <button class="btn" id="autoSaveSet">保存参数</button>
             </div>
+            <div class="auto-form" style="border-top:1px dashed var(--line);margin-top:8px;padding-top:9px">
+              <label>初始资金 <input class="inp" id="autoBalance" type="number" min="100" step="100" value="10000"> USDT</label>
+              <label>单笔风险 ≤ <input class="inp" id="autoRiskPct" type="number" min="0.1" max="20" step="0.5" value="2"> % 权益</label>
+              <label>在持风险 ≤ <input class="inp" id="autoRiskTot" type="number" min="0.5" max="50" step="0.5" value="6"> % 权益</label>
+              <label>名义敞口 ≤ <input class="inp" id="autoMaxNot" type="number" min="1" max="200" step="1" value="20"> × 权益</label>
+              <label>单笔保证金 ≤ <input class="inp" id="autoMarginPct" type="number" min="5" max="100" step="5" value="40"> % 权益</label>
+              <span class="mut" style="flex:1 1 100%;font-size:10.5px;line-height:1.7">
+                方向一律取自四周期融合决策（4h→1h→30m→15m），本面板只调「用什么周期算价位」与「能开多大仓位」。
+              </span>
+            </div>
+            <button class="btn" id="autoSaveSet">保存参数</button>
           </details>
 
           <div style="margin:12px 0 5px;font-size:11.5px;font-weight:700">今日单据 · <span class="mut" id="autoTodayKey" style="font-weight:400">—</span></div>
@@ -642,6 +720,17 @@ a.btn{text-decoration:none;display:inline-block;line-height:1.4}
             <div id="autoDays"></div>
             <button class="btn" id="autoExport" style="margin-top:10px">导出 CSV</button>
           </details>
+
+          <details class="sub" id="replayWrap" style="margin-top:10px">
+            <summary>历史回放与样本外验证 · 离线跑，不产生真实订单</summary>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 8px">
+              <button class="btn" id="replayRun">运行回放</button>
+              <span class="mut" id="replayMeta" style="font-size:10.5px">—</span>
+            </div>
+            <div id="replayResult"><span class="mut">点击「运行回放」，用已加载的真实 K 线离线跑一遍当前策略（自动交易品种与周期）。</span></div>
+          </details>
+
+          <div id="autoModel"></div>
 
           <div class="note" style="border:0;margin:0;padding:0" id="autoNote">—</div>
         </div>
@@ -683,10 +772,11 @@ a.btn{text-decoration:none;display:inline-block;line-height:1.4}
           <div class="hlegend">
             <span><i style="background:rgba(18,161,80,.85)"></i>圆点＝筹码密度（越大越厚）</span>
             <span><i style="background:rgba(225,59,59,.85)"></i>红＝空头筹码 · 绿＝多头筹码</span>
-            <span>虚线框＝识别出的清算区间，框上数字＝强度 %</span>
+            <span>虚线框＝模型识别的<b>潜在</b>清算区间，框上数字＝强度 %</span>
           </div>
           <div class="heat-stats" id="heatStats"></div>
           <div class="hz-list" id="heatZones"></div>
+          <div id="heatModel"></div>
           <div class="note" style="border:0;margin:0;padding:0" id="heatNote">—</div>
         </div>
       </details>
@@ -840,6 +930,33 @@ a.btn{text-decoration:none;display:inline-block;line-height:1.4}
         <li>国内服务器需先完成 <b>ICP 备案</b>；托管到 Cloudflare Pages / Vercel 等境外平台可免备案，证书自动签发。</li>
         <li>看板依赖交易所实时接口，<b>必须联网访问</b>；若所在网络无法直连，可在「数据源」填写自建代理地址。</li>
       </ul>
+      </div>
+    <details class="fold" id="secCard" style="margin-top:0">
+      <summary>密钥与本机数据 · 只存在这台浏览器里</summary>
+      <div class="card-b risk" style="padding:12px 14px">
+        <div class="keyline"><span class="keyline-k">AiCoin AccessKey</span><code id="kAcKey">—</code>
+          <button class="btn" id="kAcClear">清除</button></div>
+        <div class="keyline"><span class="keyline-k">CoinGlass API Key</span><code id="kCgKey">—</code>
+          <button class="btn" id="kCgClear">清除</button></div>
+        <div class="keyline"><span class="keyline-k">CORS 代理</span><code id="kProxy">—</code>
+          <button class="btn" id="kProxyClear">清除</button></div>
+
+        <div class="keyline" style="margin-top:10px">
+          <span class="keyline-k">持久化记录</span>
+          <code id="kRecStat">—</code>
+          <button class="btn" id="kBackup">备份 JSON</button>
+          <button class="btn" id="kRestore">恢复</button>
+          <input type="file" id="kRestoreFile" accept="application/json,.json" hidden>
+        </div>
+
+        <ul class="dom-steps" style="margin-top:10px">
+          <li>本页<b>不内置任何密钥</b>：AiCoin / CoinGlass 的 Key 由你在页面上填写，只写入<b>当前浏览器的 localStorage</b>，
+              不会出现在源码、链接或任何提交记录里，也不会上传到服务器。</li>
+          <li>localStorage <b>未加密</b>，共用电脑或公共网络环境下请勿填写；换浏览器 / 清缓存即失效，上面的「清除」可随时删除。</li>
+          <li>模拟持仓与自动交易单据同样只存本机。<b>清缓存前请先「备份 JSON」</b>，之后可用「恢复」导回。</li>
+          <li>需要多人共用或长期留存时，正确做法是把密钥和记录放到<b>后端服务</b>（密钥存服务端环境变量，记录存数据库），
+              前端只拿临时票据 —— 纯静态页面做不到这一点，这是当前架构的已知边界。</li>
+        </ul>
       </div>
     </details>
   </div>

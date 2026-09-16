@@ -28,6 +28,8 @@ global.localStorage = {
 };
 
 const EXPORT = '\n;module.exports={obv,obvFeat,zigzag,structFeat,bollFeat,macdFeat,fuseSignal,mmView,' +
+  'fuseIndep,FUSE_GROUP,FUSE_RHO,FUSE_INDEP_FULL,FUSE_MIN_INDEP,' +
+  'sweepTendency,sweepLabel,SWEEP_CALIB,SWEEP_TENDENCY_NOTE,CONF_NOTE,INDEP_NOTE,' +
   'kvRange,kvReset,FUSE_W,S,SYM_LIST,SYMS,clamp,fmt,boll,macd,atr,sma,ema,liqSignal,finishHeat,liqPools,magnetBands,' +
   'liqZones,heatScaleOf,kdj,kdjFeat};';
 const m = {};
@@ -35,6 +37,7 @@ new Function('module', 'exports', code + EXPORT)(m, {});
 const X = m.exports;
 const { obv, obvFeat, zigzag, structFeat, bollFeat, macdFeat, fuseSignal, mmView, kvRange, kvReset, FUSE_W, S } = X;
 const { clamp, fmt, SYM_LIST, liqZones, atr, kdj, kdjFeat } = X;
+const { fuseIndep, FUSE_GROUP, FUSE_RHO, FUSE_INDEP_FULL, FUSE_MIN_INDEP } = X;
 
 let pass = 0, fail = 0;
 const ok = (c, msg, extra = '') => {
@@ -275,7 +278,9 @@ H('[5] 做市商视角结论');
   ok(V.techSide === 'up', '识别技术面偏上方', String(V.techSide));
   ok(V.bias === 'long', '扫单情形下最终偏向取技术侧（做多）', V.bias);
   ok(V.sweep && V.sweep.side === 'down', '扫单目标在下方（先扫多单止损）', V.sweep && V.sweep.side);
-  ok(V.sweep.prob > 0.3 && V.sweep.prob < 0.95, '扫单概率在合理区间', fmt(V.sweep.prob, 3));
+  ok(V.sweep.score > 0.3 && V.sweep.score < 0.95, '扫单评分（相对评分，非概率）在合理区间', fmt(V.sweep.score, 3));
+  ok(V.sweep.prob === undefined, '扫单不再暴露名为 prob 的字段（避免被当概率渲染）', String(V.sweep.prob));
+  ok(V.sweep.tendency && ['high','mid','low'].includes(V.sweep.tendency.level), '扫单带出档位对象', JSON.stringify(V.sweep.tendency));
   ok(V.reasons.length >= 4, '给出至少 4 条依据（流动性/结构/动能/量能/波动）', V.reasons.length + '');
   ok(V.reasons.every(r => typeof r === 'string' && r.length > 0), '依据均为非空字符串');
   ok(!V.reasons.some(r => /NaN|undefined/.test(r)), '依据无 NaN / undefined');
@@ -524,6 +529,107 @@ H('[9] 全局健壮性');
   } catch (e) { crashed = e; }
   ok(!crashed, '短 K 线全流程不抛异常', crashed && crashed.message);
   S.heats = {};
+}
+
+H('[10] 因子同源折减：多个指标一致 ≠ 多份独立证据');
+{
+  /* 直接喂表态因子给 fuseIndep，验证「组内第 2、3、4 个因子几乎不再增加信息」。 */
+  const mk = ks => ks.map(k => ({ k, s: 0.5 }));
+  const e1 = fuseIndep(mk(['st']));
+  const e2 = fuseIndep(mk(['st', 'macd']));
+  const e3 = fuseIndep(mk(['st', 'macd', 'boll']));
+  const e4 = fuseIndep(mk(['st', 'macd', 'boll', 'kdj']));
+  ok(Math.abs(e1 - 1) < 1e-9, '1 个价格因子 = 1.00 份独立证据', fmt(e1, 3));
+  ok(e2 > 1.25 && e2 < 1.35, '2 个价格同源因子 ≈ 1.30 份（不是 2 份）', fmt(e2, 3));
+  ok(e3 > e2 && e3 < 1.45, '3 个 ≈ 1.39 份', fmt(e3, 3));
+  ok(e4 > e3 && e4 < 1.50, '4 个 ≈ 1.42 份（第四个几乎不增加信息）', fmt(e4, 3));
+  ok(Math.abs(fuseIndep(mk(['st', 'obv'])) - 2) < 1e-9, '价格 + 量能 = 2 份（不同源，可叠加）',
+    fmt(fuseIndep(mk(['st', 'obv'])), 3));
+  ok(Math.abs(fuseIndep(mk(['st', 'macd', 'boll', 'kdj', 'obv', 'liq'])) - (e4 + 2)) < 1e-9,
+    '价格四因子 + OBV + 清算 ≈ 3.42 份（六因子 ≠ 六份证据）');
+  ok(FUSE_GROUP.st === 'px' && FUSE_GROUP.macd === 'px' && FUSE_GROUP.boll === 'px' && FUSE_GROUP.kdj === 'px',
+    '结构 / MACD / BOLL / KDJ 同属 px 同源组');
+  ok(FUSE_GROUP.obv === 'vol' && FUSE_GROUP.liq === 'flow', 'OBV（成交量）与清算（热力图）各属独立来源');
+  ok(FUSE_RHO.px >= 0.6, 'px 组相关系数取高值（同源程度高）', String(FUSE_RHO.px));
+
+  /* 同源多数票压不过不同源反对票：4 个价格因子同向 + 量能反向，
+   * 原始一致度 4/5 = 80%，独立口径 1.42/(1.42+1) ≈ 59%。 */
+  const nAll = fuseIndep(mk(['st', 'macd', 'boll', 'kdj', 'obv']));
+  const nAgree = fuseIndep(mk(['st', 'macd', 'boll', 'kdj']));
+  const confInd = nAgree / nAll;
+  ok(confInd > 0.55 && confInd < 0.62, '独立口径一致度 ≈ 59%，明显低于原始 80%', fmt(confInd, 3));
+  ok(nAll / 5 < 0.5, '5 个表态因子折算后不足 2.5 份独立证据', fmt(nAll, 3));
+  ok(FUSE_MIN_INDEP > e2, '证据门槛高于「2 个价格同源因子」的 1.30 份 —— 只靠 MACD+KDJ 不给方向',
+    FUSE_MIN_INDEP + ' > ' + fmt(e2, 3));
+
+  /* 只有价格同源四因子同向（无量能 / 流动性佐证）时拿不到满额加成。 */
+  const depth = clamp(nAgree / FUSE_INDEP_FULL, 0, 1);
+  ok(depth > 0.6 && depth < 0.7, '独立证据深度 ≈ 0.64 → 加成打折', fmt(depth, 3));
+  ok(0.6 + 0.4 * 1 * depth < 0.9, '同源四因子全同向的加成系数 < 0.9（堆同源指标涨不上去）',
+    fmt(0.6 + 0.4 * depth, 3));
+
+  /* 清算修正：幅度上限 32%，且永远改不了技术面基准的符号。 */
+  const upB = mkBars(200, { drift: 0.003, volTrend: 0.5, seed: 77 });
+  const upx = upB[upB.length - 1].c;
+  S.heats = { BTC: { '1h': mkHeat(upx, { upBias: 0.02, dnBias: 6 }) } };
+  const Fu = fuseSignal('BTC', '1h', upB);
+  ok(Math.abs(Fu.liqAdj) <= 0.32 + 1e-9, '清算修正幅度不超过 ±32%', fmt(Fu.liqAdj, 3));
+  ok((Fu.base > 0) === (Fu.raw > 0), '清算修正翻不了技术面基准的符号（多头仍为正）',
+    fmt(Fu.base, 1) + ' → ' + fmt(Fu.raw, 1));
+  ok(Fu.nEff > 0 && Fu.nEff <= Fu.nEffAll + 1e-9, '同向独立证据数不超过表态证据总数',
+    fmt(Fu.nEff, 3) + ' ≤ ' + fmt(Fu.nEffAll, 3));
+  ok(Fu.confInd <= Fu.conf + 1e-9, '独立口径一致度不高于原始口径（同源折减只会降低）',
+    fmt(Fu.confInd, 3) + ' ≤ ' + fmt(Fu.conf, 3));
+  ok(Fu.confMult >= 0.6 && Fu.confMult <= 1, '一致性加成系数在 0.6~1.0', fmt(Fu.confMult, 3));
+  ok(Math.abs(Fu.score - clamp(Fu.raw * Fu.confMult, -100, 100)) < 1e-6, '合成分 = 原始分 × 加成系数',
+    fmt(Fu.score, 2));
+  S.heats = {};
+
+  /* 源码守卫：这几处一旦被改回「按因子个数投票」，同源折减就失效了。 */
+  ok(/const FUSE_GROUP\s*=/.test(src), '存在同源分组常量 FUSE_GROUP');
+  ok(/nEffAll < FUSE_MIN_INDEP/.test(src), '证据门槛按独立口径判定（不是按因子个数）');
+  ok(/0\.6 \+ 0\.4 \* confInd \* indepDepth/.test(src), '加成系数按独立口径 × 证据深度给');
+  ok(/fuseIndep\(act\)/.test(src), '表态因子先折算成有效独立证据数');
+}
+
+// ============================================================
+// [11] 扫单「倾向」不得显示成概率（固定公式无样本校准）
+// ============================================================
+{
+  const { sweepTendency, sweepLabel, SWEEP_CALIB, SWEEP_TENDENCY_NOTE } = X;
+  console.log('\n[11] 扫单倾向：未校准只给档位');
+  ok(typeof sweepLabel === 'function', 'sweepLabel 是唯一的对外展示入口');
+  ok(SWEEP_CALIB && SWEEP_CALIB.calibrated === false, '默认处于未校准状态', JSON.stringify(SWEEP_CALIB));
+  ok(SWEEP_CALIB.minSample >= 100, '设置了样本量门槛', SWEEP_CALIB.minSample);
+
+  const lv = [0.80, 0.62, 0.50, 0.45, 0.20].map(p => sweepLabel(p));
+  ok(lv[0].level === 'high' && lv[0].txt === '高', '高分 → 档位「高」', lv[0].txt);
+  ok(lv[1].level === 'high', '阈值 0.62 归入高档', lv[1].txt);
+  ok(lv[2].level === 'mid' && lv[2].txt === '中', '中分 → 档位「中」', lv[2].txt);
+  ok(lv[4].level === 'low' && lv[4].txt === '低', '低分 → 档位「低」', lv[4].txt);
+  ok(lv.every(t => !/%/.test(t.txt)), '未校准时任何档位都不显示百分比', lv.map(t => t.txt).join('/'));
+  ok(lv.every(t => t.calib === false), '未校准时 calib 标记为 false');
+  ok([0, 0.3, 0.62, 1, null, undefined].every(p => !/%/.test(sweepLabel(p).txt)),
+    '边界值（0 / 1 / null）也不会输出百分比');
+
+  // 校准后的行为：凑够样本 + 有实测频率表，才允许给概率
+  const bak = JSON.parse(JSON.stringify(SWEEP_CALIB));
+  SWEEP_CALIB.calibrated = true; SWEEP_CALIB.sample = 50; SWEEP_CALIB.byLevel = { high: 0.71, mid: 0.5, low: 0.2 };
+  ok(sweepLabel(0.8).txt === '高' && sweepLabel(0.8).calib === false, '样本量不足 → 仍然只给档位', sweepLabel(0.8).txt);
+  SWEEP_CALIB.sample = 300;
+  ok(sweepLabel(0.8).txt === '71%' && sweepLabel(0.8).calib === true, '样本足够且已校准 → 才给实测频率', sweepLabel(0.8).txt);
+  ok(sweepLabel(0.2).txt === '20%', '低档也走实测频率表', sweepLabel(0.2).txt);
+  SWEEP_CALIB.calibrated = bak.calibrated; SWEEP_CALIB.sample = bak.sample; SWEEP_CALIB.byLevel = bak.byLevel;
+  ok(sweepLabel(0.8).txt === '高', '还原校准状态后回到档位显示');
+
+  ok(/不是概率|未经历史样本校准/.test(SWEEP_TENDENCY_NOTE), '说明文案明确「不是概率」');
+
+  // 源码守卫：不许再把扫单分值叫 prob / 渲染成百分比
+  ok(!/\.sweep\.prob\b/.test(src), '源码不再引用 sweep.prob（字段已改名 score）');
+  ok(!/扫单概率/.test(src), '源码不再出现「扫单概率」字样');
+  ok(!/const prob\s*=/.test(src), '扫单计算段不再用 prob 命名变量');
+  ok(/const score = clamp\(0\.32/.test(src), '扫单分值变量命名为 score（钳位只用于排序）');
+  ok(/sweepLabel\(/.test(src), '渲染层统一走 sweepLabel 出口');
 }
 
 console.log('\n==============================================');

@@ -1,0 +1,13 @@
+{
+  "name": "market-board",
+  "version": "2.1.0",
+  "private": true,
+  "description": "五品种多平台永续行情看板（纯静态）：实时聚合 · 五因子做市商结论 · 模拟自动交易 · 历史回放",
+  "scripts": {
+    "build": "node build.js",
+    "dist": "node build.js dist-v6",
+    "test": "node tests/run.js",
+    "test:unit": "node tests/_test.js && node tests/_fuse.js && node tests/_heat.js && node tests/_liq.js && node tests/_entry.js && node tests/_kmerge.js && node tests/_domid.js && node tests/_auto.js",
+    "test:dom": "node tests/_smoke.js && node tests/_heat_dom.js && node tests/_auto_dom.js && node tests/_gate.js && node tests/_replay.js"
+  }
+}

@@ -39,7 +39,7 @@ const CG = { bitcoin: { usd: 77860.0 }, ethereum: { usd: 2511.5 }, binancecoin: 
 // 永续 K 线：生成 240 根升序 K 线，覆盖真实 K 线分支
 const klinesOf = p => Array.from({ length: 240 }, (_, i) => {
   const base = p * (1 + Math.sin(i / 9) * 0.004 + (i - 120) * 0.00004);
-  return [Date.now() - (239 - i) * 900000, base, base * 1.0012, base * 0.9988, base * 1.0004, 100 + i, 0, 0, 0, 0, 0, 0];
+  return [Math.floor(Date.now() / 900000) * 900000 - (239 - i) * 900000, base, base * 1.0012, base * 0.9988, base * 1.0004, 100 + i, 0, 0, 0, 0, 0, 0];
 });
 
 w.fetch = (url) => {
@@ -127,7 +127,7 @@ const txt = s => ((doc.querySelector(s) || {}).textContent || '').trim();
   ok(sigs.every(s => s.querySelectorAll('.sig-r').length === 5), '每格 5 行清算指标');
   ok(sigs.every(s => /上方空单清算/.test(s.textContent) && /下方多单清算/.test(s.textContent)),
      '指标改为上下方清算池口径');
-  ok(sigs.every(s => /真实|推算|估算|无清算数据/.test(s.querySelector('.sig-src').textContent)),
+  ok(sigs.every(s => /历史爆仓记录|潜在清算区模型|无清算数据/.test(s.querySelector('.sig-src').textContent)),
      '每格标注清算数据来源',
      sigs.map(s => s.querySelector('.sig-src').textContent).join('|'));
   ok(sigs.every(s => /五因子合成/.test(s.querySelector('.sig-act').textContent)), '提示行给出五因子合成分值');
@@ -305,7 +305,19 @@ const txt = s => ((doc.querySelector(s) || {}).textContent || '').trim();
   console.log("\n[12] 建仓前提示 · 近 1 小时多空爆单");
   ok(!!doc.querySelector('#entryCard'), '建仓前提示卡片存在');
   ok(!!doc.querySelector('#entCfg'), '「配置 AiCoin」按钮存在');
-  ok(/AiCoin|清算热力图/.test(txt('#entSrc')), '标注爆单数据来源', txt('#entSrc'));
+  /* 来源必须明标，且用词不许把模型推算说成真实爆仓：
+   * 真实链路叫「历史爆仓记录」，推算链路统一叫「潜在清算区模型」。 */
+  ok(/AiCoin|CoinGlass|历史爆仓记录|潜在清算区模型/.test(txt('#entSrc')), '标注爆单数据来源', txt('#entSrc'));
+  const uiTxt = ['#heatSrc', '#heatNote', '#heatModel', '#entSrc', '#entNote', '#sigGrid']
+    .map(x => { const e = doc.querySelector(x); return e ? e.textContent : ''; }).join(' ');
+  ok(!/供应商模型|自建估算|本地估算/.test(uiTxt), '不再使用含糊的「供应商模型 / 自建估算」说法',
+    (uiTxt.match(/供应商模型|自建估算|本地估算/g) || []).join(','));
+  ok(/潜在清算区模型/.test(txt('#heatSrc')), '热力图标注为潜在清算区模型', txt('#heatSrc'));
+  ok(/模型假设与偏差/.test(txt('#heatModel')), '热力图有模型假设面板');
+  ok(/成交量 ≠ 未平仓量/.test(txt('#heatModel')), '假设面板列出「成交量≠未平仓量」');
+  ok(/账户数/.test(txt('#heatModel')), '假设面板说明多空比是账户数比例');
+  ok(/维持保证金/.test(txt('#heatModel')), '假设面板说明清算公式是简化的');
+  ok(!/本地估算/.test(txt('#entSrc')), '不再使用含糊的「本地估算」标签', txt('#entSrc'));
   ok(!!doc.querySelector('.ent-lv'), '风险等级徽章存在', txt('.ent-lv'));
   ok(/建议仓位/.test(txt('#entHd')), '给出建议仓位上限', txt('#entHd').replace(/\s+/g, ' ').slice(0, 60));
   ok(doc.querySelector('#entBar').children.length === 2, '多空爆仓对比条为两段');
@@ -457,7 +469,33 @@ const txt = s => ((doc.querySelector(s) || {}).textContent || '').trim();
   ok(!!doc.querySelector('#autoCard'), '存在自动交易卡片');
   ok(!!doc.querySelector('#autoToggle'), '存在启动 / 停止开关');
   ok(/启动|停止/.test(txt('#autoToggle')), '开关文案为启动或停止', txt('#autoToggle'));
-  ok(doc.querySelectorAll('#autoStats .st').length === 6, '统计 6 格：单据/持仓/止盈止损/胜率/净盈亏/今日');
+  ok(doc.querySelectorAll('#autoStats .st').length === 9,
+    '统计 9 格：权益/在持风险/名义敞口 + 单据/持仓/止盈止损/胜率/净盈亏/今日',
+    String(doc.querySelectorAll('#autoStats .st').length));
+  ok(!!doc.querySelector('#mtfBox'), '存在四周期融合决策容器');
+  ok(/四周期融合决策/.test(doc.querySelector('#mtfBox').innerHTML), '融合决策已渲染', 
+     doc.querySelector('#mtfBox').textContent.slice(0, 60));
+  ok(!!doc.querySelector('#autoBalance') && !!doc.querySelector('#autoRiskPct'), '存在账户风控参数输入');
+  ok(!/概率\s*\d+%/.test(doc.body.innerHTML), '页面不再显示「概率 X%」这类未校准百分比');
+  /* 扫单分值是固定公式拼出来的，没有历史样本校准 —— 页面只能给「高/中/低」档位。
+   * 一旦有人把它渲染成「扫单倾向 80%」，就是这里要拦的回归。 */
+  const swAll = ['#mmCard', '#mmNote', '#mmVerdict', '#sigGrid', '#mtfBox', '#autoCard']
+    .map(x => { const e = doc.querySelector(x); return e ? e.textContent + ' ' + (e.getAttribute('title') || '') : ''; })
+    .join(' ');
+  ok(!/扫单倾向\s*[\d.]+\s*%/.test(swAll), '扫单倾向不显示为百分比',
+    (swAll.match(/扫单倾向.{0,16}/g) || []).slice(0, 3).join(' | '));
+  ok(!/扫单倾向/.test(swAll) || /扫单倾向\s*(高|中|低|—)/.test(swAll), '扫单倾向只以高/中/低档位出现',
+    (swAll.match(/扫单倾向.{0,10}/g) || []).slice(0, 3).join(' | '));
+  ok(!/扫单倾向/.test(swAll) || /未校准|不是概率|未经历史样本校准/.test(swAll), '扫单倾向旁边标注未校准');
+  /* 因子同源：只报一个「一致度 X%」会让人把同源指标的多数票当成多份证据，
+   * 界面必须同时给出独立口径与有效独立证据份数。 */
+  const indepTxt = ['#mmHd', '#mmVerdict', '#mmNote', '#sigGrid', '#mtfBox']
+    .map(x => { const e = doc.querySelector(x); return e ? e.textContent + ' ' + (e.getAttribute('title') || '') : ''; })
+    .join(' ');
+  ok(/独立口径/.test(indepTxt), '结论区给出独立口径一致度', indepTxt.slice(0, 80));
+  ok(/有效独立证据/.test(indepTxt), '结论区给出有效独立证据份数');
+  ok(/同源/.test(indepTxt), '说明同源因子不构成相互独立验证');
+  ok(/四个同向只折算成约 1\.4 份|不是 4 份/.test(indepTxt), '明确写出「四个同向 ≈ 1.4 份」的折减口径');
   ok(!!doc.querySelector('#autoToday') && !!doc.querySelector('#autoDays'), '存在今日单据与按天历史');
   ok(!!doc.querySelector('#autoExport'), '存在 CSV 导出（只导出、不删除单据）');
   ok(['#autoIv', '#autoMg', '#autoLv', '#autoRr', '#autoTf'].every(s => !!doc.querySelector(s)),

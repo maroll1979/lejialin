@@ -49,7 +49,7 @@ w.fetch = url => {
       : /^BNB/.test(sym) ? 722.32 : /^XAU/.test(sym) ? 4286.40 : 104.07;
     const data = Array.from({ length: 240 }, (_, i) => {
       const o = base * (1 + Math.sin(i / 9) * 0.004 + (i - 120) * 0.00004);
-      return [Date.now() - (239 - i) * 900000, o, o * 1.0012, o * 0.9988, o * 1.0004, 100 + i, 0, 0, 0, 0, 0, 0];
+      return [Math.floor(Date.now() / 900000) * 900000 - (239 - i) * 900000, o, o * 1.0012, o * 0.9988, o * 1.0004, 100 + i, 0, 0, 0, 0, 0, 0];
     });
     return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(data) });
   }
@@ -119,8 +119,9 @@ const hasNaN = () => /NaN|undefined|Infinity/.test(doc.body.textContent);
   console.log('\n[3] 切换数据源');
   const tab = k => doc.querySelector(`#heatTabs [data-hs="${k}"]`);
   tab('local').click();
-  for (let i = 0; i < 40 && !/本地估算/.test(txt('#heatSrc')); i++) await sleep(50);
-  ok(/本地估算/.test(txt('#heatSrc')), '切到本地估算生效', txt('#heatSrc'));
+  // 两条推算链路都以「潜在清算区模型」开头，等更具体的「仅 K 线推算」才算真正切到本地
+  for (let i = 0; i < 40 && !/仅 K 线推算/.test(txt('#heatSrc')); i++) await sleep(50);
+  ok(/潜在清算区模型/.test(txt('#heatSrc')), '切到本地推算生效', txt('#heatSrc'));
   ok(tab('local').className.includes('on'), '本地估算按钮高亮');
   ok(!tab('binance').className.includes('on'), '其他按钮取消高亮');
   ok(doc.querySelector('#heatSrc').className.includes('syn'), '本地估算标注为警示样式');
@@ -144,7 +145,7 @@ const hasNaN = () => /NaN|undefined|Infinity/.test(doc.body.textContent);
   for (let i = 0; i < 40 && !/CoinGlass/.test(txt('#heatSrc')); i++) await sleep(50);
   ok(/CoinGlass/.test(txt('#heatSrc')), 'Coinglass 真实清算数据生效', txt('#heatSrc'));
   ok(doc.querySelector('#heatSrc').className.includes('real'), '真实数据标注为 real 样式');
-  ok(/真实清算记录/.test(txt('#heatNote')), '说明标注为真实清算记录');
+  ok(/真实发生的清算记录/.test(txt('#heatNote')), '说明标注为真实发生的历史清算记录');
   ok(!hasNaN(), 'Coinglass 分支无 NaN');
 
   // 四格方向依赖 S.heats，切源后必须整批重算，不能只刷当前那张图
