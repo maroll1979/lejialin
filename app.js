@@ -396,14 +396,7 @@ const KLINE = {
       t: t * 1000, o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i], v: q.volume?.[i] || 0,
     })).filter(b => b.o && b.h && b.l && b.c);
     if (!bars.length) throw new Error('empty');
-    if (tf.agg) { // 4h 由 1h 聚合
-      const out = [];
-      for (let i = 0; i < bars.length; i += tf.agg) {
-        const g = bars.slice(i, i + tf.agg); if (g.length < tf.agg) break;
-        out.push({ t: g[0].t, o: g[0].o, h: Math.max(...g.map(x => x.h)), l: Math.min(...g.map(x => x.l)), c: g[g.length - 1].c, v: g.reduce((a, x) => a + x.v, 0) });
-      }
-      bars = out;
-    }
+    if (tf.agg) bars = aggBars(bars, tf.m * 60000, tf.agg);   // 4h 由 1h 聚合，按时间桶而非下标
     return bars;
   } },
 };
@@ -465,6 +458,71 @@ function mkBars(symId, tfKey, anchor) {
   return { bars, real: false, src: '合成' };
 }
 
+/* 序列保留上限。取数一次给 240 根，跨周期合并后序列会持续增长；
+ * 1000 根足够任何指标热身（MACD 26 + DEA 9 也只要几十根），同时防止挂机数周后数组无界膨胀。 */
+const KBAR_CAP = 1000;
+
+/* ===== KBAR-MERGE-START ===== */
+/* 按时间戳合并两段 K 线序列。
+ *
+ * 旧实现只改最后一根的 c/h/l，有四个后果：
+ *   1) 跨周期后永不追加新 bar —— 序列长度冻结在首次加载那一刻，
+ *      MACD / OBV / KDJ / ATR 全在一条停止生长的序列上算，页面价格却在动；
+ *   2) 最高最低用「旧 h 与新收盘价取 max/min」凑，不是接口返回的真实高低
+ *      （实测 140 被压成 120 —— 因为只跟收盘价比）；
+ *   3) 成交量永不更新 —— OBV 累积的是过期量；
+ *   4) 断线重连后中间缺失的区间补不回来。
+ *
+ * 正确做法：以时间戳为键，同键**整根替换**。
+ * 为什么不逐字段拼：同一时间桶里接口返回的就是权威值，把「旧 open + 新 close + 旧 volume」
+ * 拼在一起，会造出一根市场上从未存在过的 bar，比直接用旧值更糟。
+ * 新键追加 → 按时间排序 → 裁剪到 cap。
+ * 不修改入参，返回新数组（旧实现原地 mutate，调用方拿不到「有没有新增」的信号）。 */
+function mergeBars(oldBars, newBars, cap) {
+  const byT = new Map();
+  for (const list of [oldBars, newBars]) {
+    if (!Array.isArray(list)) continue;
+    for (const b of list) {
+      if (!b || !isFinite(b.t)) continue;
+      byT.set(b.t, b);       // 后一段覆盖前一段：接口对同一时间桶的数据是权威的
+    }
+  }
+  const out = Array.from(byT.values()).sort((a, b) => a.t - b.t);
+  return (cap > 0 && out.length > cap) ? out.slice(out.length - cap) : out;
+}
+/* 把细粒度 bar 聚合成粗粒度（Yahoo 只给到 1h，4h 要自己凑）。
+ *
+ * 桶键 = Math.floor(t / stepMs)，不是数组下标：
+ * 下标分组依赖取数窗口起点，窗口一滑整个桶序列就错位 1~3 小时，
+ * 后续按时间戳合并时每个桶都被当成「新时间戳」重复追加，序列里出现时段重叠的 bar。
+ *
+ * minCount：一个完整桶应含几根细粒度 bar。窗口边缘必然产生残缺桶，
+ * 必须丢掉（只保留最后那个正在形成的桶），否则残缺桶会被写进缓存，
+ * 下次合并时反过来把之前存好的完整桶替换成一个「只有 1 根 1h 的 4h bar」。 */
+function aggBars(bars, stepMs, minCount) {
+  const need = minCount > 0 ? minCount : 1;
+  const buckets = new Map();
+  for (const b of bars) {
+    if (!b || !isFinite(b.t) || !(stepMs > 0)) continue;
+    const k = Math.floor(b.t / stepMs);
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(b);
+  }
+  const keys = Array.from(buckets.keys()).sort((a, b) => a - b);
+  const out = [];
+  keys.forEach((k, i) => {
+    const g = buckets.get(k);
+    if (g.length < need && i !== keys.length - 1) return;   // 残缺桶：只放行最后那个（正在形成）
+    out.push({
+      t: k * stepMs, o: g[0].o, h: Math.max.apply(null, g.map(x => x.h)),
+      l: Math.min.apply(null, g.map(x => x.l)), c: g[g.length - 1].c,
+      v: g.reduce((a, x) => a + x.v, 0),
+    });
+  });
+  return out;
+}
+/* ===== KBAR-MERGE-END ===== */
+
 /* K 线加载：只接受交易所真实返回。
  * 取不到就抛错，由上层把「取数失败 + 原因」显示出来并自动重试 —— 绝不用合成序列顶替。
  * 唯一保留旧数据的情形：已经拉到过真实 K 线、只是这一次刷新没成功。
@@ -487,18 +545,17 @@ async function loadKlines(symId, tfKey) {
     throw e;
   }
 
-  // 历史首次加载后固定，后续仅更新最后一根，避免整图跳动
+  /* 与已有序列按时间戳合并：同一根整根替换、新时间戳追加、断线缺口补齐。
+   * 已收盘的历史 bar 不会被改写（新旧值本来相同），所以整图不会跳动 ——
+   * 旧实现为「避免跳动」干脆不追加新 bar，等于把指标钉死在首次加载的序列上。 */
   if (cached && cached.bars.length && cached.real === data.real) {
-    const last = data.bars[data.bars.length - 1];
-    if (last) {
-      const b = cached.bars[cached.bars.length - 1];
-      b.c = last.c; b.h = Math.max(b.h, last.c); b.l = Math.min(b.l, last.c);
-    }
+    cached.bars = mergeBars(cached.bars, data.bars, KBAR_CAP);
     cached.src = data.src;
     cached.stale = false; cached.staleSince = 0;
     return cached;
   }
   data.stale = false; data.staleSince = 0;
+  data.bars = mergeBars([], data.bars, KBAR_CAP);
   S.klines[symId][tfKey] = data;
   return data;
 }
