@@ -1,0 +1,335 @@
+// @version=2
+// ===================================================================
+//  成交量分布 VP-24 · Volume Profile（24 档）  —— 滚动窗口版（推荐先用这个验证平台）
+// -------------------------------------------------------------------
+//  1. 取最近 N 根 K 线的最高/最低构成价格区间，均分为 24 档
+//  2. 按「K线区间与档位的重叠比例」把成交量摊分到各档
+//  3. 中间 70% 成交量所在区间 = 价值区；上沿 VAH，下沿 VAL，最密档 POC
+//  4. 收盘 > VAH → 高位低量区 → 做空；收盘 < VAL → 低位低量区 → 做多
+//  
+//  周期与 N 的对应：1小时→24（≈一整日）；30分钟→48；15分钟→96；4小时→6
+//  本版不依赖任何时间函数，只要平台有 highest/lowest/sum/max/min 即可运行。
+// ===================================================================
+
+// ---------- 参数 ----------
+N = 24        // 回溯 K 线根数
+VA_PCT = 70   // 价值区包含的成交量百分比，标准值 70
+
+// ---------- 价格区间 ----------
+// 若平台不支持 highest/lowest，改用 hhv(high, N) / llv(low, N)
+hi = highest(high, N)
+lo = lowest(low, N)
+rng = hi - lo
+step = rng > 0 ? rng / 24 : 0
+
+// ---------- 24 档价格（取每档中点） ----------
+P0 = lo + (0.5) * step
+P1 = lo + (1.5) * step
+P2 = lo + (2.5) * step
+P3 = lo + (3.5) * step
+P4 = lo + (4.5) * step
+P5 = lo + (5.5) * step
+P6 = lo + (6.5) * step
+P7 = lo + (7.5) * step
+P8 = lo + (8.5) * step
+P9 = lo + (9.5) * step
+P10 = lo + (10.5) * step
+P11 = lo + (11.5) * step
+P12 = lo + (12.5) * step
+P13 = lo + (13.5) * step
+P14 = lo + (14.5) * step
+P15 = lo + (15.5) * step
+P16 = lo + (16.5) * step
+P17 = lo + (17.5) * step
+P18 = lo + (18.5) * step
+P19 = lo + (19.5) * step
+P20 = lo + (20.5) * step
+P21 = lo + (21.5) * step
+P22 = lo + (22.5) * step
+P23 = lo + (23.5) * step
+
+// ---------- 逐档成交量：按重叠比例摊分 ----------
+// 不能整根计入 —— 否则一根大阳线会把全部成交量重复算进它覆盖的每一档，
+// 把分布图抹平。ov = 重叠长度，占比 = ov / (high - low)。
+sp = high - low
+ov0 = min(high, lo + 1 * step) - max(low, lo + 0 * step)
+hit0 = sp > 0 ? (ov0 > 0 ? volume * ov0 / sp : 0) : (high >= lo + 0 * step && high <= lo + 1 * step ? volume : 0)
+v0 = sum(hit0, N)
+ov1 = min(high, lo + 2 * step) - max(low, lo + 1 * step)
+hit1 = sp > 0 ? (ov1 > 0 ? volume * ov1 / sp : 0) : (high >= lo + 1 * step && high <= lo + 2 * step ? volume : 0)
+v1 = sum(hit1, N)
+ov2 = min(high, lo + 3 * step) - max(low, lo + 2 * step)
+hit2 = sp > 0 ? (ov2 > 0 ? volume * ov2 / sp : 0) : (high >= lo + 2 * step && high <= lo + 3 * step ? volume : 0)
+v2 = sum(hit2, N)
+ov3 = min(high, lo + 4 * step) - max(low, lo + 3 * step)
+hit3 = sp > 0 ? (ov3 > 0 ? volume * ov3 / sp : 0) : (high >= lo + 3 * step && high <= lo + 4 * step ? volume : 0)
+v3 = sum(hit3, N)
+ov4 = min(high, lo + 5 * step) - max(low, lo + 4 * step)
+hit4 = sp > 0 ? (ov4 > 0 ? volume * ov4 / sp : 0) : (high >= lo + 4 * step && high <= lo + 5 * step ? volume : 0)
+v4 = sum(hit4, N)
+ov5 = min(high, lo + 6 * step) - max(low, lo + 5 * step)
+hit5 = sp > 0 ? (ov5 > 0 ? volume * ov5 / sp : 0) : (high >= lo + 5 * step && high <= lo + 6 * step ? volume : 0)
+v5 = sum(hit5, N)
+ov6 = min(high, lo + 7 * step) - max(low, lo + 6 * step)
+hit6 = sp > 0 ? (ov6 > 0 ? volume * ov6 / sp : 0) : (high >= lo + 6 * step && high <= lo + 7 * step ? volume : 0)
+v6 = sum(hit6, N)
+ov7 = min(high, lo + 8 * step) - max(low, lo + 7 * step)
+hit7 = sp > 0 ? (ov7 > 0 ? volume * ov7 / sp : 0) : (high >= lo + 7 * step && high <= lo + 8 * step ? volume : 0)
+v7 = sum(hit7, N)
+ov8 = min(high, lo + 9 * step) - max(low, lo + 8 * step)
+hit8 = sp > 0 ? (ov8 > 0 ? volume * ov8 / sp : 0) : (high >= lo + 8 * step && high <= lo + 9 * step ? volume : 0)
+v8 = sum(hit8, N)
+ov9 = min(high, lo + 10 * step) - max(low, lo + 9 * step)
+hit9 = sp > 0 ? (ov9 > 0 ? volume * ov9 / sp : 0) : (high >= lo + 9 * step && high <= lo + 10 * step ? volume : 0)
+v9 = sum(hit9, N)
+ov10 = min(high, lo + 11 * step) - max(low, lo + 10 * step)
+hit10 = sp > 0 ? (ov10 > 0 ? volume * ov10 / sp : 0) : (high >= lo + 10 * step && high <= lo + 11 * step ? volume : 0)
+v10 = sum(hit10, N)
+ov11 = min(high, lo + 12 * step) - max(low, lo + 11 * step)
+hit11 = sp > 0 ? (ov11 > 0 ? volume * ov11 / sp : 0) : (high >= lo + 11 * step && high <= lo + 12 * step ? volume : 0)
+v11 = sum(hit11, N)
+ov12 = min(high, lo + 13 * step) - max(low, lo + 12 * step)
+hit12 = sp > 0 ? (ov12 > 0 ? volume * ov12 / sp : 0) : (high >= lo + 12 * step && high <= lo + 13 * step ? volume : 0)
+v12 = sum(hit12, N)
+ov13 = min(high, lo + 14 * step) - max(low, lo + 13 * step)
+hit13 = sp > 0 ? (ov13 > 0 ? volume * ov13 / sp : 0) : (high >= lo + 13 * step && high <= lo + 14 * step ? volume : 0)
+v13 = sum(hit13, N)
+ov14 = min(high, lo + 15 * step) - max(low, lo + 14 * step)
+hit14 = sp > 0 ? (ov14 > 0 ? volume * ov14 / sp : 0) : (high >= lo + 14 * step && high <= lo + 15 * step ? volume : 0)
+v14 = sum(hit14, N)
+ov15 = min(high, lo + 16 * step) - max(low, lo + 15 * step)
+hit15 = sp > 0 ? (ov15 > 0 ? volume * ov15 / sp : 0) : (high >= lo + 15 * step && high <= lo + 16 * step ? volume : 0)
+v15 = sum(hit15, N)
+ov16 = min(high, lo + 17 * step) - max(low, lo + 16 * step)
+hit16 = sp > 0 ? (ov16 > 0 ? volume * ov16 / sp : 0) : (high >= lo + 16 * step && high <= lo + 17 * step ? volume : 0)
+v16 = sum(hit16, N)
+ov17 = min(high, lo + 18 * step) - max(low, lo + 17 * step)
+hit17 = sp > 0 ? (ov17 > 0 ? volume * ov17 / sp : 0) : (high >= lo + 17 * step && high <= lo + 18 * step ? volume : 0)
+v17 = sum(hit17, N)
+ov18 = min(high, lo + 19 * step) - max(low, lo + 18 * step)
+hit18 = sp > 0 ? (ov18 > 0 ? volume * ov18 / sp : 0) : (high >= lo + 18 * step && high <= lo + 19 * step ? volume : 0)
+v18 = sum(hit18, N)
+ov19 = min(high, lo + 20 * step) - max(low, lo + 19 * step)
+hit19 = sp > 0 ? (ov19 > 0 ? volume * ov19 / sp : 0) : (high >= lo + 19 * step && high <= lo + 20 * step ? volume : 0)
+v19 = sum(hit19, N)
+ov20 = min(high, lo + 21 * step) - max(low, lo + 20 * step)
+hit20 = sp > 0 ? (ov20 > 0 ? volume * ov20 / sp : 0) : (high >= lo + 20 * step && high <= lo + 21 * step ? volume : 0)
+v20 = sum(hit20, N)
+ov21 = min(high, lo + 22 * step) - max(low, lo + 21 * step)
+hit21 = sp > 0 ? (ov21 > 0 ? volume * ov21 / sp : 0) : (high >= lo + 21 * step && high <= lo + 22 * step ? volume : 0)
+v21 = sum(hit21, N)
+ov22 = min(high, lo + 23 * step) - max(low, lo + 22 * step)
+hit22 = sp > 0 ? (ov22 > 0 ? volume * ov22 / sp : 0) : (high >= lo + 22 * step && high <= lo + 23 * step ? volume : 0)
+v22 = sum(hit22, N)
+ov23 = min(high, lo + 24 * step) - max(low, lo + 23 * step)
+hit23 = sp > 0 ? (ov23 > 0 ? volume * ov23 / sp : 0) : (high >= lo + 23 * step && high <= lo + 24 * step ? volume : 0)
+v23 = sum(hit23, N)
+
+// ---------- 自下而上累积（用于求 VAL） ----------
+c0 = v0
+c1 = c0 + v1
+c2 = c1 + v2
+c3 = c2 + v3
+c4 = c3 + v4
+c5 = c4 + v5
+c6 = c5 + v6
+c7 = c6 + v7
+c8 = c7 + v8
+c9 = c8 + v9
+c10 = c9 + v10
+c11 = c10 + v11
+c12 = c11 + v12
+c13 = c12 + v13
+c14 = c13 + v14
+c15 = c14 + v15
+c16 = c15 + v16
+c17 = c16 + v17
+c18 = c17 + v18
+c19 = c18 + v19
+c20 = c19 + v20
+c21 = c20 + v21
+c22 = c21 + v22
+c23 = c22 + v23
+
+// ---------- 自上而下累积（用于求 VAH） ----------
+d23 = v23
+d22 = d23 + v22
+d21 = d22 + v21
+d20 = d21 + v20
+d19 = d20 + v19
+d18 = d19 + v18
+d17 = d18 + v17
+d16 = d17 + v16
+d15 = d16 + v15
+d14 = d15 + v14
+d13 = d14 + v13
+d12 = d13 + v12
+d11 = d12 + v11
+d10 = d11 + v10
+d9 = d10 + v9
+d8 = d9 + v8
+d7 = d8 + v7
+d6 = d7 + v6
+d5 = d6 + v5
+d4 = d5 + v4
+d3 = d4 + v3
+d2 = d3 + v2
+d1 = d2 + v1
+d0 = d1 + v0
+
+// ---------- POC：成交量最大的那一档 ----------
+m0 = v0
+poc0 = P0
+m1 = v1 > m0 ? v1 : m0
+poc1 = v1 > m0 ? P1 : poc0
+m2 = v2 > m1 ? v2 : m1
+poc2 = v2 > m1 ? P2 : poc1
+m3 = v3 > m2 ? v3 : m2
+poc3 = v3 > m2 ? P3 : poc2
+m4 = v4 > m3 ? v4 : m3
+poc4 = v4 > m3 ? P4 : poc3
+m5 = v5 > m4 ? v5 : m4
+poc5 = v5 > m4 ? P5 : poc4
+m6 = v6 > m5 ? v6 : m5
+poc6 = v6 > m5 ? P6 : poc5
+m7 = v7 > m6 ? v7 : m6
+poc7 = v7 > m6 ? P7 : poc6
+m8 = v8 > m7 ? v8 : m7
+poc8 = v8 > m7 ? P8 : poc7
+m9 = v9 > m8 ? v9 : m8
+poc9 = v9 > m8 ? P9 : poc8
+m10 = v10 > m9 ? v10 : m9
+poc10 = v10 > m9 ? P10 : poc9
+m11 = v11 > m10 ? v11 : m10
+poc11 = v11 > m10 ? P11 : poc10
+m12 = v12 > m11 ? v12 : m11
+poc12 = v12 > m11 ? P12 : poc11
+m13 = v13 > m12 ? v13 : m12
+poc13 = v13 > m12 ? P13 : poc12
+m14 = v14 > m13 ? v14 : m13
+poc14 = v14 > m13 ? P14 : poc13
+m15 = v15 > m14 ? v15 : m14
+poc15 = v15 > m14 ? P15 : poc14
+m16 = v16 > m15 ? v16 : m15
+poc16 = v16 > m15 ? P16 : poc15
+m17 = v17 > m16 ? v17 : m16
+poc17 = v17 > m16 ? P17 : poc16
+m18 = v18 > m17 ? v18 : m17
+poc18 = v18 > m17 ? P18 : poc17
+m19 = v19 > m18 ? v19 : m18
+poc19 = v19 > m18 ? P19 : poc18
+m20 = v20 > m19 ? v20 : m19
+poc20 = v20 > m19 ? P20 : poc19
+m21 = v21 > m20 ? v21 : m20
+poc21 = v21 > m20 ? P21 : poc20
+m22 = v22 > m21 ? v22 : m21
+poc22 = v22 > m21 ? P22 : poc21
+m23 = v23 > m22 ? v23 : m22
+poc23 = v23 > m22 ? P23 : poc22
+POC = poc23
+
+// ---------- 总成交量与两侧尾部阈值 ----------
+total = c23
+T = total * (100 - VA_PCT) / 200
+
+// ---------- VAL：自下而上累积到 15% 处 ----------
+// 从区间下沿 lo 出发，累积量不足 T 就往上走一格。起点必须是 lo 而非 P0，
+// 否则结果整体偏高半格。步进量先存进 s0..s22，避免写出超长表达式。
+s0 = c0 < T ? step : 0
+s1 = c1 < T ? step : 0
+s2 = c2 < T ? step : 0
+s3 = c3 < T ? step : 0
+s4 = c4 < T ? step : 0
+s5 = c5 < T ? step : 0
+s6 = c6 < T ? step : 0
+s7 = c7 < T ? step : 0
+s8 = c8 < T ? step : 0
+s9 = c9 < T ? step : 0
+s10 = c10 < T ? step : 0
+s11 = c11 < T ? step : 0
+s12 = c12 < T ? step : 0
+s13 = c13 < T ? step : 0
+s14 = c14 < T ? step : 0
+s15 = c15 < T ? step : 0
+s16 = c16 < T ? step : 0
+s17 = c17 < T ? step : 0
+s18 = c18 < T ? step : 0
+s19 = c19 < T ? step : 0
+s20 = c20 < T ? step : 0
+s21 = c21 < T ? step : 0
+s22 = c22 < T ? step : 0
+VAL = lo + s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10 + s11 + s12 + s13 + s14 + s15 + s16 + s17 + s18 + s19 + s20 + s21 + s22
+
+// ---------- VAH：自上而下累积到 15% 处 ----------
+t1 = d1 < T ? step : 0
+t2 = d2 < T ? step : 0
+t3 = d3 < T ? step : 0
+t4 = d4 < T ? step : 0
+t5 = d5 < T ? step : 0
+t6 = d6 < T ? step : 0
+t7 = d7 < T ? step : 0
+t8 = d8 < T ? step : 0
+t9 = d9 < T ? step : 0
+t10 = d10 < T ? step : 0
+t11 = d11 < T ? step : 0
+t12 = d12 < T ? step : 0
+t13 = d13 < T ? step : 0
+t14 = d14 < T ? step : 0
+t15 = d15 < T ? step : 0
+t16 = d16 < T ? step : 0
+t17 = d17 < T ? step : 0
+t18 = d18 < T ? step : 0
+t19 = d19 < T ? step : 0
+t20 = d20 < T ? step : 0
+t21 = d21 < T ? step : 0
+t22 = d22 < T ? step : 0
+t23 = d23 < T ? step : 0
+VAH = hi - t1 - t2 - t3 - t4 - t5 - t6 - t7 - t8 - t9 - t10 - t11 - t12 - t13 - t14 - t15 - t16 - t17 - t18 - t19 - t20 - t21 - t22 - t23
+
+// ---------- 强制把 POC 包进价值区 ----------
+// 分位数口径在分布极分散时可能把 POC 甩在价值区外，违反「价值区必含 POC」，
+// 故做一次夹逼修正。
+pocLo = POC - step / 2
+pocHi = POC + step / 2
+VAL = VAL > pocLo ? pocLo : VAL
+VAH = VAH < pocHi ? pocHi : VAH
+
+// ---------- 数据有效性 ----------
+valid = total > 0 && rng > 0
+VAH_ = valid ? VAH : na
+VAL_ = valid ? VAL : na
+POC_ = valid ? POC : na
+
+// ---------- 绘制线条 ----------
+plot(VAH_, title='VAH 价值区上沿', color='red', linewidth=2)
+plot(VAL_, title='VAL 价值区下沿', color='green', linewidth=2)
+plot(POC_, title='POC 成交最密集价', color='orange', linewidth=1)
+
+// ---------- 区域判定 ----------
+shortZone = valid && close > VAH_    // 高于 VAH：高位低量区 → 做空区域
+longZone  = valid && close < VAL_    // 低于 VAL：低位低量区 → 做多区域
+
+// ---------- 进出场信号 ----------
+enterShort = crossup(close, VAH_)     // 上穿 VAH → 进入做空区
+enterLong  = crossdown(close, VAL_)   // 下穿 VAL → 进入做多区
+exitShort  = crossdown(close, VAH_)   // 回落价值区 → 平空
+exitLong   = crossup(close, VAL_)     // 回升价值区 → 平多
+
+// ---------- 图表标注 ----------
+plotText(enterShort, title='做空', text='做空', color='red', refSeries=high, placement='top')
+plotText(enterLong, title='做多', text='做多', color='green', refSeries=low, placement='bottom')
+plotText(exitShort, title='平空', text='平空', color='gray', refSeries=high, placement='top')
+plotText(exitLong, title='平多', text='平多', color='gray', refSeries=low, placement='bottom')
+
+// ---------- 预警 ----------
+alertcondition(enterShort, title='价格进入 VAH 上方做空区', direction='sell')
+alertcondition(enterLong, title='价格进入 VAL 下方做多区', direction='buy')
+alertcondition(exitShort, title='回落价值区·平空', direction='buy')
+alertcondition(exitLong, title='回升价值区·平多', direction='sell')
+
+// ---------- 如需自动化交易，取消下面四行注释 ----------
+// enterShort(enterShort, price='market', amount=1)
+// exitShort(exitShort, price='market', amount=1)
+// enterLong(enterLong, price='market', amount=1)
+// exitLong(exitLong, price='market', amount=1)
+

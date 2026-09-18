@@ -46,7 +46,6 @@
 ├── app.js          构建产物（由 src/ 拼接，勿直接编辑）
 ├── build.js        拼接脚本：src/*.js → app.js，带字节级一致校验
 ├── package.json    构建 / 测试脚本入口
-├── _build.js       构建守卫：检测到直改 app.js 时报错
 ├── src/            源码模块（真正的编辑对象）
 │   ├── 01-core.js       工具、常量、格式化
 │   ├── 02-net.js        网络层与转发通道
@@ -69,6 +68,19 @@
 │   ├── 18-replay.js     历史回放
 │   └── 19-sec.js        安全与输入校验
 ├── versions/       历史版本备份（每目录均为可独立部署的完整站点）
+├── aicoin/         AiCoin AIScript 指标（独立于本站点，粘贴到 AiCoin 自定义指标中使用）
+│   ├── AiCoin-VP24-使用说明.md        参数、安装、备选写法、已知限制
+│   ├── AiCoin-VP24-滚动窗口版.txt     最近 N 根滚动计算（推荐先试这版）
+│   └── AiCoin-VP24-每日08点重置版.txt 每日 08:00 起算（需 hour() 与自引用支持）
+├── tools/          Python 侧工具链（生成与验证 AIScript 指标）
+│   ├── gen_vp24.py         生成两版 AIScript 源码
+│   ├── aiscript_runner.py  迷你 AIScript → Python 转译器
+│   ├── e2e_run_generated.py 直接执行生成的代码并校验数值约束
+│   ├── verify_vp24.py      与暴力参考实现逐位对比
+│   ├── verify_session.py   验证每日 08:00 重置与 MIN_BARS 过滤
+│   └── bench_va.py         分位数法 vs 行业标准贪心法差异实测
+├── docs/
+│   └── 验收报告-2026-09-16.md   P0/P1/P2 验收清单逐项核对结果
 └── tests/          Node 测试套件（14 个，共 1000+ 项断言）
     ├── run.js           全量运行器
     ├── _test.js         基础指标
@@ -80,7 +92,7 @@
     ├── _gate.js / _auto.js / _auto_dom.js   模拟盘（闸门 / 计算 / 端到端）
     ├── _replay.js       回放
     ├── _smoke.js / _heat_dom.js             DOM 端到端
-    ├── _build.js        构建产物一致性
+    ├── _build.js        构建守卫 + 产物一致性（检测到直改 app.js 时报错）
     └── _domid.js        DOM id 一致性校验工具
 ```
 
@@ -113,6 +125,35 @@ cd tests
 npm i jsdom          # 仅 DOM 类测试需要
 node run.js          # 全量
 ```
+
+## AiCoin 指标：VP-24 成交量分布（独立工具）
+
+与本站点无关的独立产物，供 AiCoin 自定义指标使用。价格分 24 档，按成交量分布定价值区：
+
+- 中间 70% 成交量为价值区，**VAH 之上为做空区，VAL 之下为做多区**，另给 POC
+- 两个版本：滚动窗口版（最近 N 根）与每日 08:00 重置版
+
+实现约束与取舍（详见 `aicoin/AiCoin-VP24-使用说明.md`）：
+
+- AIScript 公开资料中**无 for 循环与数组**，24 档展开为独立标量，价值区查找用「累加步进」
+- 因此采用**分位数口径**（上下各切 15%）而非 TradingView 常用的「从 POC 向两侧贪心扩展」；
+  实测在真实感分布下两者相差 0~2 个档位，分位数语义也更贴近「70% 上方/下方」的原始描述
+- 成交量按 K 线区间与档位的**重叠比例摊分**，而非整根重复计入（后者偏差最高 35%）
+- `high == low` 的一字线按价格是否落档判断，避免成交量丢失
+- 会话版带 `MIN_BARS` 过滤，避免 08:00 刚重置时区间过窄刷假信号
+
+验证方式：本仓库无法直接执行 AIScript，故用 `tools/aiscript_runner.py` 把生成的源码
+转译成 Python 逐根 K 线执行，校验 `lo ≤ VAL ≤ POC ≤ VAH ≤ hi` 等约束。
+
+```bash
+python tools/gen_vp24.py           # 生成两版源码
+python tools/e2e_run_generated.py  # 转译执行 + 数值约束校验
+python tools/verify_vp24.py        # 与暴力参考实现逐位对比（应 0.0000%）
+python tools/verify_session.py     # 每日 08:00 重置逻辑
+python tools/bench_va.py           # 分位数法 vs 贪心法差异
+```
+
+需用户确认的平台函数：`highest/lowest`（备选 `hhv/llv`）、`sum`、`max/min`、`na`。
 
 ## 口径与免责
 
