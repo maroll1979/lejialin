@@ -76,13 +76,18 @@ VAL = lo + (c0 < T ? step : 0) + (c1 < T ? step : 0) + ...
 | `lowest(low, N)` | `llv(low, N)` |
 | `sum(x, N)` | 若不支持，可用 `cum` 差值或 `totalsum` 替代思路 |
 | `max(a, b)` / `min(a, b)` | — |
+| `cross_up(a, b)` / `cross_down(a, b)` | 若平台报错，改成 `crossup` / `crossdown`（去掉下划线） |
 | `na` | 若平台无空值，把 `VAH_ = valid ? VAH : na` 直接改成 `VAH_ = VAH` |
 | `hour`（仅会话版） | 见文件内注释三种写法 |
 
+> **已修复「无绘图函数」报错**：当前版本使用最简 `plot(VAH_, title='VAH')` 等调用，
+> 先保证能被 AiCoin 识别并渲染出三条线；样式参数（color/linewidth）在确认跑通后再加。
+
 ## 交易用法
 
-指标画三条线：**VAH（红）**、**VAL（绿）**、**POC（橙）**，并在首次穿越处标注文字与箭头，
-同时触发预警。
+指标画三条线：**VAH**、**VAL**、**POC**，并在价格上穿/下穿价值区边界时通过 `alertcondition`
+触发预警。当前版本为了优先解决「无绘图函数」报错，暂时用最简 `plot` 画线，不带颜色和线宽；
+若你需要彩色线条，可在 `plot(...)` 里补 `color='red'`、`linewidth=2` 等参数。
 
 典型用法是**区间震荡市的均值回归**：
 

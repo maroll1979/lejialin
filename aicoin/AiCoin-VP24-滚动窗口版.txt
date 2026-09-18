@@ -301,35 +301,26 @@ VAL_ = valid ? VAL : na
 POC_ = valid ? POC : na
 
 // ---------- 绘制线条 ----------
-plot(VAH_, title='VAH 价值区上沿', color='red', linewidth=2)
-plot(VAL_, title='VAL 价值区下沿', color='green', linewidth=2)
-plot(POC_, title='POC 成交最密集价', color='orange', linewidth=1)
+// AiCoin 要求脚本必须调用 plot / plotShape 等绘图函数，否则报「无绘图函数」。
+// 先用最简 plot(..., title=...) 保证能跑通；若需要样式再补 color / linewidth 参数。
+plot(VAH_, title='VAH')
+plot(VAL_, title='VAL')
+plot(POC_, title='POC')
 
 // ---------- 区域判定 ----------
 shortZone = valid && close > VAH_    // 高于 VAH：高位低量区 → 做空区域
 longZone  = valid && close < VAL_    // 低于 VAL：低位低量区 → 做多区域
 
 // ---------- 进出场信号 ----------
-enterShort = crossup(close, VAH_)     // 上穿 VAH → 进入做空区
-enterLong  = crossdown(close, VAL_)   // 下穿 VAL → 进入做多区
-exitShort  = crossdown(close, VAH_)   // 回落价值区 → 平空
-exitLong   = crossup(close, VAL_)     // 回升价值区 → 平多
-
-// ---------- 图表标注 ----------
-plotText(enterShort, title='做空', text='做空', color='red', refSeries=high, placement='top')
-plotText(enterLong, title='做多', text='做多', color='green', refSeries=low, placement='bottom')
-plotText(exitShort, title='平空', text='平空', color='gray', refSeries=high, placement='top')
-plotText(exitLong, title='平多', text='平多', color='gray', refSeries=low, placement='bottom')
+// AiCoin 示例中使用 cross_up / cross_down（带下划线），不是 crossup / crossdown
+enterShort = cross_up(close, VAH_)     // 上穿 VAH → 进入做空区
+enterLong  = cross_down(close, VAL_)   // 下穿 VAL → 进入做多区
+exitShort  = cross_down(close, VAH_)   // 回落价值区 → 平空
+exitLong   = cross_up(close, VAL_)     // 回升价值区 → 平多
 
 // ---------- 预警 ----------
 alertcondition(enterShort, title='价格进入 VAH 上方做空区', direction='sell')
 alertcondition(enterLong, title='价格进入 VAL 下方做多区', direction='buy')
 alertcondition(exitShort, title='回落价值区·平空', direction='buy')
 alertcondition(exitLong, title='回升价值区·平多', direction='sell')
-
-// ---------- 如需自动化交易，取消下面四行注释 ----------
-// enterShort(enterShort, price='market', amount=1)
-// exitShort(exitShort, price='market', amount=1)
-// enterLong(enterLong, price='market', amount=1)
-// exitLong(exitLong, price='market', amount=1)
 

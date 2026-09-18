@@ -55,12 +55,18 @@ def conv(e):
             n = conv(raw[1]) if len(raw) > 1 else '0'
             fmap = {'highest': '_hh', 'lowest': '_ll', 'sum': '_sm'}
             return '%s(%r, %s)' % (fmap[fn], var, n)
+        if fn in ('cross_up', 'crossup'):
+            a, b = raw[0].strip(), raw[1].strip()
+            return "((_h(%r) < _h(%r)) and (_v(%r) >= _v(%r)))" % (a, b, a, b)
+        if fn in ('cross_down', 'crossdown'):
+            a, b = raw[0].strip(), raw[1].strip()
+            return "((_h(%r) > _h(%r)) and (_v(%r) <= _v(%r)))" % (a, b, a, b)
         a = [conv(x) for x in raw]
         if fn == 'max':     return 'max(%s, %s)' % (a[0], a[1])
         if fn == 'min':     return 'min(%s, %s)' % (a[0], a[1])
         if fn == 'abs':     return 'abs(%s)' % a[0]
         return '0'
-    e = re.sub(r'\b(highest|lowest|sum|max|min|abs)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', frepl, e)
+    e = re.sub(r'\b(highest|lowest|sum|max|min|abs|cross_up|cross_down|crossup|crossdown)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', frepl, e)
     # 下标 x[1]
     e = re.sub(r"\b([A-Za-z_]\w*)\s*\[\s*1\s*\]", r"_h('\1')", e)
     # 保护字符串字面量（如 _hh('high', ...) 里的 'high'），
