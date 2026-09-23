@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 多品种模拟交易终端 · SimTrader</title>
+<link rel="stylesheet" href="style.css?v=20260923f">
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">SimTrader</span>
+    <span class="badge-sim">模拟盘 · 不涉及真实资金 · 仅手动下单（市价/限价挂单 · 杠杆 · 二次确认）</span>
+  </div>
+  <div class="topbar-right">
+    <!-- 数据源状态：显示当前主源、实测延迟，失效时明确标注为离线快照 -->
+    <div class="ds-ctl" id="dsCtl">
+      <button class="ds-btn" id="dsBtn" title="查看数据源状态 / 手动锁定主源">
+        <span class="ds-dot warn" id="dsDot"></span>
+        <span class="ds-name" id="dsName">连接中…</span>
+        <span class="ds-ms" id="dsMs"></span>
+      </button>
+      <div class="ds-menu" id="dsMenu">
+        <div class="ds-mh">数据源 · 自动择优（点击可锁定）</div>
+        <div id="dsList"></div>
+        <div class="ds-mf" id="dsFoot"></div>
+      </div>
+    </div>
+    <div class="refresh-ctl" id="refreshCtl">
+      <button id="btnRefresh" class="rf-btn" title="立即刷新全部行情、信号与热力图">
+        <span class="rf-ico" id="rfIco">⟳</span><span>刷新</span>
+      </button>
+      <div class="rf-seg" id="rfSeg">
+        <button data-rf="realtime" class="active" title="K线/信号/涨跌矩阵 每 60 秒 · 成交热力图 每 15 秒">实时</button>
+        <button data-rf="m5" title="K线/信号/涨跌矩阵 每 5 分钟 · 成交热力图 每 5 分钟">5分钟</button>
+        <button data-rf="m10" title="K线/信号/涨跌矩阵 每 10 分钟 · 成交热力图 每 10 分钟">10分钟</button>
+        <button data-rf="m30" title="K线/信号/涨跌矩阵 每 30 分钟 · 成交热力图 每 30 分钟">30分钟</button>
+      </div>
+      <span class="rf-cd" id="rfCountdown">—</span>
+    </div>
+    <div class="conn" id="connStatus"><span class="dot"></span>连接行情中…</div>
+  </div>
+</header>
+
+<!-- 品种速览条 -->
+<nav class="watchlist" id="watchlist"></nav>
+
+<main class="layout">
+  <!-- 左侧：K线图 + 下方四格交易提示 -->
+  <section class="panel chart-panel">
+    <div class="chart-head">
+      <div class="ch-left">
+        <h2 id="instName">—</h2>
+        <span class="src-tag" id="instSrcTag">—</span>
+      </div>
+      <div class="ch-right">
+        <button id="liqToggle" class="liq-sw" title="显示/隐藏 K线左侧的「多空清算图」：Gate.io 永续近 24 小时真实强平订单，按价位聚合">清算图</button>
+        <span class="liq-stat" id="liqStat"></span>
+        <div class="tf-tabs" id="tfTabs">
+        <button data-tf="15m" class="active">15分钟</button>
+        <button data-tf="30m">30分钟</button>
+        <button data-tf="1h">1小时</button>
+        <button data-tf="4h">4小时</button>
+        </div>
+      </div>
+    </div>
+    <div id="chartBox"><div id="chart"></div><div class="chart-note" id="chartNote"></div></div>
+
+    <!-- ★ 交易提示：K线图正下方，四个独立格子 -->
+    <div class="sig-cards-wrap">
+      <div class="sc-head">
+        <h3>多周期交易提示</h3>
+        <span class="sc-sub" id="sigSub">四周期独立计算 · 依据真实K线 · 绿涨红跌</span>
+      </div>
+      <div class="sig-cards" id="sigMatrix"></div>
+      <div class="sig-hint" id="sigHint"></div>
+      <div class="sig-detail" id="sigDetail"></div>
+      <div class="ind-panel" id="indPanel"></div>
+      <div class="tpov-panel" id="tpOvPanel">
+        <div class="tpov-head">
+          <span class="tpov-title">止盈止损手动微调 · <b id="tpovTf">15分钟</b></span>
+          <button class="btn-xs" id="tpovReset" disabled title="清除本周期手填值，恢复指标自动方案">恢复自动</button>
+        </div>
+        <div class="tpov-grid">
+          <label class="tpov-f"><span>止损价</span><input type="number" id="ovStop" min="0" step="any" placeholder="—"></label>
+          <label class="tpov-f"><span>止盈一</span><input type="number" id="ovTp1" min="0" step="any" placeholder="—"></label>
+          <label class="tpov-f"><span>止盈二</span><input type="number" id="ovTp2" min="0" step="any" placeholder="—"></label>
+        </div>
+        <div class="tpov-note" id="tpovNote"></div>
+      </div>
+      <div class="tpsl-block" id="tpslBlock"></div>
+    </div>
+  </section>
+
+  <!-- 右侧：多平台实时价格 + 下单 -->
+  <aside class="side">
+    <section class="panel price-panel">
+      <div class="price-line">
+        <div>
+          <div class="label">实时价格 · <span id="venueMain">—</span></div>
+          <div class="big-price" id="bigPrice">—</div>
+        </div>
+        <div class="chg-box" id="chgBox">—</div>
+      </div>
+      <div class="update-time" id="updateTime"></div>
+      <div class="venue-list" id="venueList"></div>
+    </section>
+
+    <section class="panel order-panel">
+      <h3>手动模拟下单</h3>
+      <div class="acct-line">
+        <span>可用余额：<b id="cashVal">—</b></span>
+        <span>总权益：<b id="equityVal">—</b></span>
+      </div>
+      <div class="acct-line sub">
+        <span>占用保证金：<b id="marginVal">—</b></span>
+        <span>可用保证金：<b id="freeVal">—</b></span>
+      </div>
+
+      <div class="seg" id="orderType">
+        <button data-ot="market" class="active">市价单</button>
+        <button data-ot="limit">限价单</button>
+      </div>
+
+      <div class="order-form">
+        <label class="of-row" id="limitPriceRow" style="display:none">
+          <span>委托价格</span><input type="number" id="orderPrice" min="0" step="any" placeholder="限价">
+        </label>
+        <div class="of-tip" id="limitTip" style="display:none">限价单只挂单、不立即成交：实时行情真正触及委托价后才撮合成交。买入价须低于现价、卖出价须高于现价；未成交前可随时撤单并全额退回保证金。</div>
+
+        <label class="of-row">
+          <span>数量</span><input type="number" id="orderQty" min="0" step="any" placeholder="0.01">
+        </label>
+
+        <div class="lever-row">
+          <span class="lb">杠杆倍数</span>
+          <div class="lever-btns" id="leverBtns"></div>
+        </div>
+
+        <div class="pct-row" id="pctRow">
+          <button data-pct="0.25">25%</button>
+          <button data-pct="0.5">50%</button>
+          <button data-pct="0.75">75%</button>
+          <button data-pct="1">100%</button>
+        </div>
+
+        <div class="order-est" id="orderEst"></div>
+
+        <div class="order-btns">
+          <button class="btn-buy" id="btnBuy">买入 / 开多</button>
+          <button class="btn-sell" id="btnSell">卖出 / 开空</button>
+        </div>
+      </div>
+      <div class="order-note">市价单手续费 0.1%（Taker）· 限价单 0.05%（Maker）· 全仓保证金、逐仓风控 · 模拟盘不涉及真实资金</div>
+    </section>
+  </aside>
+</main>
+
+<!-- 热力图区：方向判断与交易区间 -->
+<section class="heat-wrap">
+  <div class="heat-grid">
+    <section class="panel heat-panel">
+      <div class="heat-head">
+        <h3>多品种 · 多周期实时热力图</h3>
+        <div class="heat-legend">
+          <span class="lg-txt">跌</span>
+          <span class="lg lg-dn3"></span><span class="lg lg-dn1"></span>
+          <span class="lg lg-0"></span>
+          <span class="lg lg-up1"></span><span class="lg lg-up3"></span>
+          <span class="lg-txt">涨</span>
+          <span class="heat-tip">左侧四列=该周期最近一根K线涨跌 · 最右列=近24小时涨跌</span>
+        </div>
+      </div>
+      <div class="heat-matrix" id="heatMatrix"></div>
+      <div class="heat-note" id="heatNote">加载中…</div>
+    </section>
+
+    <section class="panel vp-panel">
+      <div class="heat-head">
+        <h3>成交热力图 · 当下真实逐笔（近 15 分钟）</h3>
+        <span class="heat-tip" id="vpMeta"></span>
+      </div>
+      <div class="vp-body">
+        <div class="vp-chart" id="vpChart"></div>
+        <div class="range-cards" id="rangeCards"></div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- 底部区域 -->
+<section class="bottom">
+  <div class="bottom-tabs">
+    <button data-tab="pos" class="active">持仓与成交</button>
+    <button data-tab="bt">历史回测（近10年）</button>
+    <button data-tab="doc">数据与模型说明</button>
+  </div>
+
+  <div class="tab-page" id="tab-pos">
+    <div class="table-wrap">
+      <h4 class="tbl-title">当前持仓</h4>
+      <table class="tbl" id="posTable">
+        <thead><tr><th>品种</th><th>方向</th><th>数量</th><th>杠杆</th><th>开仓价</th><th>现价</th><th>保证金</th><th>强平价</th><th>浮动盈亏</th><th>收益率</th><th>开仓时间</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <h4 class="tbl-title">当前委托（限价挂单）</h4>
+      <table class="tbl" id="orderTable">
+        <thead><tr><th>品种</th><th>类型</th><th>方向</th><th>委托价</th><th>数量</th><th>杠杆</th><th>状态</th><th>成交触发条件</th><th>委托时间</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <h4 class="tbl-title">成交历史</h4>
+      <table class="tbl" id="histTable">
+        <thead><tr><th>品种</th><th>方向</th><th>数量</th><th>价格</th><th>金额</th><th>盈亏</th><th>时间</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="hist-actions"><button id="btnReset" class="btn-ghost">重置模拟账户</button></div>
+    </div>
+  </div>
+
+  <div class="tab-page hidden" id="tab-bt">
+    <div class="bt-head">
+      <span>对当前品种加载近10年日线数据，回测「EMA20/60 趋势跟踪 + 信号过滤」策略（模拟、不构成建议）：</span>
+      <button id="btnBacktest" class="btn-ghost">开始回测当前品种</button>
+    </div>
+    <div id="btResult"></div>
+  </div>
+
+  <div class="tab-page hidden" id="tab-doc">
+    <div class="doc">
+      <h4>数据来源与多平台口径</h4>
+      <ul>
+        <li><b>主源（下单与撮合依据）</b>：BTC / ETH / BNB / 黄金 一律取 <b>Gate.io 的 USDT 永续合约</b>价格，<b>单一数据源、没有备线、没有现货兜底</b>。K线、实时价、24小时涨跌、逐笔成交与实时推送全部走同一条链路，口径统一；取不到就是取不到，只会显示离线快照，绝不会拿现货价冒充永续价</li>
+        <li><b>黄金标的</b>：<b>XAUUSDT 黄金永续</b>（直接挂钩伦敦金的指数合约），不再是黄金代币 PAXG；XAU 取不到时退到 <b>PAXGUSDT 永续</b>，仍在 Gate 永续口径内，不会掉到现货</li>
+        <li><b>实时推送同口径</b>：订阅 Gate.io 期货成交流（<code>futures.trades</code>），与 K线、下单、强平用的是同一个市场的价，不会出现用别的市场成交价误触发限价单</li>
+        <li><b>跨平台比价</b>：同一品种在主源之外同时展示 <b>OKX / Coinbase / Bitstamp</b> 的实时价，并按「相对主源价差」排序，便于观察各平台价差（BTC/ETH 覆盖 4 家；BNB 与黄金覆盖 3 家）</li>
+        <li><b>币种报价单位差异</b>：Gate.io / OKX / Bitstamp 为 USDT 计价，Coinbase 为 USD 计价，两者理论上接近但存在稳定币溢价差，属正常现象</li>
+        <li><b>价格用途区分</b>：只有<b>主源 Gate.io 永续</b>的价格参与限价单撮合、强平与盈亏计算；其余平台价格<b>仅作参考比价</b>，不参与成交判定</li>
+        <li><b>永续与现货的差异</b>：永续价格围绕现货上下浮动（资金费率导致），两者通常相差几十到几百点不等；本终端以永续为唯一基准，K线、信号、止盈止损与撮合全部使用同一口径</li>
+        <li><b>美债 2Y/5Y/10Y</b>：美国财政部每日国债收益率曲线（<b>单一来源</b>，日频数据，无多平台概念，界面标注为「美国财政部」）</li>
+        <li><b>多空清算图（K线左侧）</b>：取自 Gate.io 永续的<b>真实强平订单</b>（<code>/futures/usdt/liq_orders</code>），回溯近 <b>24 小时</b>，按成交价位分桶累计成横向强度条，画在 K 线左侧（Y 轴左）。<b>绿色=多头仓位被强平</b>（强平单卖出成交，形成下杀压力），<b>红色=空头仓位被强平</b>（强平单买入成交，形成上冲压力）；强度条越长=该价位附近累计爆仓金额越大。金额口径 = <code>|张数| × 合约面值 × 成交价</code>（名义 USDT）</li>
+        <li><b>清算价位横线</b>：在强度最高的若干个价位上自动画虚线横贯 K 线，并在左端标注「<b>价位 · 多头/空头爆仓 $金额</b>」，即把清算价位与图上价格一一对应；缩放或平移 K 线时按当前可见价格区间重新聚合。接口单次只能查 1 小时窗口，因此按小时切片并发回溯后再合并去重；每 60 秒增量刷新最近 2 小时</li>
+        <li>石油 / 美股 / A股：免费实时接口存在跨域与授权限制，未纳入本版本；模型可平滑扩展</li>
+      </ul>
+      <h4>数据刷新（页面右上角刷新控件）</h4>
+      <ul>
+        <li><b>立即刷新</b>：点击按钮或按 <b>R</b> 键，强制重新拉取 K线、四周期信号、涨跌热力矩阵、成交热力图与实时价格。</li>
+        <li><b>刷新档位</b>：实时 / 5分钟 / 10分钟 / 30分钟，选择后会记住（下次打开沿用），右侧显示到下次自动刷新的倒计时。</li>
+        <li>档位只作用于<b>行情与分析数据</b>（K线、信号、止盈止损区间、两张热力图）。</li>
+        <li><b>实时价格与挂单撮合、强平检查固定为 5 秒</b>，不随档位变慢 —— 否则限价单触发与风控会失效。</li>
+        <li>各档位的实际节奏：实时 = 信号/矩阵 60 秒、成交热力图 15 秒；5 / 10 / 30 分钟 = 两者同为 5 / 10 / 30 分钟。</li>
+      </ul>
+      <h4>信号模型（多因子打分，-1 ~ +1）</h4>
+      <ul>
+        <li>趋势因子（权重40%）：EMA9 / EMA21 多空排列与乖离</li>
+        <li>动能因子（权重25%）：MACD(12,26,9) 柱状线方向与金叉死叉</li>
+        <li>超买超卖（权重20%）：RSI(14)，&lt;30 超卖偏多，&gt;70 超买偏空</li>
+        <li>波动通道（权重15%）：布林带(20,2) %B 位置，触及上下轨提示回归</li>
+        <li>综合分 ≥0.5 强烈买入 · 0.2~0.5 买入 · -0.2~0.2 观望 · -0.5~-0.2 卖出 · ≤-0.5 强烈卖出</li>
+      </ul>
+      <h4>热力图（方向与交易区间判断）</h4>
+      <ul>
+        <li>多品种多周期热力图：每个品种在 15m/30m/1h/4h 四列显示<b>该周期最近一根K线</b>的涨跌，最右列显示<b>近 24 小时</b>涨跌，绿涨红跌，颜色深浅=幅度大小（±3% 以上满色）</li>
+        <li><b>成交热力图（当下逐笔口径）</b>：直接取该品种<b>最近 15 分钟的真实逐笔成交</b>（Gate.io 永续成交流），按成交价分档累计成交量后再堆积成柱。颜色越亮=当下该价位成交越密集；<b>POC</b>=当下成交最密集价（价格磁吸位），<b>VA70</b>=覆盖当下 70% 成交量的价值区间。每 15 秒自动重取一次，并显示笔数、总量与主动买/卖占比</li>
+        <li><b>取数规则</b>：从<b>最新一笔成交向前回溯</b>，最多翻 8 页×1000 笔；成交极活跃（如 BTC）时优先保证最新成交完整，并在标题栏标注实际覆盖时长。逐笔不足 20 笔时自动降级</li>
+        <li>口径说明：成交热力图<b>不再是长周期K线统计</b>，只反映「现在」在哪成交得最多；美债无逐笔成交数据，自动降级为日线K线口径并在标题栏标注</li>
+        <li>交易区间卡片：结合 近20根高低点 / ATR(14) / 布林带 推导支撑位与压力位，并用「现价 vs 当下POC」判断方向偏向</li>
+      </ul>
+      <h4>止盈 / 止损价格区间（信号栏内提示）</h4>
+      <ul>
+        <li><b>数据依据</b>：对 15分钟 / 30分钟 / 1小时 / 4小时 四个周期的<b>真实K线</b>分别计算 ATR(14) 波动、近 N 根结构高低点（15m 取20根、30m 24根、1h 30根、4h 40根）、布林带(20,2) 与多因子信号方向</li>
+        <li><b>止损价</b>：优先取「结构止损」（做多 = 近期最低点再让 0.15×ATR，做空 = 近期最高点再让 0.15×ATR）；若该止损距离超过单笔风险上限（15m 2.0×ATR、30m 2.2、1h 2.4、4h 2.8），则改用 ATR 止损（1.2/1.5/1.8/2.4 × ATR），避免单笔风险过大</li>
+        <li><b>止盈价</b>：止盈一 = 1R（1 倍风险距离）；止盈二 = 结构压力/布林上轨（做空为结构支撑/布林下轨）与 2R 中<b>更近且可达</b>者，否则退回 2R；同时给出止盈三（3R 以上）供参考</li>
+        <li><b>盈亏比</b>：以止损距离为 1R 衡量，显示 1:1 / 1:x；<b>单笔风险</b>列为该周期止损距离占现价的百分比</li>
+        <li><b>参考入场区</b>：做多为现价下方 0.12~0.60×ATR（回踩买入），做空为现价上方同样区间（反弹卖出），天然符合「限价单须挂在未触及一侧」的规则</li>
+        <li><b>综合结论</b>：按周期权重（15m 20% / 30m 24% / 1h 26% / 4h 30%）加权同向周期的绝对价位，给出综合止损/止盈与盈亏比；置信度 = 方向一致性 60% + 信号强度，若 2 个以上周期为震荡则下调；共振 3/4 周期同向时标注「四周期共振」</li>
+        <li><b>建议数量</b>：按单笔风险预算（总权益 2%）÷ 止损距离反推，并受当前杠杆下最大可开量限制</li>
+        <li><b>持仓提示</b>：当前品种的持仓会按所选周期的方案列出参考止损/止盈与状态（接近止损 / 接近止盈 / 持有观察）</li>
+        <li><b>一键填入</b>：列表内「用此方案」只把委托价与数量填进下单面板，<b>不会自动下单</b>，仍需手动点击买入/卖出并完成二次确认</li>
+      </ul>
+      <h4>交易规则（模拟盘 · 手动下单）</h4>
+      <ul>
+        <li><b>订单类型</b>：市价单（立即按最新成交价成交，Taker 手续费 0.10%）／限价单（<b>只挂单，绝不立即成交</b>，Maker 手续费 0.05%）。限价单必须挂在行情尚未到达的一侧：买入价须低于现价、卖出价须高于现价；提交后进入「当前委托」等待，<b>只有实时成交价真正走到委托价才撮合成交</b>，未成交前可随时撤单，撤单时冻结的保证金全额退回</li>
+        <li><b>限价单撮合依据</b>：以逐笔实时成交数据为准（优先 WebSocket 逐笔成交推送，断线时用行情轮询兜底），委托成交价 = 委托价；下单瞬间的现价不计入触发，因此不会出现「挂单即成交」</li>
+        <li><b>方向</b>：买入/开多、卖出/开空双向持仓；多空可同时持有，各自独立计算保证金与强平价</li>
+        <li><b>杠杆倍数</b>：简化档位 <b>1x / 10x / 20x / 50x</b>（已去掉 2x / 3x / 5x），逐仓保证金。占用保证金 = 名义价值 ÷ 杠杆；收益率按保证金计算（放大倍数）</li>
+        <li><b>强平规则</b>：当浮动亏损逼近保证金（预留 0.5% 维持保证金）时自动强制平仓，剩余保证金退回可用余额</li>
+        <li><b>平仓</b>：持仓表点「平仓」，可选 市价平仓（立即成交）或 限价平仓（转为挂单，<b>行情真正涨/跌到委托价才成交</b>；多单委托价须高于现价、空单须低于现价）；支持按 25%/50%/75%/100% 部分平仓</li>
+        <li><b>反手</b>：一步市价平掉当前持仓并反向开立等量新仓</li>
+        <li><b>二次确认</b>：买入、卖出、平仓、反手、撤单、重置账户均弹出确认框，须点「是 · 确认」才执行，点「否 · 取消」或按 Esc 则放弃</li>
+        <li>初始模拟资金 100,000 USDT，全部数据保存在浏览器本地，可随时重置；<b>仅手动下单，不含任何自动交易</b></li>
+      </ul>
+      <h4>免责声明</h4>
+      <p>本系统为教学研究用途的模拟交易软件，所有信号与回测均基于历史数据，不构成任何投资建议。加密货币与衍生品交易风险极高。</p>
+    </div>
+  </div>
+</section>
+
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260923f · Gate.io 永续单一数据源 · 多空清算图</span></footer>
+
+<div id="toast" class="toast"></div>
+
+<!-- 二次确认弹窗 -->
+<div class="modal-mask" id="modalMask">
+  <div class="modal" id="modalBox">
+    <div class="md-head">
+      <span class="md-icon" id="mdIcon">?</span>
+      <h3 id="mdTitle">确认</h3>
+    </div>
+    <div class="md-body" id="mdBody"></div>
+    <div class="md-warn" id="mdWarn"></div>
+    <div class="md-actions">
+      <button class="md-no" id="mdNo">否 · 取消</button>
+      <button class="md-yes" id="mdYes">是 · 确认</button>
+    </div>
+  </div>
+</div>
+
+<script src="liq-map.js?v=20260923f"></script>
+<script src="app.js?v=20260923f"></script>
+</body>
+</html>

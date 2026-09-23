@@ -1,0 +1,3022 @@
+/* ============================================================
+   SimTrader · 多品种模拟交易终端（模拟盘 · 仅手动下单）
+   数据源：Gate.io USDT 永续行情 / 美国财政部国债收益率
+   ============================================================ */
+
+/* ---------- 交易平台（多平台实时比价）
+   primary=true 的平台为「主源」：其价格参与限价单撮合、强平与盈亏计算；
+   其余平台价格仅作参考比价，不参与任何成交判定。 */
+const VENUES = [
+  { key: 'gate',     name: 'Gate.io', cn: 'Gate·永续', primary: true },
+  { key: 'okx',      name: 'OKX',      cn: '欧易' },
+  { key: 'coinbase', name: 'Coinbase', cn: 'Coinbase' },
+  { key: 'bitstamp', name: 'Bitstamp', cn: 'Bitstamp' },
+];
+
+/* ---------- 品种配置 ---------- */
+const INSTRUMENTS = [
+  { id: 'BTC',   name: '比特币 BTC/USDT', short: 'BTC',   sym: 'BTCUSDT',      type: 'crypto', dec: 2,  qtyStep: 0.0001,
+    venues: { gate: 'BTCUSDT', okx: 'BTC-USDT', coinbase: 'BTC-USD', bitstamp: 'btcusdt' } },
+  { id: 'ETH',   name: '以太坊 ETH/USDT', short: 'ETH',   sym: 'ETHUSDT',      type: 'crypto', dec: 2,  qtyStep: 0.001,
+    venues: { gate: 'ETHUSDT', okx: 'ETH-USDT', coinbase: 'ETH-USD', bitstamp: 'ethusdt' } },
+  { id: 'BNB',   name: '币安币 BNB/USDT', short: 'BNB',   sym: 'BNBUSDT',      type: 'crypto', dec: 2,  qtyStep: 0.01,
+    venues: { gate: 'BNBUSDT', okx: 'BNB-USDT', coinbase: 'BNB-USD' } },
+  /* 黄金用 XAUUSDT 黄金永续（直接挂钩伦敦金）；取不到时退到 PAXGUSDT 永续，
+     两者都是 Gate 的 USDT 永续合约，口径不变，见 SYM_FALLBACK */
+  { id: 'GOLD',  name: '纽约黄金 XAU/USD', short: '黄金', sym: 'XAUUSDT',      type: 'gold',   dec: 2,  qtyStep: 0.001,
+    venues: { gate: 'XAUUSDT', okx: 'PAXG-USDT', coinbase: 'PAXG-USD' } },
+  { id: 'UST2Y',  name: '美债2年收益率',   short: '美2Y',  type: 'ust', tenor: '2 Yr',  dec: 3, qtyStep: 1, source: '美国财政部' },
+  { id: 'UST5Y',  name: '美债5年收益率',   short: '美5Y',  type: 'ust', tenor: '5 Yr',  dec: 3, qtyStep: 1, source: '美国财政部' },
+  { id: 'UST10Y', name: '美债10年收益率',  short: '美10Y', type: 'ust', tenor: '10 Yr', dec: 3, qtyStep: 1, source: '美国财政部' },
+];
+const TFS = ['15m', '30m', '1h', '4h'];
+const TF_NAME = { '15m': '15分钟', '30m': '30分钟', '1h': '1小时', '4h': '4小时' };
+
+const FEE = 0.001;            // 兼容旧引用（=市价 Taker 费率）
+const FEE_TAKER = 0.001;      // 市价单手续费 0.10%
+const FEE_MAKER = 0.0005;     // 限价单手续费 0.05%
+const MMR = 0.005;            // 维持保证金率（用于计算强平价）
+const LEVERS = [1, 10, 20, 50];          // 简化窗口：去掉 2x / 3x / 5x，只保留 1x / 10x / 20x / 50x
+const LEVER_DEFAULT = 10;
+
+/* ---------- 右上角刷新档位
+   仅控制「行情/分析数据」的刷新节奏（K线、信号、涨跌热力矩阵、成交热力图、止盈止损方案）。
+   实时价格轮询（5s）与逐笔成交撮合/强平检查不随档位变化 —— 它们是交易核心，
+   变慢会导致限价单触发与强平风控失效。 */
+const REFRESH_LEVELS = [
+  { id: 'realtime', name: '实时',   sigMs: 60000,  flowMs: 15000,  priceMs: 5000 },
+  { id: 'm5',       name: '5分钟',  sigMs: 300000, flowMs: 300000, priceMs: 5000 },
+  { id: 'm10',      name: '10分钟', sigMs: 600000, flowMs: 600000, priceMs: 5000 },
+  { id: 'm30',      name: '30分钟', sigMs: 1800000, flowMs: 1800000, priceMs: 5000 },
+];
+const REFRESH_KEY = 'simtrader_refresh_v1';
+function rfLevel() { return REFRESH_LEVELS.find(l => l.id === state.refreshLevel) || REFRESH_LEVELS[0]; }
+
+/* ---------- 止盈止损区间参数（按周期分别设定）
+   atrK     ：ATR 止损倍数（周期越大，容忍的正常波动越大）
+   maxAtrK  ：单笔最大风险上限（以 ATR 倍数计，防止结构止损过远）
+   look     ：结构高低点取样根数
+   rr       ：止盈目标的风险回报倍数（用于推导止盈1/2/3）
+   w        ：该周期在综合结论中的权重
+   riskPct  ：单笔风险预算（占总权益比例，用于反推建议数量） */
+const TPSL_CFG = {
+  '15m': { atrK: 1.20, maxAtrK: 2.0, look: 20, rr: [1.0, 2.0, 3.0], w: 0.20 },
+  '30m': { atrK: 1.50, maxAtrK: 2.2, look: 24, rr: [1.0, 2.0, 3.0], w: 0.24 },
+  '1h':  { atrK: 1.80, maxAtrK: 2.4, look: 30, rr: [1.0, 2.0, 3.2], w: 0.26 },
+  '4h':  { atrK: 2.40, maxAtrK: 2.8, look: 40, rr: [1.0, 2.2, 3.5], w: 0.30 },
+};
+const TPSL_RISK_BUDGET = 0.02;   // 单笔风险预算 = 总权益的 2%
+
+/* ---------- 工具 ---------- */
+const $ = (s) => document.querySelector(s);
+function fmt(v, dec = 2) {
+  if (v == null || isNaN(v)) return '—';
+  return Number(v).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+}
+function ts(t) { const d = new Date(t); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; }
+let toastTimer;
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3000); }
+function upDownClass(v) { return v > 0 ? 'txt-up' : v < 0 ? 'txt-down' : ''; }
+function upDownColor(v) { return v > 0 ? 'var(--up)' : v < 0 ? 'var(--down)' : 'var(--muted)'; }
+function fmtPct(v) { return (v > 0 ? '+' : '') + (v * 100).toFixed(2) + '%'; }
+
+/* ---------- 技术指标 ---------- */
+function ema(vals, p) {
+  const k = 2 / (p + 1), out = [];
+  let prev;
+  vals.forEach((v, i) => { prev = i === 0 ? v : v * k + prev * (1 - k); out.push(prev); });
+  return out;
+}
+function sma(vals, p) {
+  const out = [];
+  for (let i = 0; i < vals.length; i++) {
+    if (i < p - 1) { out.push(null); continue; }
+    let s = 0; for (let j = i - p + 1; j <= i; j++) s += vals[j];
+    out.push(s / p);
+  }
+  return out;
+}
+function rsi(closes, p = 14) {
+  const out = new Array(closes.length).fill(null);
+  let ag = 0, al = 0;
+  for (let i = 1; i < closes.length; i++) {
+    const ch = closes[i] - closes[i - 1], g = Math.max(ch, 0), l = Math.max(-ch, 0);
+    if (i <= p) { ag += g / p; al += l / p; if (i === p) out[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al); }
+    else { ag = (ag * (p - 1) + g) / p; al = (al * (p - 1) + l) / p; out[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al); }
+  }
+  return out;
+}
+function macd(closes, f = 12, s = 26, sig = 9) {
+  const ef = ema(closes, f), es = ema(closes, s);
+  const dif = closes.map((_, i) => ef[i] - es[i]);
+  const dea = ema(dif, sig);
+  return { dif, dea, hist: dif.map((d, i) => d - dea[i]) };
+}
+function boll(closes, p = 20, m = 2) {
+  const mid = sma(closes, p);
+  const up = [], lo = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (mid[i] == null) { up.push(null); lo.push(null); continue; }
+    let s = 0; for (let j = i - p + 1; j <= i; j++) s += Math.pow(closes[j] - mid[i], 2);
+    const sd = Math.sqrt(s / p);
+    up.push(mid[i] + m * sd); lo.push(mid[i] - m * sd);
+  }
+  return { mid, up, lo };
+}
+
+/* KDJ(9,3,3)：RSV → K（2/3 前值 + 1/3 新值）→ D（对 K 同样平滑）→ J = 3K − 2D */
+function kdj(candles, n = 9, m1 = 3, m2 = 3) {
+  const k = [], d = [], j = [];
+  let pk = 50, pd = 50;
+  for (let i = 0; i < candles.length; i++) {
+    if (i < n - 1) { k.push(null); d.push(null); j.push(null); continue; }
+    let hh = -Infinity, ll = Infinity;
+    for (let x = i - n + 1; x <= i; x++) {
+      if (candles[x].high > hh) hh = candles[x].high;
+      if (candles[x].low < ll) ll = candles[x].low;
+    }
+    const rsv = hh === ll ? 50 : (candles[i].close - ll) / (hh - ll) * 100;
+    pk = (m1 - 1) / m1 * pk + rsv / m1;
+    pd = (m2 - 1) / m2 * pd + pk / m2;
+    k.push(pk); d.push(pd); j.push(3 * pk - 2 * pd);
+  }
+  return { k, d, j };
+}
+
+/* OBV 能量潮：涨计 +量、跌计 −量、平计 0，逐根累加 */
+function obv(candles) {
+  const out = [];
+  let acc = 0;
+  for (let i = 0; i < candles.length; i++) {
+    const v = candles[i].volume || 0;
+    if (i > 0) {
+      const c = candles[i].close, pv = candles[i - 1].close;
+      if (c > pv) acc += v; else if (c < pv) acc -= v;
+    } else acc = v;
+    out.push(acc);
+  }
+  return out;
+}
+
+/* 量价背离：价创新高而 OBV 未创新高 → 顶背离(-1)；价创新低而 OBV 未创新低 → 底背离(+1) */
+function obvDivergence(candles, look = 30) {
+  if (!candles || candles.length < 12) return 0;
+  const ov = obv(candles);
+  const seg = candles.slice(-look), sv = ov.slice(-look);
+  const n = seg.length;
+  let hiC = -Infinity, hiO = -Infinity, loC = Infinity, loO = Infinity;
+  for (let i = 0; i < n - 1; i++) {
+    if (seg[i].close > hiC) hiC = seg[i].close;
+    if (sv[i] > hiO) hiO = sv[i];
+    if (seg[i].close < loC) loC = seg[i].close;
+    if (sv[i] < loO) loO = sv[i];
+  }
+  const lastC = seg[n - 1].close, lastO = sv[n - 1];
+  if (lastC > hiC && lastO < hiO) return -1;    // 顶背离：上涨无量，警惕反转
+  if (lastC < loC && lastO > loO) return 1;     // 底背离：下跌无量，跌势衰竭
+  return 0;
+}
+
+/* 布林扩展：%B（价格在通道中的相对位置）+ 带宽 + 带宽历史分位（收口/开口） */
+function bollExt(closes, p = 20, m = 2) {
+  const b = boll(closes, p, m);
+  const i = closes.length - 1;
+  const bw = closes.map((_, x) => (b.mid[x] == null || !b.mid[x]) ? null : (b.up[x] - b.lo[x]) / b.mid[x]);
+  const hist = bw.slice(Math.max(0, bw.length - 120), i + 1).filter(v => v != null && isFinite(v));
+  const cur = bw[i];
+  const bwRank = (cur == null || !hist.length) ? null : hist.filter(v => v <= cur).length / hist.length;
+  const pb = (b.up[i] != null && b.up[i] !== b.lo[i]) ? (closes[i] - b.lo[i]) / (b.up[i] - b.lo[i]) : null;
+  return {
+    ...b, bw, pb, bwRank,
+    squeeze: bwRank != null && bwRank < 0.25,     // 波动压缩 → 容易被扫损，需给止损缓冲
+    expand: bwRank != null && bwRank > 0.78,      // 波动扩张 → 止损需跟随放大
+  };
+}
+
+/* ATR% 在自身近 120 根中的分位（判断当前波动处于历史高位还是低位） */
+function atrRank(candles, p = 14, look = 120) {
+  if (!candles || candles.length < p + 20) return null;
+  const n = candles.length;
+  const series = [];
+  for (let i = p; i < n; i++) {
+    const seg = candles.slice(Math.max(0, i - p), i + 1);
+    let a = 0;
+    for (let x = 1; x < seg.length; x++) {
+      const c = seg[x], pv = seg[x - 1];
+      a += Math.max(c.high - c.low, Math.abs(c.high - pv.close), Math.abs(c.low - pv.close));
+    }
+    a /= (seg.length - 1);
+    const c0 = candles[i].close;
+    if (c0 > 0) series.push(a / c0);
+  }
+  if (series.length < 10) return null;
+  const hist = series.slice(-look);
+  const cur = hist[hist.length - 1];
+  return hist.filter(v => v <= cur).length / hist.length;
+}
+
+function clampN(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+/* ---------- 信号引擎（六因子打分） ----------
+   因子与权重：趋势 EMA9/21 30% · MACD 动能 22% · KDJ 15% · RSI 13% · 布林 %B 10% · OBV 量能 10%
+   KDJ 与 RSI 同属摆动指标但算法不同（KDJ 含最高最低价位置），OBV 补充量价配合验证。 */
+const SIG_W = { trend: 0.30, macd: 0.22, kdj: 0.15, rsi: 0.13, boll: 0.10, obv: 0.10 };
+function computeSignal(candles) {
+  const closes = candles.map(c => c.close);
+  if (closes.length < 40) return null;
+  const last = closes[closes.length - 1];
+  const e9 = ema(closes, 9), e21 = ema(closes, 21);
+  const m = macd(closes), r = rsi(closes), bx = bollExt(closes);
+  const kd = kdj(candles);
+  const i = closes.length - 1;
+
+  // ① 趋势因子：EMA9/21 乖离归一
+  const dev = (e9[i] - e21[i]) / last;
+  const trend = clampN(dev * 120, -1, 1);
+
+  // ② 动能因子：MACD 柱方向 + 增强/衰减 + 零轴位置
+  let macdV = 0;
+  if (m.hist[i] > 0) macdV = m.hist[i] > m.hist[i - 1] ? 1 : 0.45;
+  else macdV = m.hist[i] < m.hist[i - 1] ? -1 : -0.45;
+  // 零轴位置只做「同向放大」，不单独制造方向（否则横盘微涨会被误判为明确多头）
+  if (m.dif[i] > 0 && m.dea[i] > 0 && macdV > 0) macdV = Math.min(1, macdV + 0.12);
+  else if (m.dif[i] < 0 && m.dea[i] < 0 && macdV < 0) macdV = Math.max(-1, macdV - 0.12);
+  macdV = clampN(macdV, -1, 1);
+  const macdCross = (m.dif[i] > m.dea[i] && m.dif[i - 1] <= m.dea[i - 1]) ? 1
+    : (m.dif[i] < m.dea[i] && m.dif[i - 1] >= m.dea[i - 1]) ? -1 : 0;
+
+  // ③ KDJ 因子：金叉/死叉（55%）+ 超买超卖区（45%）
+  // KDJ 金叉权重按位置衰减：低位金叉（K<30）信号强，高位金叉（K>70）易失效
+  const K = kd.k[i], D = kd.d[i], J = kd.j[i];
+  let kdjV = 0, kdjTxt = '—';
+  if (K != null && D != null && kd.k[i - 1] != null) {
+    const cross = (K > D && kd.k[i - 1] <= kd.d[i - 1]) ? 1 : (K < D && kd.k[i - 1] >= kd.d[i - 1]) ? -1 : 0;
+    let zone = 0;
+    if (J > 100) zone = -0.7; else if (J > 80) zone = -0.3;
+    else if (J < 0) zone = 0.7; else if (J < 20) zone = 0.3;
+    const posW = K < 30 ? 1 : K > 70 ? 0.6 : 0.8;      // 低位金叉/死叉更可信
+    kdjV = clampN(0.55 * cross * posW + 0.45 * zone, -1, 1);
+    kdjTxt = cross === 1 ? '金叉 ↑' : cross === -1 ? '死叉 ↓' : (K > D ? 'K 在 D 上' : 'K 在 D 下');
+  }
+
+  // ④ RSI（顺势动量，极端区衰减避免追高杀低）
+  const rv = r[i] ?? 50;
+  const rsiV = clampN((rv - 50) / 50, -0.8, 0.8);
+
+  // ⑤ 布林 %B（均值回归倾向：贴上轨偏空、贴下轨偏多）
+  let bollV = 0;
+  const pb = bx.pb;
+  if (pb != null) {
+    if (pb < 0.05) bollV = 0.8; else if (pb > 0.95) bollV = -0.8;
+    else if (pb < 0.2) bollV = 0.35; else if (pb > 0.8) bollV = -0.35;
+  }
+
+  // ⑥ OBV 量能：OBV 与自身 20 期均线的偏离（60%）+ 量价背离（40%）
+  const ov = obv(candles), oma = ema(ov, 20);
+  const rel = (ov[i] - oma[i]) / (Math.abs(oma[i]) + 1e-9);
+  const obvBase = clampN(rel * 2, -0.9, 0.9);      // 系数收敛，避免横盘里 OBV 随机游走打满
+  const dvg = obvDivergence(candles);
+  const obvV = clampN(obvBase * 0.6 + dvg * 0.4, -1, 1);
+  const obvTxt = dvg === -1 ? '顶背离（价涨量缩）' : dvg === 1 ? '底背离（价跌量缩）'
+    : (ov[i] >= oma[i] ? '量能偏多' : '量能偏空');
+
+  const raw = trend * SIG_W.trend + macdV * SIG_W.macd + kdjV * SIG_W.kdj
+    + rsiV * SIG_W.rsi + bollV * SIG_W.boll + obvV * SIG_W.obv;
+
+  /* 方向判定的两道闸门：
+     ① 主导因子：至少有一个因子明确表态，否则六因子各给一点同向分也能凑过阈值；
+     ② 趋势门槛：EMA9/21 粘合（|trend| < 0.15）说明处于震荡，此时摆动指标噪音大，
+        需更强的分数才认定方向成立（阈值 0.20 → 0.32）。 */
+  const strength = Math.max(Math.abs(trend), Math.abs(macdV), Math.abs(kdjV),
+    Math.abs(rsiV), Math.abs(bollV), Math.abs(obvV));
+  const trendLocked = Math.abs(trend) >= 0.15;
+  const th = trendLocked ? 0.20 : 0.32;
+  const clear = strength >= 0.5 && Math.abs(raw) >= th;
+  const score = clear ? raw : raw * 0.5;      // 方向不成立 → 分数向中性收敛
+  const dir = clear ? (raw >= th ? 'long' : raw <= -th ? 'short' : 'wait') : 'wait';
+  const label = !clear ? '观望'
+    : score >= 0.5 ? '强烈买入' : score >= th ? '买入'
+      : score > -th ? '观望' : score > -0.5 ? '卖出' : '强烈卖出';
+  const kind = !clear ? 'neutral' : score >= th ? 'buy' : score > -th ? 'neutral' : 'sell';
+  return {
+    score, label, kind, dir, clear, raw, th, trendLocked,
+    detail: [
+      ['趋势 EMA9/21', e9[i] > e21[i] ? '多头排列' : '空头排列', trend],
+      ['动能 MACD柱', (m.hist[i] > 0 ? '多方' : '空方') + (macdCross ? (macdCross > 0 ? ' · 金叉' : ' · 死叉') : ''), macdV],
+      ['KDJ 随机指标', K == null ? '—' : `${kdjTxt} · J ${J.toFixed(0)}`, kdjV],
+      ['超买超卖 RSI', rv.toFixed(1), rsiV],
+      ['通道 布林%B', pb != null ? (pb * 100).toFixed(0) + '%' : '—', bollV],
+      ['量能 OBV', obvTxt, obvV],
+    ],
+    // 指标快照（供指标面板与止盈止损优化使用）
+    ind: {
+      k: K, d: D, j: J, kdjTxt,
+      dif: m.dif[i], dea: m.dea[i], hist: m.hist[i], macdCross,
+      rsi: rv,
+      pb, bw: bx.bw[i], bwRank: bx.bwRank, squeeze: bx.squeeze, expand: bx.expand,
+      bUp: bx.up[i], bMid: bx.mid[i], bLo: bx.lo[i],
+      obv: ov[i], obvMa: oma[i], dvg, obvTxt,
+    },
+  };
+}
+const SIG_COLOR = { '强烈买入': 'var(--up)', '买入': 'var(--up)', '观望': 'var(--muted)', '卖出': 'var(--down)', '强烈卖出': 'var(--down)' };
+
+/* ============================================================
+   数据接入层
+   目标：任何单点网络故障都不该导致「页面空白 / 抓不到数据」。
+   四道防线 —— 超时 → 重试 → 换源 → 缓存兜底。
+   ============================================================ */
+
+/* ---------- 网络层：超时 + 重试 + 退避 ----------
+   裸 fetch 在网络被墙（TCP 黑洞）时会无限挂起：请求既不通也不报错，
+   页面只能一直停在加载态 —— 这是「抓不到数据」最常见也最容易被忽略的原因。
+   这里强制给每个请求设上限，超时候快速失败并转下一源。 */
+const NET = { timeout: 4500, retries: 0, backoff: 350, budget: 12000 };
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+class NetError extends Error {
+  constructor(msg, kind) { super(msg); this.name = 'NetError'; this.kind = kind || 'net'; }
+}
+async function netFetch(url, opt = {}) {
+  const timeout = opt.timeout != null ? opt.timeout : NET.timeout;
+  const retries = opt.retries != null ? opt.retries : NET.retries;
+  let last;
+  for (let i = 0; i <= retries; i++) {
+    if (i > 0) await sleep(NET.backoff * Math.pow(2, i - 1) + Math.random() * 200);
+    const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    let timer = null;
+    try {
+      if (ctl) timer = setTimeout(() => ctl.abort(), timeout);
+      const init = ctl ? Object.assign({}, opt.init, { signal: ctl.signal }) : opt.init;
+      const res = await fetch(url, init);
+      if (!res.ok) throw new NetError('HTTP ' + res.status, 'http');
+      return res;
+    } catch (e) {
+      last = (e && e.name === 'AbortError') ? new NetError('请求超时 ' + timeout + 'ms', 'timeout') : e;
+    } finally { if (timer) clearTimeout(timer); }
+  }
+  throw last;
+}
+async function netJson(url, opt) { const r = await netFetch(url, opt); return await r.json(); }
+async function netText(url, opt) { const r = await netFetch(url, opt); return await r.text(); }
+
+/* ---------- 源健康度：按实测延迟与成功率动态排序 ----------
+   境外接口的可达性会随时间、网络环境变化（域名被污染、TCP 被 reset 都是常态），
+   把主源写死，就会在某一天突然全挂。这里记录每个源的成功/失败与最近延迟，
+   每次取源都按「健康分」排序，失败的源自动沉底，恢复后又能浮上来。 */
+const SRC_KEY = 'simtrader_src_v1';
+function loadSrcHealth() { try { return JSON.parse(localStorage.getItem(SRC_KEY) || '{}') || {}; } catch (e) { return {}; } }
+const SRC_HEALTH = loadSrcHealth();
+function saveSrcHealth() { try { localStorage.setItem(SRC_KEY, JSON.stringify(SRC_HEALTH)); } catch (e) {} }
+function srcOf(key) { return SRC_HEALTH[key] || (SRC_HEALTH[key] = { ok: 0, fail: 0, ms: 0, lastOk: 0 }); }
+function srcRecord(key, ok, ms) {
+  const h = srcOf(key);
+  if (ok) { h.ok++; h.ms = ms ? (h.ms ? Math.round(h.ms * 0.6 + ms * 0.4) : ms) : h.ms; h.lastOk = Date.now(); h.fail = Math.max(0, h.fail - 1); }
+  else { h.fail++; h.lastFail = Date.now(); }
+  saveSrcHealth();
+}
+/* 健康分：越小越优先。失败率重罚（×100000），延迟作为次要排序项 */
+function srcScore(key) {
+  const h = srcOf(key), n = h.ok + h.fail;
+  return (n ? h.fail / n : 0) * 100000 + (h.ms || 4000);
+}
+/* 手动锁定主源：用户指定的源永远排在最前（存 localStorage，跨会话生效） */
+const PIN_KEY = 'simtrader_pin_v1';
+function loadPin() { try { return localStorage.getItem(PIN_KEY) || ''; } catch (e) { return ''; } }
+function savePin(k) { try { k ? localStorage.setItem(PIN_KEY, k) : localStorage.removeItem(PIN_KEY); } catch (e) {} }
+let srcPinned = loadPin();
+function setSrcPinned(k) { srcPinned = k || ''; savePin(srcPinned); }
+function orderedSources(list) {
+  return list.slice().sort((a, b) => {
+    if (srcPinned) {
+      if (a.key === srcPinned) return -1;
+      if (b.key === srcPinned) return 1;
+    }
+    /* 永续永远排在现货前面：即使现货更快更稳，也不能因为「快」就把永续价换成现货价 */
+    const ka = a.kind === 'perp' ? 0 : 1, kb = b.kind === 'perp' ? 0 : 1;
+    if (ka !== kb) return ka - kb;
+    return srcScore(a.key) - srcScore(b.key);
+  });
+}
+/* 换源时的进度回调：让界面能显示「正在尝试备用源」，
+   否则用户在十几秒的等待里根本不知道系统是卡死了还是在工作。 */
+let netHint = null;
+async function trySources(sources, kind, label, fn) {
+  const t0 = Date.now();
+  let last;
+  const list = orderedSources(sources);
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    if (i > 0) {
+      if (Date.now() - t0 > NET.budget) break;      // 总预算耗尽 → 快速失败，不再无意义地等
+      if (netHint) netHint(`主源无响应，正在尝试 ${s.name}…`);
+    }
+    const r0 = Date.now();
+    try {
+      const out = await fn(s);
+      srcRecord(s.key, true, Date.now() - r0);
+      if (i > 0 && netHint) netHint('');             // 换源成功后清空提示
+      return out;
+    } catch (e) { srcRecord(s.key, false); last = e; }
+  }
+  throw last || new NetError(label + '：全部数据源均不可用', 'all');
+}
+
+/* ---------- 持久化快照缓存：最后一道防线 ----------
+   只要成功取到过一次数据，就写一份到 localStorage。
+   之后即便所有源都挂掉，页面仍能显示「上次成功的数据」而不是空白，
+   并明确标注数据时间，避免把陈旧数据误当成实时行情。 */
+/* 快照键升到 v2：v1 存的是现货口径数据，改版为永续基准后不应再拿旧快照兜底 */
+const SNAP_KEY = 'simtrader_snap_v3';   // v3：品种代码换为 XAUUSDT 后旧快照口径不一致，直接作废
+const SNAP_MAX = 40;          // 最多保留 40 份快照，超出按时间淘汰最旧的
+function snapStore() { try { return JSON.parse(localStorage.getItem(SNAP_KEY) || '{}') || {}; } catch (e) { return {}; } }
+function snapSave(key, data) {
+  try {
+    const s = snapStore();
+    s[key] = { data, ts: Date.now() };
+    const ks = Object.keys(s);
+    if (ks.length > SNAP_MAX) {
+      ks.sort((a, b) => (s[a].ts || 0) - (s[b].ts || 0));
+      ks.slice(0, ks.length - SNAP_MAX).forEach(k => delete s[k]);
+    }
+    localStorage.setItem(SNAP_KEY, JSON.stringify(s));
+  } catch (e) { /* 配额不足时静默放弃，不影响主流程 */ }
+}
+function snapLoad(key) {
+  try { const s = snapStore(); return s[key] || null; } catch (e) { return null; }
+}
+/* 把 K 线压缩后再存：坐标取整、价格保留 8 位有效精度，减少 60% 以上体积 */
+function slimCandles(c) {
+  return c.map(x => [x.time, +(+x.open).toFixed(8), +(+x.high).toFixed(8), +(+x.low).toFixed(8), +(+x.close).toFixed(8), +(+x.volume).toFixed(4)]);
+}
+function fatCandles(c) {
+  return (c || []).map(a => ({ time: a[0], open: a[1], high: a[2], low: a[3], close: a[4], volume: a[5] }));
+}
+function staleText(ts) {
+  const d = Date.now() - ts;
+  if (d < 60000) return '刚刚';
+  if (d < 3600000) return Math.floor(d / 60000) + ' 分钟前';
+  if (d < 86400000) return Math.floor(d / 3600000) + ' 小时前';
+  return Math.floor(d / 86400000) + ' 天前';
+}
+
+/* ---------- 行情源：Gate.io USDT 永续（单一数据源） ----------
+   K线、实时价、24小时涨跌、逐笔成交与实时推送，全部只走 Gate.io 的 USDT 永续合约，
+   不再抓任何现货行情，也不再回退到其他交易所 —— 口径统一，界面所见即永续价。 */
+const GATE_HOST = 'https://api.gateio.ws';
+/* 品种代码 → Gate.io USDT 永续合约（均已实测可取数） */
+const GATE_FUT_PAIR = {
+  BTCUSDT: 'BTC_USDT', ETHUSDT: 'ETH_USDT', BNBUSDT: 'BNB_USDT',
+  XAUUSDT: 'XAU_USDT',          // 黄金永续（直接挂钩伦敦金）
+  PAXGUSDT: 'PAXG_USDT',        // 黄金代币永续，仅作 XAU 取不到时的同口径备用
+};
+/* 备用代码：主代码取不到时换成这个再试一次，仍在 Gate 永续口径内（XAU → PAXG） */
+const SYM_FALLBACK = { XAUUSDT: 'PAXGUSDT' };
+
+/* Gate.io USDT 永续源（本终端唯一行情源） */
+const GATE_FUT_SOURCE = {
+  key: 'gate_perp', name: 'Gate·永续', host: GATE_HOST, kind: 'perp',
+  pingUrl: GATE_HOST + '/api/v4/futures/usdt/time',
+  async klines(sym, tf, limit) {
+    const pair = GATE_FUT_PAIR[sym];
+    if (!pair) throw new NetError('Gate.io 无此永续合约 ' + sym, 'unsupported');
+    const j = await netJson(`${GATE_HOST}/api/v4/futures/usdt/candlesticks?contract=${pair}&interval=${tf}&limit=${limit}`);
+    if (!Array.isArray(j) || !j.length) throw new NetError('K线为空', 'empty');
+    return j.map(a => ({ time: +a.t, open: +a.o, high: +a.h, low: +a.l, close: +a.c, volume: +a.v }))
+            .sort((x, y) => x.time - y.time);
+  },
+  async prices(syms) {
+    const out = {};
+    await Promise.all(syms.map(async s => {
+      const pair = GATE_FUT_PAIR[s]; if (!pair) return;
+      try {
+        const j = await netJson(`${GATE_HOST}/api/v4/futures/usdt/tickers?contract=${pair}`);
+        if (j && j[0] && +j[0].last > 0) out[s] = +j[0].last;
+      } catch (e) { /* 单个合约失败不影响其他 */ }
+    }));
+    if (!Object.keys(out).length) throw new NetError('价格为空', 'empty');
+    return out;
+  },
+  async dayChange(syms) {
+    const out = {};
+    await Promise.all(syms.map(async s => {
+      const pair = GATE_FUT_PAIR[s]; if (!pair) return;
+      try {
+        const j = await netJson(`${GATE_HOST}/api/v4/futures/usdt/tickers?contract=${pair}`);
+        if (j && j[0] && j[0].change_percentage != null) out[s] = +j[0].change_percentage;
+      } catch (e) { /* 同上 */ }
+    }));
+    if (!Object.keys(out).length) throw new NetError('涨跌为空', 'empty');
+    return out;
+  },
+  async aggTrades(sym, opt) {
+    const pair = GATE_FUT_PAIR[sym]; if (!pair) throw new NetError('unsupported', 'unsupported');
+    opt = opt || {};
+    let q = `contract=${pair}&limit=${opt.limit || 1000}`;
+    if (opt.endTime != null) q += `&to=${Math.floor(opt.endTime / 1000)}`;
+    const j = await netJson(`${GATE_HOST}/api/v4/futures/usdt/trades?${q}`);
+    return (j || []).map(t => ({ T: Math.round(+(t.create_time_ms != null ? t.create_time_ms : t.create_time * 1000)), p: t.price, q: t.size }));
+  },
+  async ticker24h(sym) {
+    const pair = GATE_FUT_PAIR[sym]; if (!pair) throw new NetError('unsupported', 'unsupported');
+    const j = await netJson(`${GATE_HOST}/api/v4/futures/usdt/tickers?contract=${pair}`);
+    const last = j && j[0] ? +j[0].last : NaN, pct = j && j[0] ? +j[0].change_percentage : NaN;
+    return { lastPrice: last, openPrice: isFinite(last) && isFinite(pct) ? last / (1 + pct / 100) : null };
+  },
+};
+
+/* 唯一数据源：Gate.io USDT 永续。没有备线、没有现货兜底 —— 取不到就是取不到，宁可显示离线快照也不换口径 */
+const KLINE_SOURCES = [GATE_FUT_SOURCE];
+
+/* 当前生效的数据源（供界面显示）：kline=主行情源，ust=美债源，degraded=正在显示离线快照 */
+const dataSrc = { kline: '—', klineKey: '', price: '—', ust: '—', lastOk: 0, degraded: false, staleTs: 0 };
+
+/* 代码级回退：主代码在某个源上取不到时，换成备用代码再试一次
+   （黄金永续 XAUUSDT 拿不到 → 退回黄金代币 PAXGUSDT 拿现货价）
+   只作用于当前这个源，不会打乱「永续优先」的源链顺序 */
+async function callSym(fn, sym, a, b) {
+  try {
+    return await fn(sym, a, b);
+  } catch (e) {
+    const alt = SYM_FALLBACK[sym];
+    if (!alt) throw e;
+    return await fn(alt, a, b);
+  }
+}
+/* 整批请求版本：把需要回退的代码换成备用代码重取，再把结果键名映射回原代码 */
+async function callSyms(fn, syms, a) {
+  try {
+    return await fn(syms, a);
+  } catch (e) {
+    const mapped = syms.map(x => SYM_FALLBACK[x] || x);
+    if (mapped.join(',') === syms.join(',')) throw e;
+    const out = await fn(mapped, a);
+    const back = {};
+    syms.forEach((x, i) => { const v = out[mapped[i]]; if (v != null) back[x] = v; });
+    if (!Object.keys(back).length) throw e;
+    return back;
+  }
+}
+
+/* 逐笔成交 / 24h 行情：同样走「永续优先、现货兜底」的整条源链 */
+async function srcFetch(kind, label, fn) {
+  return await trySources(KLINE_SOURCES, kind, label, fn);
+}
+async function fetchKlines(symbol, interval, limit = 300, endTime) {
+  return await trySources(KLINE_SOURCES, 'kline', 'K线', async s => {
+    const c = await callSym((x, tf, n) => s.klines(x, tf, n), symbol, interval, limit);
+    const out = endTime ? c.filter(x => x.time * 1000 <= endTime) : c;
+    if (!out.length) throw new NetError('K线为空', 'empty');
+    dataSrc.kline = s.name; dataSrc.klineKey = s.key; dataSrc.lastOk = Date.now();
+    return out;
+  });
+}
+async function fetchPrices(symbols) {
+  return await trySources(KLINE_SOURCES, 'price', '实时价格', async s => {
+    const o = await callSyms(x => s.prices(x), symbols);
+    if (!Object.keys(o).length) throw new NetError('价格为空', 'empty');
+    dataSrc.price = s.name;
+    return o;
+  });
+}
+async function fetchDayChange(symbols) {
+  return await trySources(KLINE_SOURCES, 'price', '24小时涨跌', async s => await callSyms(x => s.dayChange(x), symbols));
+}
+
+/* ---------- 源探测 ----------
+   只有一个源（Gate.io 永续），探测的作用是把实测延迟写进健康度并显示到状态条上。 */
+async function probeSources() {
+  await Promise.all(KLINE_SOURCES.map(async s => {
+    const t0 = Date.now();
+    try {
+      await netJson(s.pingUrl, { timeout: 6000, retries: 0 });
+      srcRecord(s.key, true, Date.now() - t0);
+    } catch (e) { srcRecord(s.key, false); }
+  }));
+  renderDataSource();
+}
+
+/* ---------- 数据源状态条 ----------
+   把「数据到底来自哪里、快不快、是不是过期缓存」直接摆在用户眼前。
+   行情类页面最忌讳的是数据悄悄不动了而界面看起来一切正常。 */
+/* 当前源固定为 Gate.io USDT 永续 —— 只有一个源，不存在永续/现货混用的可能 */
+function srcKindText() {
+  return 'Gate.io 永续';
+}
+function renderDataSource() {
+  const dot = $('#dsDot'), name = $('#dsName'), msEl = $('#dsMs');
+  if (!dot || !name) return;
+  const cur = KLINE_SOURCES.find(s => s.key === dataSrc.klineKey);
+  const h = cur ? srcOf(cur.key) : null;
+  let cls, txt, sub = '';
+  if (dataSrc.degraded) {
+    cls = 'stale'; txt = '离线快照';
+    sub = dataSrc.staleTs ? staleText(dataSrc.staleTs) + '更新' : '';
+  } else if (cur) {
+    cls = 'ok'; txt = cur.name;
+    sub = h && h.ms ? h.ms + 'ms' : '';
+  } else { cls = 'warn'; txt = '连接中…'; }
+  dot.className = 'ds-dot ' + cls;
+  name.textContent = txt;
+  if (msEl) msEl.textContent = sub;
+  const ctl = $('#dsCtl');
+  if (ctl) ctl.classList.toggle('degraded', !!dataSrc.degraded);
+  if (ctl && ctl.classList.contains('open')) renderDsMenu();
+}
+function renderDsMenu() {
+  const box = $('#dsList');
+  if (!box) return;
+  box.innerHTML = orderedSources(KLINE_SOURCES).map(s => {
+    const h = srcOf(s.key), n = h.ok + h.fail;
+    const rate = n ? Math.round(h.ok / n * 100) : null;
+    const st = !n ? 'unknown' : rate >= 80 ? 'ok' : rate >= 40 ? 'warn' : 'bad';
+    const meta = !n ? '尚未测试' : (h.ms ? h.ms + 'ms · ' : '') + '成功率 ' + rate + '%';
+    return `<button class="ds-item${s.key === dataSrc.klineKey ? ' cur' : ''}${s.key === srcPinned ? ' pinned' : ''}" data-src="${s.key}">
+      <span class="ds-dot ${st}"></span>
+      <span class="ds-iname">${s.name}</span>
+      <span class="ds-imeta">${meta}</span>
+      <span class="ds-iact">${s.key === srcPinned ? '已锁定' : '锁定'}</span>
+    </button>`;
+  }).join('');
+  box.querySelectorAll('[data-src]').forEach(b => b.addEventListener('click', () => {
+    const k = b.dataset.src;
+    setSrcPinned(srcPinned === k ? '' : k);
+    const nm = (KLINE_SOURCES.find(s => s.key === k) || {}).name || k;
+    toast(srcPinned ? '已锁定主源 ' + nm + ' · 正在重新加载' : '已恢复自动择优');
+    renderDsMenu();
+    refreshAll(true);
+  }));
+  const foot = $('#dsFoot');
+  if (foot) foot.textContent = dataSrc.degraded
+    ? '所有数据源当前不可达，正在显示本地缓存的上次成功数据，仅供参考。'
+    : '默认按「成功率 + 实测延迟」自动择优，某个源失败会立即切换下一个。';
+}
+function initDataSourceCtl() {
+  const ctl = $('#dsCtl'), btn = $('#dsBtn');
+  if (!ctl || !btn) return;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    ctl.classList.toggle('open');
+    if (ctl.classList.contains('open')) renderDsMenu();
+  });
+  document.addEventListener('click', (e) => { if (!ctl.contains(e.target)) ctl.classList.remove('open'); });
+  renderDataSource();
+}
+/* 真实逐笔成交（aggTrades）：用于「当下」成交分布口径。
+   从最新一笔开始向前翻页（首屏不带参数 = 最新 1000 笔），
+   直到覆盖满时间窗口或达到页数上限——这样即使窗口内成交笔数极多，
+   也优先保证「最近」的成交数据完整，不会漏掉当下最新的成交。 */
+const AGG_PAGE_LIMIT = 8;      // 单次最多 8 页 × 1000 笔
+async function fetchAggTrades(symbol, minutes) {
+  const cut = Date.now() - minutes * 60000;
+  let all = [], endTime = null;
+  for (let page = 0; page < AGG_PAGE_LIMIT; page++) {
+    let batch;
+    try { batch = await srcFetch('kline', '逐笔成交', s => callSym((x, opt) => s.aggTrades(x, opt), symbol, { limit: 1000, endTime: endTime })); }
+    catch (e) { break; }
+    if (!Array.isArray(batch) || !batch.length) break;
+    all = batch.concat(all);
+    const first = batch[0];
+    if (+first.T <= cut) break;          // 已覆盖到窗口起点
+    endTime = +first.T - 1;              // 否则继续向前翻
+  }
+  return all.filter(t => +t.T >= cut);
+}
+
+/* ---------- 多平台实时比价 ----------
+   同一品种并行取 Gate.io 永续（主源）/ OKX / Coinbase / Bitstamp 的实时价。
+   主源只有一个：Gate.io USDT 永续；其余平台直连公开 REST，仅作比价参考。
+   注意：Bitstamp 对不存在的交易对会回退返回「数组」格式，这里显式丢弃，避免污染比价。 */
+/* 第三方平台（OKX / Coinbase / Bitstamp）比价请求：
+   超时收紧到 5 秒 —— 它们只用于比价展示，不该拖慢主流程。 */
+async function jFetch(url, timeout) {
+  const res = await netFetch(url, { timeout: timeout || 5000, retries: 0 });
+  return await res.json();
+}
+/* 单个平台报价：契约统一 —— 无论网络错误、HTTP 错误、格式异常还是价格无效，
+   一律返回 null，绝不抛出。这样调用方（尤其直接调用时）不会因为单个平台挂掉而中断。 */
+async function fetchVenueQuote(key, sym) {
+  try {
+    if (key === 'gate') {
+      const t = await srcFetch('kline', '24小时行情', s => callSym(x => s.ticker24h(x), sym));
+      const px = +t.lastPrice;
+      return px > 0 ? { px, open24h: +t.openPrice } : null;
+    }
+    if (key === 'okx') {
+      const j = await jFetch('https://www.okx.com/api/v5/market/ticker?instId=' + sym);
+      const d = j && j.data && j.data[0];
+      const px = d && +d.last;
+      return px > 0 ? { px, open24h: +d.open24h } : null;
+    }
+    if (key === 'coinbase') {
+      const j = await jFetch('https://api.exchange.coinbase.com/products/' + sym + '/ticker');
+      const px = j && +j.price;
+      return px > 0 ? { px, open24h: null } : null;   // Coinbase ticker 不含 24h 开盘价
+    }
+    if (key === 'bitstamp') {
+      const j = await jFetch('https://www.bitstamp.net/api/v2/ticker/' + sym + '/');
+      if (Array.isArray(j)) return null;              // 无此交易对时的回退格式
+      const px = j && +j.last;
+      return px > 0 ? { px, open24h: j.open_24 != null ? +j.open_24 : null } : null;
+    }
+  } catch (e) { /* 单个平台失败 → 视为无报价 */ }
+  return null;
+}
+/* 取某品种全平台报价 → { gate:{px,open24h}, okx:{...}, ... }（失败平台不出现在结果里） */
+async function fetchVenueQuotes(inst) {
+  if (!inst.venues) return null;
+  const keys = Object.keys(inst.venues);
+  const arr = await Promise.all(keys.map(async k => {
+    try { return [k, await fetchVenueQuote(k, inst.venues[k])]; } catch (e) { return [k, null]; }
+  }));
+  const out = {}; let n = 0;
+  arr.forEach(([k, q]) => { if (q && q.px > 0) { out[k] = q; n++; } });
+  return n ? out : null;
+}
+/* 多平台比价缓存：比价格行情更新慢一些（默认 20 秒），避免高频打第三方接口 */
+const VENUE_TTL = 20000;
+async function ensureVenueQuotes(inst, force) {
+  const ts = state.venueTs[inst.id] || 0;
+  if (!force && state.venueQuotes[inst.id] && Date.now() - ts < VENUE_TTL) return state.venueQuotes[inst.id];
+  const q = await fetchVenueQuotes(inst);
+  if (q) { state.venueQuotes[inst.id] = q; state.venueTs[inst.id] = Date.now(); }
+  return q || state.venueQuotes[inst.id] || null;
+}
+
+/* ---------- 美债收益率（多源降级 + 缓存兜底） ----------
+   注意：财政部 fiscaldata JSON API 的日收益率曲线数据集已下架（全部路径 404），
+   因此主源改为官网 CSV 直连 —— 实测返回 CORS: *，可浏览器直连，且是官方一手数据。 */
+const UST_CACHE = { data: null, ts: 0, src: '' };
+const UST_CSV = y => `https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/${y}/all?type=daily_treasury_yield_curve&field_tdr_date_value=${y}&page&_format=csv`;
+const UST_MIN_BARS = 200;                 // 至少要这么多交易日才够算指标
+async function fetchTreasuryYields() {
+  if (UST_CACHE.data && Date.now() - UST_CACHE.ts < 30 * 60 * 1000) return UST_CACHE.data;
+  const y = new Date().getFullYear();
+
+  // 源1：财政部官网 CSV 直连（当年 + 上年拼接，保证历史长度足够）
+  try {
+    const texts = [];
+    for (const yy of [y, y - 1]) {
+      texts.push(await netText(UST_CSV(yy), { timeout: 9000 }));
+      const probe = mergeTreasuryCSV(texts);
+      if (probe && probe.ust10Y.series.length >= UST_MIN_BARS) break;
+    }
+    const out = mergeTreasuryCSV(texts);
+    if (out && out.ust10Y.series.length) { commitUst(out, '美国财政部官网'); return out; }
+  } catch (e) { /* 降级 */ }
+
+  // 源2：fiscaldata JSON API（数据集若恢复则自动优先于缓存）
+  try {
+    const url = 'https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/daily_treasury_par_yield_curve_rates?sort=-record_date&page[size]=400';
+    const j = await netJson(url, { timeout: 9000 });
+    const recs = (j && j.data) || [];
+    if (recs.length) {
+      const out = parseFiscal(recs);
+      if (out) { commitUst(out, '美国财政部 API'); return out; }
+    }
+  } catch (e) { /* 降级 */ }
+
+  // 源3：本地快照缓存（保证断网也不空白，界面会标注为离线数据）
+  const snap = snapLoad('ust:all');
+  if (snap && snap.data && snap.data.ust10Y && snap.data.ust10Y.series.length) {
+    UST_CACHE.data = snap.data; UST_CACHE.ts = snap.ts; UST_CACHE.src = '本地缓存';
+    dataSrc.ust = '本地缓存'; dataSrc.degraded = true; dataSrc.staleTs = snap.ts;
+    return snap.data;
+  }
+  throw new NetError('美债数据源暂不可用（财政部接口维护中，且无本地缓存）', 'all');
+}
+function commitUst(out, src) {
+  UST_CACHE.data = out; UST_CACHE.ts = Date.now(); UST_CACHE.src = src;
+  dataSrc.ust = src; dataSrc.degraded = false; dataSrc.staleTs = 0;
+  snapSave('ust:all', out);
+}
+/* 多份年度 CSV 合并：去重 + 按日期升序 */
+function mergeTreasuryCSV(texts) {
+  const all = { ust2Y: { dates: [], series: [] }, ust5Y: { dates: [], series: [] }, ust10Y: { dates: [], series: [] } };
+  const seen = {};
+  texts.forEach(t => {
+    const p = parseTreasuryCSV(t);
+    if (!p) return;
+    ['ust2Y', 'ust5Y', 'ust10Y'].forEach(k => {
+      for (let i = 0; i < p[k].dates.length; i++) {
+        const d = p[k].dates[i];
+        if (seen[k + d]) continue;
+        seen[k + d] = 1;
+        all[k].dates.push(d); all[k].series.push(p[k].series[i]);
+      }
+    });
+  });
+  ['ust2Y', 'ust5Y', 'ust10Y'].forEach(k => {
+    const z = all[k].dates.map((d, i) => [d, all[k].series[i]]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    all[k].dates = z.map(x => x[0]); all[k].series = z.map(x => x[1]);
+  });
+  return all.ust10Y.series.length ? all : null;
+}
+function parseFiscal(recs) {
+  // 数据集有两种可能结构：长表（security_desc+rate）或宽表（record_date + "2 Yr" 列）
+  const out = { ust2Y: { dates: [], series: [] }, ust5Y: { dates: [], series: [] }, ust10Y: { dates: [], series: [] } };
+  if (recs[0] && recs[0].security_desc !== undefined) {
+    const map = { '2 Yr': 'ust2Y', '5 Yr': 'ust5Y', '10 Yr': 'ust10Y' };
+    recs.forEach(r => {
+      const key = map[r.security_desc];
+      const rate = r.rate !== undefined ? +r.rate : (r.avg_interest_rate_amt !== undefined ? +r.avg_interest_rate_amt : NaN);
+      if (key && !isNaN(rate)) { out[key].dates.unshift(r.record_date); out[key].series.unshift(rate); }
+    });
+  } else if (recs[0] && recs[0]['10 Yr'] !== undefined) {
+    recs.forEach(r => {
+      const d = r.record_date;
+      [['2 Yr', 'ust2Y'], ['5 Yr', 'ust5Y'], ['10 Yr', 'ust10Y']].forEach(([col, key]) => {
+        const v = +r[col];
+        if (!isNaN(v)) { out[key].dates.unshift(d); out[key].series.unshift(v); }
+      });
+    });
+  } else return null;
+  return out.ust10Y.series.length ? out : null;
+}
+/* 日期归一化：财政部 CSV 用 MM/DD/YYYY，fiscaldata 用 YYYY-MM-DD，统一成 ISO */
+function normDate(s) {
+  if (!s) return '';
+  const t = String(s).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+  const m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+  return t;
+}
+function parseTreasuryCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return null;
+  const header = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+  const idx = { date: header.indexOf('Date'), y2: header.indexOf('2 Yr'), y5: header.indexOf('5 Yr'), y10: header.indexOf('10 Yr') };
+  if (idx.y10 < 0) return null;
+  const out = { ust2Y: { dates: [], series: [] }, ust5Y: { dates: [], series: [] }, ust10Y: { dates: [], series: [] } };
+  for (let i = 1; i < lines.length; i++) {
+    const c = lines[i].split(',').map(s => s.trim().replace(/"/g, ''));
+    const d = normDate(c[idx.date]); if (!d) continue;
+    const push = (ci, key) => { if (ci >= 0 && c[ci] && !isNaN(+c[ci])) { out[key].dates.unshift(d); out[key].series.unshift(+c[ci]); } };
+    push(idx.y2, 'ust2Y'); push(idx.y5, 'ust5Y'); push(idx.y10, 'ust10Y');
+  }
+  return out.ust10Y.series.length ? out : null;
+}
+// 美债：日频 → 合成到四周期视图（相同信号，备注日频）
+async function fetchUstKlines(inst, tf) {
+  const all = await fetchTreasuryYields();
+  const d = all[inst.id.toLowerCase()];
+  return d.dates.map((dt, i) => {
+    const t = Math.floor(new Date(dt + 'T00:00:00Z').getTime() / 1000);
+    const v = d.series[i];
+    return { time: t, open: v, high: v, low: v, close: v, volume: 0 };
+  });
+}
+
+/* ---------- 状态 ---------- */
+const state = {
+  current: 'BTC',
+  tf: '15m',
+  candles: {},
+  prices: {},          // 实时价格
+  prevPrices: {},
+  dayChange: {},       // 24h 涨跌幅
+  signals: {},         // tf -> signal
+  heat: null,          // 涨跌热力矩阵数据
+  flow: {},            // 品种 -> { trades:[], ts, min } 当下真实逐笔成交（成交热力图口径）
+  venueQuotes: {},     // 品种 -> { gate:{px,open24h}, okx:{...}, ... } 多平台实时比价
+  venueTs: {},         // 品种 -> 比价缓存时间戳
+  tfCandles: null,     // { _inst, 15m:[], 30m:[], 1h:[], 4h:[] } 各周期真实K线
+  tpsl: null,          // 当前品种的多周期止盈止损方案
+  tpOv: loadTpOv(),    // "品种:周期" -> { stop?, tp1?, tp2? } 手动微调覆盖值（持久化）
+  cacheTs: {},         // 各品种各周期K线缓存时间戳
+  orderType: 'market', // market | limit
+  lever: LEVER_DEFAULT,  // 杠杆倍数（简化档位：1x / 10x / 20x / 50x）
+  ticks: {},           // 品种 -> 近 2 分钟真实成交价序列 [{p,t,s}]，用于限价单撮合
+  tickSeq: 0,          // 成交采样自增序号（委托以序号为触发起点）
+  wsAlive: false,      // 逐笔行情推送是否已连接
+  refreshLevel: loadRefreshLevel(),  // 右上角刷新档位（realtime/m5/m10/m30）
+  refreshTimers: [],   // 当前档位下的定时器句柄（切档时统一清理）
+  nextRefreshAt: 0,    // 下一次自动刷新的时间戳（用于倒计时显示）
+  chart: null,
+  candleSeries: null,
+  ema9Series: null,
+  ema21Series: null,
+  acct: loadAcct(),
+};
+const SYM_MAP = {};
+INSTRUMENTS.forEach(i => { if (i.sym) SYM_MAP[i.sym] = i.id; });
+function uid() { return 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+function freshAcct() { return { cash: 100000, positions: [], orders: [], history: [] }; }
+function loadAcct() {
+  try {
+    const s = JSON.parse(localStorage.getItem('simtrader_acct_v1'));
+    if (s && typeof s.cash === 'number') return normalizeAcct(s);
+  } catch (e) {}
+  return freshAcct();
+}
+/* 兼容旧版账户结构（补全 id / side / margin / orders） */
+function normalizeAcct(s) {
+  const a = {
+    cash: +s.cash || 0, positions: [],
+    orders: Array.isArray(s.orders) ? s.orders : [],
+    history: Array.isArray(s.history) ? s.history : [],
+  };
+  (s.positions || []).forEach(p => {
+    const qty = +p.qty || 0; if (qty <= 0) return;
+    const entry = +p.entry || 0;
+    a.positions.push({
+      id: p.id || uid(), inst: p.inst, side: p.side || 'long', qty, entry,
+      margin: p.margin != null ? +p.margin : qty * entry / (+p.lev || 1),
+      time: p.time || Date.now(),
+    });
+  });
+  return a;
+}
+function saveAcct() { localStorage.setItem('simtrader_acct_v1', JSON.stringify(state.acct)); }
+/* 刷新档位持久化（读档失败或非法值一律回落「实时」） */
+function loadRefreshLevel() {
+  try {
+    const v = localStorage.getItem(REFRESH_KEY);
+    if (v && REFRESH_LEVELS.some(l => l.id === v)) return v;
+  } catch (e) {}
+  return 'realtime';
+}
+function saveRefreshLevel() { try { localStorage.setItem(REFRESH_KEY, state.refreshLevel); } catch (e) {} }
+function instOf(id) { return INSTRUMENTS.find(x => x.id === id); }
+function lastPrice(id) { return state.prices[id] ?? null; }
+
+/* ---------- 真实成交价采样（限价单撮合依据）----------
+   记录每一笔观测到的真实成交价（WebSocket 逐笔推送优先，轮询兜底），
+   限价单只有在这条真实价格轨迹“走到”委托价时才撮合成交。
+   每条采样带自增序号 seq，委托以下单时刻的 seq 为起点，
+   因此下单之前出现过的价位不会触发成交（杜绝“挂单即成交”）。 */
+function observeTrade(id, price, t) {
+  if (!(price > 0)) return;
+  const now = t || Date.now();
+  let arr = state.ticks[id];
+  if (!arr) arr = state.ticks[id] = [];
+  arr.push({ p: price, t: now, s: ++state.tickSeq });
+  if (arr.length > 3000) arr.splice(0, arr.length - 3000);
+  while (arr.length && now - arr[0].t > 120000) arr.shift(); // 只保留近 2 分钟
+}
+/* 自序号 sinceSeq（含之后）以来该品种的真实成交区间，并合并最新价 */
+function tradedRangeSince(id, sinceSeq) {
+  const px = lastPrice(id);
+  let hi = px == null ? -Infinity : px, lo = px == null ? Infinity : px;
+  const arr = state.ticks[id] || [];
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const x = arr[i];
+    if ((x.s || 0) <= (sinceSeq || 0)) break;
+    if (x.p > hi) hi = x.p;
+    if (x.p < lo) lo = x.p;
+  }
+  return { hi, lo, n: arr.length };
+}
+
+/* ---------- 保证金 / 盈亏计算 ---------- */
+function posDir(p) { return p.side === 'long' ? 1 : -1; }
+function posNotional(p) { return p.qty * p.entry; }
+function posLev(p) { return p.margin > 0 ? posNotional(p) / p.margin : 1; }
+function posPnl(p, pr) { return pr == null ? null : (pr - p.entry) * p.qty * posDir(p); }
+function posRoi(p, pr) { const v = posPnl(p, pr); return v == null || !p.margin ? null : v / p.margin; }
+function liqPrice(p) { return p.entry - posDir(p) * (p.margin / p.qty) * (1 - MMR); }
+function orderLiq(entry, lev, isLong) { return entry - (isLong ? 1 : -1) * (entry / lev) * (1 - MMR); }
+function posMarginUsed() { return (state.acct.positions || []).reduce((s, p) => s + p.margin, 0); }
+function frozenMargin() { return (state.acct.orders || []).reduce((s, o) => s + (o.kind === 'open' ? o.margin : 0) + (o.frozenFee || 0), 0); }
+function acctEquity() {
+  let eq = state.acct.cash + frozenMargin();
+  state.acct.positions.forEach(p => { eq += p.margin + (posPnl(p, lastPrice(p.inst)) || 0); });
+  return eq;
+}
+function maxQtyFor(price, lev, feeRate, avail) { return avail / (price * (1 / lev + feeRate)); }
+function roundStep(v, step) { return Math.max(step, Math.round(Math.floor(v / step + 1e-9) * step * 1e8) / 1e8); }
+function pendCloseQty(posId) {
+  return (state.acct.orders || []).filter(o => o.kind === 'close' && o.posId === posId).reduce((s, o) => s + o.qty, 0);
+}
+
+/* ---------- 二次确认弹窗 ---------- */
+function confirmDialog(opt) {
+  return new Promise(resolve => {
+    const mask = $('#modalMask'), box = $('#modalBox'), warn = $('#mdWarn'), body = $('#mdBody');
+    $('#mdTitle').textContent = opt.title || '请确认操作';
+    $('#mdIcon').textContent = opt.icon || '?';
+    body.innerHTML = (opt.rows ? opt.rows.map(r =>
+      `<div class="md-row"><span class="k">${r.k}</span><span class="v ${r.cls || ''}">${r.v}</span></div>`).join('') : '')
+      + (opt.bodyHtml || '');
+    if (opt.warn) { warn.textContent = opt.warn; warn.classList.add('show'); } else warn.classList.remove('show');
+    const yes = $('#mdYes'), no = $('#mdNo');
+    yes.textContent = opt.yesText || '是 · 确认';
+    no.textContent = opt.noText || '否 · 取消';
+    const style = opt.btnStyle || 'accent';
+    const isDanger = opt.danger === true;   // 破坏性操作（撤单/重置）固定红色，与方向色解耦
+    yes.style.background = style === 'up' ? 'var(--up)' : style === 'down' ? 'var(--down)' : (isDanger ? 'var(--down)' : 'var(--accent)');
+    box.classList.toggle('danger', isDanger);
+    mask.classList.add('show');
+    if (opt.onRender) { try { opt.onRender(body); } catch (e) {} }
+
+    let done = false;
+    const finish = (v) => {
+      if (done) return; done = true;
+      mask.classList.remove('show');
+      yes.onclick = no.onclick = mask.onclick = null;
+      document.removeEventListener('keydown', onKey);
+      resolve(v);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); finish({ ok: false }); }
+      if (e.key === 'Enter' && document.activeElement && document.activeElement.tagName !== 'BUTTON') { e.preventDefault(); yes.click(); }
+    };
+    yes.onclick = () => {
+      if (opt.validate) { const err = opt.validate(body); if (err) { warn.textContent = err; warn.classList.add('show'); return; } }
+      finish({ ok: true, data: opt.collect ? opt.collect(body) : null });
+    };
+    no.onclick = () => finish({ ok: false });
+    mask.onclick = (e) => { if (e.target === mask) finish({ ok: false }); };
+    document.addEventListener('keydown', onKey);
+  });
+}
+async function confirmYes(opt) { const r = await confirmDialog(opt); return !!(r && r.ok); }
+
+/* ---------- 品种速览条 ---------- */
+/* 品种的平台来源标签：美债为单一官方来源，加密与黄金为 Gate.io 永续主源 + N 家比价平台 */
+function venueTagOf(inst) {
+  if (inst.source) return inst.source;
+  const n = inst.venues ? Object.keys(inst.venues).length : 0;
+  return n ? `Gate 永续 · ${n}平台` : '—';
+}
+function renderWatchlist() {
+  const box = $('#watchlist');
+  box.innerHTML = INSTRUMENTS.map(i => `
+    <div class="wl-item ${i.id === state.current ? 'active' : ''}" data-id="${i.id}">
+      <div class="nm">${i.name}</div>
+      <div class="pr" id="wl-pr-${i.id}">—</div>
+      <div class="cg" id="wl-cg-${i.id}"></div>
+      <div class="vn" id="wl-vn-${i.id}">${venueTagOf(i)}</div>
+    </div>`).join('');
+  box.querySelectorAll('.wl-item').forEach(el => el.addEventListener('click', () => selectInstrument(el.dataset.id)));
+}
+function updateWatchlist() {
+  INSTRUMENTS.forEach(i => {
+    const p = lastPrice(i.id);
+    const prEl = $(`#wl-pr-${i.id}`), cgEl = $(`#wl-cg-${i.id}`);
+    if (prEl && p != null) prEl.textContent = i.type === 'ust' ? fmt(p, 2) + '%' : fmt(p, i.dec);
+    if (cgEl) {
+      const chg = state.dayChange[i.id];
+      if (chg != null) { cgEl.textContent = fmtPct(chg); cgEl.style.color = upDownColor(chg); }
+    }
+    const vnEl = $(`#wl-vn-${i.id}`);
+    if (vnEl) {
+      const qs = state.venueQuotes[i.id];
+      if (i.source) vnEl.textContent = i.source;
+      else {
+        const n = qs ? Object.keys(qs).length : (i.venues ? Object.keys(i.venues).length : 0);
+        vnEl.textContent = n ? `Gate 永续 · ${n}平台` : '—';
+      }
+    }
+  });
+}
+
+/* ---------- 主图 ---------- */
+function initChart() {
+  const chart = LightweightCharts.createChart($('#chart'), {
+    layout: { background: { type: 'solid', color: '#ffffff' }, textColor: '#4b5563', fontSize: 15 },
+    grid: { vertLines: { color: '#f0f2f5' }, horzLines: { color: '#f0f2f5' } },
+    rightPriceScale: { borderColor: '#e3e8ef' },
+    timeScale: { borderColor: '#e3e8ef', timeVisible: true, secondsVisible: false },
+    crosshair: { mode: 0 },
+    watermark: { visible: false },     // 视觉去噪：隐藏图表库水印
+  });
+  state.chart = chart;
+  state.candleSeries = chart.addCandlestickSeries({
+    /* 涨绿跌红（与 --up/--down 保持一致） */
+    upColor: '#0a8f4e', downColor: '#d92c2c', borderUpColor: '#0a8f4e', borderDownColor: '#d92c2c',
+    wickUpColor: '#0a8f4e', wickDownColor: '#d92c2c',
+  });
+  state.ema9Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1, title: 'EMA9', priceLineVisible: false });
+  state.ema21Series = chart.addLineSeries({ color: '#2563eb', lineWidth: 1, title: 'EMA21', priceLineVisible: false });
+  new ResizeObserver(() => chart.applyOptions({ width: $('#chart').clientWidth, height: $('#chart').clientHeight })).observe($('#chart'));
+  /* 多空清算图（Gate 永续强平）：K线左侧强度条 + 清算价位横线，随缩放/平移重绘 */
+  if (window.LiqMap) {
+    window.LiqMap.init(chart, state.candleSeries, $('#chartBox'), $('#chart'));
+    try { chart.timeScale().subscribeVisibleTimeRangeChange(() => window.LiqMap.render()); } catch (e) {}
+  }
+}
+async function loadChart(force) {
+  const inst = instOf(state.current);
+  const note = $('#chartNote');
+  try {
+    note.textContent = '加载K线中…';
+    let candles;
+    if (inst.type === 'ust') {
+      candles = await ensureCandles(inst, state.tf, !!force);
+      note.textContent = `美债收益率为日频官方数据，四周期视图显示同一日线序列`;
+      if (candles.length > 260) candles = candles.slice(-260);
+    } else {
+      candles = force ? await fetchKlines(inst.sym, state.tf, 300) : await ensureCandles(inst, state.tf);
+      note.textContent = `数据源：${srcKindText()} · ${TF_NAME[state.tf]}K线 · 黄金取 XAUUSDT 黄金永续`;
+    }
+    state.candles[state.current + '_' + state.tf] = candles;
+    state.cacheTs[state.current + '_' + state.tf] = Date.now();   // 同步缓存时间戳，避免紧接着重复拉取
+    if (candles.length && candles[candles.length - 1].close) {
+      const p = candles[candles.length - 1].close;
+      if (state.prices[inst.id] == null) { state.prices[inst.id] = p; }
+    }
+    paintChart(candles);
+    await runSignals(candles, force);     // 等待信号/止盈止损算完，保证「刷新完成」时数据确实已更新
+    renderVolumeProfile(candles);
+    refreshVolumeProfile(true);
+    note.textContent += ' · 绿涨红跌';
+    /* 全源失败、正在显示本地快照时必须说清楚，避免把陈旧数据当成实时行情 */
+    if (dataSrc.degraded) {
+      note.textContent += ` · ⚠ 网络不可用，显示 ${staleText(dataSrc.staleTs)}的离线快照`;
+      note.classList.add('stale');
+    } else { note.classList.remove('stale'); }
+    renderDataSource();
+  } catch (e) {
+    note.textContent = 'K线加载失败：' + e.message;
+    note.classList.add('stale');
+  }
+}
+function paintChart(candles) {
+  const inst = instOf(state.current);
+  state.candleSeries.setData(candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
+  const closes = candles.map(c => c.close);
+  const e9 = ema(closes, 9), e21 = ema(closes, 21);
+  state.ema9Series.setData(candles.map((c, i) => ({ time: c.time, value: e9[i] })).filter(x => x.value));
+  state.ema21Series.setData(candles.map((c, i) => ({ time: c.time, value: e21[i] })).filter(x => x.value));
+  state.chart.timeScale().fitContent();
+  if (window.LiqMap) { window.LiqMap.setCandles(candles); window.LiqMap.render(); }   // 清算图随 K 线重绘
+}
+
+/* ---------- 信号 ---------- */
+/* force=true 时强制重新拉取四个周期的K线（用于右上角刷新/定时刷新），
+   否则沿用内存中的K线缓存（切品种、切周期时使用）。 */
+async function runSignals(existingCandles, force) {
+  const inst = instOf(state.current);
+  const box = $('#sigMatrix'), det = $('#sigDetail'), hint = $('#sigHint');
+  try {
+    let results = {};
+    const byTf = { _inst: state.current };
+    if (inst.type === 'ust') {
+      let candles = existingCandles && existingCandles.length ? existingCandles : null;
+      if (!candles) candles = await ensureCandles(inst, state.tf, !!force);
+      if (candles.length > 260) candles = candles.slice(-260);
+      const sig = computeSignal(candles);
+      TFS.forEach(tf => { results[tf] = sig; byTf[tf] = candles; });  // 美债为日频，四周期共用同一序列
+    } else {
+      await Promise.all(TFS.map(async tf => {
+        try {
+          let c = state.candles[state.current + '_' + tf];
+          if (!c || state.current !== state._sigInst || force) c = await ensureCandles(inst, tf, !!force);
+          results[tf] = computeSignal(c);
+          state.candles[state.current + '_' + tf] = c;
+          byTf[tf] = c;
+        } catch (e) { results[tf] = null; }
+      }));
+    }
+    state._sigInst = state.current;
+    state.signals = results;
+    state.tfCandles = byTf;
+    computeTpSl();       // 依据四周期真实K线推导止盈止损区间
+    renderSigCards();    // K线图下方四格交易提示（信号 + 入场区 + 止损止盈 + 一键填入）
+    renderIndPanel();    // 指标全景（KDJ / MACD / 布林 / OBV / RSI / ATR）
+    renderTpOvPanel();   // 止盈止损手动微调面板
+    const cur = results[state.tf];
+    det.innerHTML = cur ? cur.detail.map(d => `<div class="row"><span>${d[0]}</span><b>${d[1]}</b></div>`).join('')
+      : '<div class="empty">暂无足够数据计算指标</div>';
+    if (cur) {
+      hint.style.display = '';                 // 修复：此前一旦置为 none 就再也不会恢复显示
+      hint.className = 'sig-hint ' + cur.kind;
+      if (cur.kind === 'buy') hint.textContent = `📈 提示：${TF_NAME[state.tf]}级别信号偏多（${cur.label}），可关注手动买入机会`;
+      else if (cur.kind === 'sell') hint.textContent = `📉 提示：${TF_NAME[state.tf]}级别信号偏空（${cur.label}），注意持仓风险或考虑卖出`;
+      else hint.textContent = `⏸ 提示：${TF_NAME[state.tf]}级别信号中性（观望），建议等待方向明确`;
+    } else { hint.className = 'sig-hint'; hint.style.display = 'none'; }
+    renderTpSl();
+  } catch (e) {
+    det.innerHTML = `<div class="empty">信号计算失败：${e.message}</div>`;
+    renderTpSl(); renderIndPanel(); renderTpOvPanel();
+  }
+}
+
+/* ---------- K线图下方：四周期交易提示（四个独立格子，整齐排列） ----------
+   每格承载一个周期（15分钟 / 30分钟 / 1小时 / 4小时）的完整交易提示：
+   信号方向与评分 · 参考入场区 · 止损 · 止盈一 / 止盈二 · 盈亏比 · ATR · 一键填入
+   「用此方案」只把参数填进下单面板，不会自动下单，仍需手动点击并二次确认。 */
+function renderSigCards() {
+  const box = $('#sigMatrix');
+  if (!box) return;
+  const inst = instOf(state.current);
+  const dec = inst.dec;
+  const px = lastPrice(inst.id);
+  const t = state.tpsl;
+  const isUst = inst.type === 'ust';
+  const P = v => (v == null ? '—' : fmt(v, dec) + (isUst ? ' %' : ''));
+  const planOf = tf => (t && t.inst === state.current) ? t.plans.find(x => x.tf === tf) : null;
+  const dTxt = v => {
+    if (v == null || px == null || !px) return '';
+    const d = (v - px) / px * 100;
+    return `<small class="${d >= 0 ? 'txt-up' : 'txt-down'}">${d >= 0 ? '+' : ''}${d.toFixed(2)}%</small>`;
+  };
+
+  box.innerHTML = TFS.map(tf => {
+    const s = state.signals[tf];
+    const p = planOf(tf);
+    const active = tf === state.tf;
+    if (!s) {
+      return `<div class="sc-card${active ? ' active' : ''}">
+        <div class="sc-top"><span class="sc-tf">${TF_NAME[tf]}</span><span class="sc-score">—</span></div>
+        <div class="sc-sig wait">数据不足</div>
+        <div class="sc-rows"><div class="sc-r"><span>提示</span><b>等待K线加载…</b></div></div>
+      </div>`;
+    }
+    const kind = s.kind;                                   // buy | sell | wait
+    const isWait = p && p.dir === 'wait';
+    const cls = isWait ? 'wait' : (kind === 'buy' ? 'up' : kind === 'sell' ? 'down' : 'wait');
+    const score = (s.score >= 0 ? '+' : '') + s.score.toFixed(2);
+    const rows = [];
+    if (isWait) {
+      rows.push(`<div class="sc-r"><span>震荡区间</span><b>${P(p.swLow)} ~ ${P(p.swHigh)}</b></div>`);
+      rows.push(`<div class="sc-r"><span>操作建议</span><b>区间高抛低吸</b></div>`);
+    } else if (p) {
+      rows.push(`<div class="sc-r"><span>入场区</span><b>${P(p.entryLo)} ~ ${P(p.entryHi)}</b></div>`);
+      const mk = f => (p.ovF && p.ovF[f]) ? '<i class="ov-dot" title="手动微调值">✎</i>' : '';
+      rows.push(`<div class="sc-r"><span>止损${mk('stop')}</span><b class="txt-down">${P(p.stop)}</b>${dTxt(p.stop)}</div>`);
+      rows.push(`<div class="sc-r"><span>止盈一${mk('tp1')}</span><b class="txt-up">${P(p.tp1)}</b>${dTxt(p.tp1)}</div>`);
+      rows.push(`<div class="sc-r"><span>止盈二${mk('tp2')}</span><b class="txt-up">${P(p.tp2)}</b>${dTxt(p.tp2)}</div>`);
+    } else {
+      rows.push(`<div class="sc-r"><span>提示</span><b>止损止盈计算中…</b></div>`);
+    }
+    const meta = [];
+    if (p) meta.push(`ATR ${(p.atrPct * 100).toFixed(2)}%`);
+    if (p && p.dir !== 'wait') meta.push(`盈亏比 1:${p.rr1.toFixed(1)}`);
+    return `<div class="sc-card ${cls}${active ? ' active' : ''}">
+      <div class="sc-top">
+        <span class="sc-tf">${TF_NAME[tf]}</span>
+        <span class="sc-score ${cls}">${score}</span>
+      </div>
+      <div class="sc-sig ${cls}">${isWait ? '观望 · 震荡' : s.label}</div>
+      <div class="sc-rows">${rows.join('')}</div>
+      <div class="sc-foot">
+        <span class="sc-meta">${meta.join(' · ')}</span>
+        <button class="btn-xs" data-use="${tf}" title="按该周期方案填入限价委托价与数量（仍需二次确认）">用此方案</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  box.querySelectorAll('[data-use]').forEach(b => b.addEventListener('click', () => applyTpSlPlan(b.dataset.use)));
+}
+
+/* ---------- 实时价格轮询（兜底） ---------- */
+const MAIN_SYMS = INSTRUMENTS.filter(i => i.sym).map(i => i.sym);
+async function pollPrices() {
+  try {
+    const prices = await fetchPrices(MAIN_SYMS);
+    const symMap = SYM_MAP;
+    Object.entries(prices).forEach(([sym, p]) => {
+      const id = symMap[sym];
+      if (!id) return;
+      state.prevPrices[id] = state.prices[id];
+      state.prices[id] = p;
+      observeTrade(id, p);              // 轮询价格同样计入真实成交轨迹
+    });
+    // 24h 涨跌幅（走独立的多源降级，与主价格源解耦）
+    try {
+      const chg = await fetchDayChange(MAIN_SYMS);
+      Object.entries(chg).forEach(([sym, v]) => {
+        const id = symMap[sym];
+        if (id && !isNaN(v)) state.dayChange[id] = v;
+      });
+    } catch (e) { /* 24h 涨跌只是辅助展示，失败不影响主流程 */ }
+    setConnState(true);
+  } catch (e) {
+    setConnState(false);
+  }
+  // 美债最新值（低频）
+  fetchTreasuryYields().then(d => {
+    INSTRUMENTS.filter(i => i.type === 'ust').forEach(i => {
+      const s = d[i.id.toLowerCase()];
+      if (s && s.series.length) {
+        const v = s.series[s.series.length - 1];
+        state.prices[i.id] = v; observeTrade(i.id, v);
+      }
+    });
+  }).catch(() => {});
+  consumeTicks();
+  updatePricePanel(); updateWatchlist(); renderPositions(); renderEst();
+  renderTpSl();
+  updateSigFromPrice();
+  renderDataSource();      // 数据来自哪个源、是否降级为离线快照
+}
+function setConnState(ok) {
+  const el = $('#connStatus'); if (!el) return;
+  if (state.wsAlive) { el.className = 'conn ok'; el.innerHTML = '<span class="dot"></span>实时逐笔行情已连接'; return; }
+  el.className = 'conn ' + (ok ? 'ok' : 'bad');
+  el.innerHTML = ok ? '<span class="dot"></span>行情连接正常（轮询模式）' : '<span class="dot"></span>行情连接中断，重试中…';
+}
+
+/* ---------- 实时逐笔成交推送（WebSocket，限价单撮合的实时数据源） ----------
+   推送必须与当前主源同口径：K线、下单、强平都用永续价，实时成交就不能混进现货价，
+   否则限价单会被另一个市场的成交价误触发。所以推送地址跟着主源走。 */
+const WS_GATE_PERP = ['wss://fx-ws.gateio.ws/v4/ws/usdt'];
+let wsConn = null, wsPlan = null, wsHostIdx = 0, wsRetryN = 0, wsRetryTimer = null,
+    wsManuallyClosed = false, wsPingTimer = null;
+
+/* 只有一条路：Gate.io USDT 永续成交推送，与 K线/下单/强平同口径 */
+function wsPlanFor() {
+  return { type: 'gate', market: 'futures', host0: WS_GATE_PERP[0], hosts: WS_GATE_PERP };
+}
+function wsStreamUrl(plan) { return plan.hosts[wsHostIdx]; }
+function gateWsChannel() { return 'futures.trades'; }
+function gateContracts() {
+  return INSTRUMENTS.filter(i => i.sym && GATE_FUT_PAIR[i.sym]).map(i => GATE_FUT_PAIR[i.sym]);
+}
+/* 单笔成交落账：价格进状态、参与撮合与强平 */
+function applyTick(id, p) {
+  if (state.prices[id] !== p) state.prevPrices[id] = state.prices[id];
+  state.prices[id] = p;
+  observeTrade(id, p);
+  consumeTicks();                    // 每一笔真实成交都立刻参与限价单撮合
+  uiDirty = true;
+}
+function connectTradeStream() {
+  if (typeof WebSocket === 'undefined') return;   // 环境不支持则退回轮询
+  const plan = wsPlanFor();
+  wsPlan = plan;
+  let url;
+  try { url = wsStreamUrl(plan); } catch (e) { scheduleWsRetry(); return; }
+  try { wsConn = new WebSocket(url); } catch (e) { scheduleWsRetry(); return; }
+  wsConn.onopen = () => {
+    state.wsAlive = true; wsRetryN = 0; setConnState(true);
+    try {
+      wsConn.send(JSON.stringify({
+        time: Math.floor(Date.now() / 1000), channel: gateWsChannel(),
+        event: 'subscribe', payload: gateContracts(),
+      }));
+    } catch (e) {}
+    clearInterval(wsPingTimer);                   // Gate 需要客户端心跳保活
+    wsPingTimer = setInterval(() => {
+      if (wsConn && wsConn.readyState === 1) {
+        try { wsConn.send(JSON.stringify({ time: Math.floor(Date.now() / 1000), channel: 'futures.ping' })); } catch (e) {}
+      }
+    }, 25000);
+  };
+  wsConn.onmessage = (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    const res = d && (d.result || (d.data && d.data.result));
+    if (!Array.isArray(res)) return;
+    res.forEach(t => {
+      const key = t.contract || t.currency_pair;
+      if (!key) return;
+      const sym = Object.keys(GATE_FUT_PAIR).find(k => GATE_FUT_PAIR[k] === key);
+      const id = sym ? SYM_MAP[sym] : null;
+      const p = parseFloat(t.price);
+      if (!id || !(p > 0)) return;
+      applyTick(id, p);
+    });
+  };
+  wsConn.onerror = () => {};
+  wsConn.onclose = () => {
+    state.wsAlive = false;
+    clearInterval(wsPingTimer);
+    if (!wsManuallyClosed) scheduleWsRetry();
+  };
+}
+function scheduleWsRetry() {
+  if (wsRetryTimer) return;
+  wsRetryN++;
+  if (wsRetryN > 3 && wsPlan) wsHostIdx = (wsHostIdx + 1) % wsPlan.hosts.length;
+  const delay = Math.min(30000, 2000 * wsRetryN);
+  wsRetryTimer = setTimeout(() => { wsRetryTimer = null; connectTradeStream(); }, delay);
+}
+
+/* 撮合 + 强平（每一笔成交推送都触发），UI 刷新限流到 1 秒一次 */
+let uiDirty = false;
+function consumeTicks() {
+  const ordChanged = checkPendingOrders();
+  const liqChanged = checkLiquidation();
+  if (ordChanged || liqChanged) {
+    saveAcct(); renderPositions(); renderOrders(); updatePricePanel(); renderEst();
+  }
+}
+function startTickLoops() {
+  setInterval(() => {                  // 逐笔推送下的界面节流刷新
+    if (state.wsAlive && (state.acct.orders || []).length) renderOrders(); // 刷新“还差多少才触发”
+    if (!uiDirty) return; uiDirty = false;
+    updatePricePanel(); updateWatchlist(); renderPositions();
+    renderTpSl();                      // 止盈止损提示随实时价格刷新距离与状态
+  }, 1000);
+}
+function updatePricePanel() {
+  const inst = instOf(state.current);
+  const p = lastPrice(inst.id);
+  $('#instName').textContent = inst.name;
+  const srcTag = $('#instSrcTag');
+  if (srcTag) srcTag.textContent = venueTagOf(inst);
+  const vm = $('#venueMain');
+  if (vm) vm.textContent = inst.type === 'ust' ? '美国财政部' : 'Gate.io 永续';
+  $('#bigPrice').textContent = p == null ? '—' : (inst.type === 'ust' ? fmt(p, 3) + ' %' : fmt(p, inst.dec));
+  const chg = state.dayChange[inst.id];
+  const box = $('#chgBox');
+  if (chg != null) { box.innerHTML = `${fmtPct(chg / 100)}<div style="font-size:11px;color:var(--muted)">24小时涨跌</div>`; box.style.color = upDownColor(chg); }
+  else box.innerHTML = inst.type === 'ust' ? '<div style="font-size:11px;color:var(--muted)">日频数据</div>' : '—';
+  $('#updateTime').textContent = '更新于 ' + ts(Date.now());
+  renderVenueList();
+  // 资金面板
+  $('#cashVal').textContent = fmt(state.acct.cash, 2) + ' USDT';
+  $('#equityVal').textContent = fmt(acctEquity(), 2) + ' USDT';
+  $('#marginVal').textContent = fmt(posMarginUsed() + frozenMargin(), 2) + ' USDT';
+  $('#freeVal').textContent = fmt(state.acct.cash, 2) + ' USDT';
+}
+
+/* ---------- 多平台实时价格对比（区分来源平台与价差） ----------
+   幂等渲染：把「上次渲染的签名」记在容器自身的 dataset 上（而非模块级变量），
+   这样即使容器被外部清空/重建，也不会出现「签名相同但 DOM 是空的」而不重绘的问题。 */
+function renderVenueList() {
+  const box = $('#venueList');
+  if (!box) return;
+  const inst = instOf(state.current);
+  const sigOf = (box.dataset && box.dataset.vsig) || '';
+
+  if (inst.type === 'ust') {
+    if (sigOf === 'ust' && box.innerHTML) return;
+    if (box.dataset) box.dataset.vsig = 'ust';
+    box.innerHTML = `<div class="vn-empty">美债收益率为 <b>美国财政部</b> 单一官方来源（日频），无多平台报价</div>`;
+    return;
+  }
+  const qs = state.venueQuotes[inst.id];
+  const rows = qs ? VENUES.filter(v => qs[v.key]).map(v => ({
+    v, q: qs[v.key], diff: (qs[v.key].px - qs.gate.px) / qs.gate.px * 100,
+    chg: qs[v.key].open24h ? (qs[v.key].px - qs[v.key].open24h) / qs[v.key].open24h * 100 : null,
+  })) : [];
+  if (!rows.length) {
+    if (sigOf === 'loading' && box.innerHTML) return;
+    if (box.dataset) box.dataset.vsig = 'loading';
+    box.innerHTML = `<div class="vn-empty">多平台比价加载中…（Gate.io 永续 / OKX / Coinbase / Bitstamp）</div>`;
+    return;
+  }
+  const sig = state.current + '|' + rows.map(r => r.v.key + ':' + r.q.px).join(',');
+  if (sig === sigOf && box.innerHTML) return;      // 签名一致且 DOM 仍在 → 跳过重绘
+  if (box.dataset) box.dataset.vsig = sig;
+
+  const sorted = rows.slice().sort((a, b) => a.q.px - b.q.px);       // 价格由低到高
+  const lo = sorted[0], hi = sorted[sorted.length - 1];
+  const spread = (hi.q.px - lo.q.px) / lo.q.px * 100;
+  const dec = inst.dec;
+  const rowHtml = sorted.map(r => {
+    const isMain = r.v.primary;
+    const dtxt = isMain ? '—' : `${r.diff > 0 ? '+' : ''}${r.diff.toFixed(3)}%`;
+    const dcls = isMain ? 'vn-df' : (r.diff > 0 ? 'txt-up' : 'txt-down');
+    return `<div class="vn-row ${isMain ? 'primary' : ''}">
+      <span class="vn-nm">${r.v.name}${isMain ? '<small>主源</small>' : ''}</span>
+      <span class="vn-px">${fmt(r.q.px, dec)}</span>
+      <span class="vn-cg ${r.chg == null ? '' : (r.chg >= 0 ? 'txt-up' : 'txt-down')}">${r.chg == null ? '—' : fmtPct(r.chg / 100)}</span>
+      <span class="vn-df ${dcls}">${dtxt}</span>
+    </div>`;
+  }).join('');
+
+  box.innerHTML = `
+    <div class="vn-head"><span>平台</span><span>实时价</span><span>24h</span><span>vs主源</span></div>
+    ${rowHtml}
+    <div class="vn-bar">跨平台价差 <b>${spread.toFixed(3)}%</b> · 最低 <b>${lo.v.name}</b> ${fmt(lo.q.px, dec)} · 最高 <b>${hi.v.name}</b> ${fmt(hi.q.px, dec)}</div>
+    <div class="vn-note">仅 <b>Gate.io 永续主源</b>价格参与限价撮合与强平；其余平台仅作比价参考</div>`;
+}
+/* 刷新当前品种的多平台比价（仅取当前品种，避免一次打 16 个第三方接口） */
+async function refreshVenues(force) {
+  const inst = instOf(state.current);
+  if (!inst.venues) { renderVenueList(); return; }
+  try { await ensureVenueQuotes(inst, !!force); } catch (e) { /* 保留旧数据 */ }
+  renderVenueList();
+  updateWatchlist();
+}
+
+function updateSigFromPrice() { /* 实时价主要刷新图表最后蜡烛与持仓盈亏，信号按周期重算 */ }
+
+/* ---------- 下单：市价 / 限价 · 杠杆 · 二次确认 ---------- */
+function renderLeverBtns() {
+  const box = $('#leverBtns');
+  if (!LEVERS.includes(state.lever)) state.lever = LEVER_DEFAULT;   // 档位精简后兜底，避免无高亮
+  box.innerHTML = LEVERS.map(l => `<button data-lev="${l}" class="${l === state.lever ? 'active' : ''}">${l}x</button>`).join('');
+  box.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+    state.lever = +b.dataset.lev; renderLeverBtns(); renderEst();
+  }));
+}
+function setOrderType(t) {
+  state.orderType = t;
+  document.querySelectorAll('#orderType button').forEach(x => x.classList.toggle('active', x.dataset.ot === t));
+  $('#limitPriceRow').style.display = t === 'limit' ? 'flex' : 'none';
+  $('#limitTip').style.display = t === 'limit' ? 'block' : 'none';
+  if (t === 'limit') { const p = lastPrice(state.current); $('#orderPrice').value = p == null ? '' : +p.toFixed(instOf(state.current).dec); }
+  renderEst();
+}
+function renderEst() {
+  const box = $('#orderEst');
+  const inst = instOf(state.current);
+  const px = lastPrice(inst.id);
+  if (px == null) { box.innerHTML = '等待行情…'; return; }
+  const type = state.orderType, lev = state.lever;
+  const feeRate = type === 'limit' ? FEE_MAKER : FEE_TAKER;
+  const ordP = type === 'limit' ? (parseFloat($('#orderPrice').value) || px) : px;
+  const avail = state.acct.cash;
+  const maxQ = maxQtyFor(ordP, lev, feeRate, avail);
+  const qty = parseFloat($('#orderQty').value) || 0;
+  // 限价单：提示触发方向与距离（只挂单，不立即成交）
+  let limitTip = '';
+  if (type === 'limit') {
+    const diff = (ordP - px) / px * 100;
+    if (Math.abs(diff) < 1e-9) limitTip = ' <span class="txt-warn">委托价 = 现价，无法挂单：买入须低于现价、卖出须高于现价</span>';
+    else if (diff < 0) limitTip = ` · 买入方向可挂：需行情跌至 ${pxText(inst, ordP)}（还差 ${Math.abs(diff).toFixed(2)}%）才成交`;
+    else limitTip = ` · 卖出方向可挂：需行情涨至 ${pxText(inst, ordP)}（还差 ${Math.abs(diff).toFixed(2)}%）才成交`;
+  }
+  if (!qty || qty <= 0) {
+    box.innerHTML = `可用 <b>${fmt(avail, 2)}</b> USDT · ${lev}x 下最多约可开 <b>${fmt(roundStep(maxQ, inst.qtyStep), 4)}</b> ${inst.short}
+      <br>市价 0.10% / 限价 0.05% 手续费 · 强平价：多 <b>${fmt(orderLiq(ordP, lev, true), inst.dec)}</b> · 空 <b>${fmt(orderLiq(ordP, lev, false), inst.dec)}</b>${limitTip}`;
+    return;
+  }
+  const notional = qty * ordP, margin = notional / lev, fee = notional * feeRate;
+  const okTxt = margin + fee <= avail + 1e-9 ? '' : ' <span class="txt-down">（超出可用余额）</span>';
+  box.innerHTML = `名义价值 <b>${fmt(notional, 2)}</b> · 保证金 <b>${fmt(margin, 2)}</b> · 手续费 <b>${fmt(fee, 2)}</b> USDT${okTxt}
+    <br>预估强平价：多 <b>${fmt(orderLiq(ordP, lev, true), inst.dec)}</b> · 空 <b>${fmt(orderLiq(ordP, lev, false), inst.dec)}</b>${limitTip}`;
+}
+function pxText(inst, v) { return v == null ? '—' : fmt(v, inst.dec) + (inst.type === 'ust' ? ' %' : ''); }
+
+function openPosition(inst, side, qty, price, margin) {
+  const exist = state.acct.positions.find(p => p.inst === inst.id && p.side === side);
+  if (exist) {
+    exist.entry = (exist.entry * exist.qty + price * qty) / (exist.qty + qty);
+    exist.qty += qty; exist.margin += margin;
+    exist.time = Date.now();
+  } else {
+    state.acct.positions.push({ id: uid(), inst: inst.id, side, qty, entry: price, margin, time: Date.now() });
+  }
+}
+
+/* 平仓结算（支持部分平仓，按比例释放保证金） */
+function settleClose(pos, qty, price, feeRate, tag) {
+  const dir = posDir(pos);
+  const relMargin = pos.margin * (qty / pos.qty);
+  const pnl = (price - pos.entry) * qty * dir;
+  const fee = qty * price * feeRate;
+  state.acct.cash += relMargin + pnl - fee;
+  state.acct.history.unshift({
+    inst: pos.inst, side: dir > 0 ? '平多' : '平空', qty, price,
+    amount: qty * price, pnl: pnl - fee, fee, time: Date.now(), tag: tag || '',
+  });
+  pos.qty -= qty; pos.margin -= relMargin;
+  if (pos.qty <= 1e-9) {
+    state.acct.positions = state.acct.positions.filter(x => x !== pos);
+    state.acct.orders = state.acct.orders.filter(o => o.posId !== pos.id);
+  }
+  return { pnl: pnl - fee, relMargin };
+}
+
+async function doOrder(side) {
+  const inst = instOf(state.current);
+  const px = lastPrice(inst.id);
+  if (px == null) { toast('暂无实时价格，无法下单'); return; }
+
+  const type = state.orderType, lev = state.lever;
+  const isBuy = side === 'buy';
+  const qty = parseFloat($('#orderQty').value);
+  const ordPrice = type === 'limit' ? parseFloat($('#orderPrice').value) : px;
+
+  if (!qty || qty <= 0) { toast('请先输入下单数量（可用 25%/50%/75%/100% 快捷设置）'); return; }
+  if (type === 'limit' && (!ordPrice || ordPrice <= 0)) { toast('限价单请先输入委托价格'); return; }
+  if (type === 'limit' && Math.abs(ordPrice - px) / px > 0.5) { toast('委托价与现价偏离超过 50%，请检查价格'); return; }
+
+  const feeRate = type === 'limit' ? FEE_MAKER : FEE_TAKER;
+  const avail = state.acct.cash;
+
+  // ★ 限价单核心规则：一律挂单等待，绝不立即成交。
+  //   必须挂在行情尚未到达的一侧，之后由实时成交价真正走到该价位才撮合。
+  const willFill = type === 'market';
+  if (type === 'limit') {
+    const eps = px * 1e-6;
+    if (isBuy && ordPrice >= px - eps) {
+      toast(`限价买入价必须低于现价 ${pxText(inst, px)}：挂单后需等行情跌到该价位才成交；想立刻成交请用市价单`);
+      return;
+    }
+    if (!isBuy && ordPrice <= px + eps) {
+      toast(`限价卖出价必须高于现价 ${pxText(inst, px)}：挂单后需等行情涨到该价位才成交；想立刻成交请用市价单`);
+      return;
+    }
+  }
+  // 市价单按最新成交价成交；限价单按委托价成交（成交发生在行情触及委托价的那一刻）
+  const fillPx = willFill ? px : ordPrice;
+  const fillNotional = qty * fillPx;
+  const fillMargin = fillNotional / lev;
+  const fillFee = fillNotional * feeRate;
+  const need = fillMargin + fillFee;
+  const dirTxt = isBuy ? '开多（买入）' : '开空（卖出）';
+  const gapPct = Math.abs(ordPrice - px) / px * 100;
+
+  if (need > avail + 1e-9) {
+    toast(`可用余额不足：需 ${fmt(need, 2)} USDT，可用 ${fmt(avail, 2)} USDT · ${lev}x 下最多约可开 ${fmt(roundStep(maxQtyFor(fillPx, lev, feeRate, avail), inst.qtyStep), 4)} ${inst.short}`);
+    return;
+  }
+
+  const rows = [
+    { k: '交易品种', v: inst.name },
+    { k: '下单方向', v: dirTxt, cls: isBuy ? 'txt-up' : 'txt-down' },
+    { k: '订单类型', v: type === 'limit' ? '限价单 · Maker 0.05% · 挂单等待' : '市价单 · Taker 0.10% · 立即成交' },
+    { k: '委托价格', v: type === 'limit' ? pxText(inst, ordPrice) : '市价 ' + pxText(inst, px) },
+    ...(type === 'limit' ? [{
+      k: '成交触发条件',
+      v: (isBuy ? '实时成交价跌至 ≤ ' : '实时成交价涨至 ≥ ') + pxText(inst, ordPrice)
+        + `（现价 ${pxText(inst, px)}，需${isBuy ? '下跌' : '上涨'} ${fmt(gapPct, 2)}% 才会成交）`,
+      cls: 'txt-warn',
+    }] : []),
+    { k: '下单数量', v: qty + ' ' + inst.short },
+    { k: '杠杆倍数', v: lev + 'x' },
+    { k: '名义价值', v: fmt(fillNotional, 2) + ' USDT' },
+    { k: '占用保证金', v: fmt(fillMargin, 2) + ' USDT' },
+    { k: '预估手续费', v: fmt(fillFee, 2) + ' USDT' },
+    { k: '预估强平价', v: pxText(inst, orderLiq(fillPx, lev, isBuy)) },
+    { k: '下单后可用余额', v: fmt(avail - fillMargin - fillFee, 2) + ' USDT' },
+    ...tpSlRefRows(isBuy),
+    { k: '成交方式', v: type === 'market' ? '立即以最新成交价成交' : '仅挂单，不立即成交；实时行情触及委托价后才成交' },
+  ];
+
+  const ok = await confirmYes({
+    title: '二次确认 · ' + dirTxt,
+    icon: isBuy ? '↑' : '↓',
+    btnStyle: isBuy ? 'up' : 'down',
+    yesText: '是 · 确认' + (willFill ? '下单' : '挂单'),
+    noText: '否 · 取消',
+    rows,
+    warn: type === 'limit'
+      ? `模拟盘挂单，不涉及真实资金。委托将一直挂起到实时行情${isBuy ? '下跌' : '上涨'}到 ${pxText(inst, ordPrice)} 才成交；未成交前可随时撤单并全额退回保证金。${lev}x 杠杆风险极高。`
+      : `模拟盘操作，不涉及真实资金。${lev}x 杠杆下价格反向波动约 ${(100 / lev).toFixed(1)}% 即触发强制平仓，风险极高。`,
+  });
+  if (!ok) { toast('已取消下单，未产生任何委托'); return; }
+  if (need > state.acct.cash + 1e-9) { toast('可用余额已变化，下单已取消，请重新确认'); renderEst(); return; }
+
+  state.acct.cash -= need;
+  if (willFill) {
+    openPosition(inst, isBuy ? 'long' : 'short', qty, fillPx, fillMargin);
+    state.acct.history.unshift({
+      inst: inst.id, side: isBuy ? '开多' : '开空', qty, price: fillPx,
+      amount: fillNotional, pnl: null, fee: fillFee, time: Date.now(), tag: '市价',
+    });
+    toast(`✅ 市价${dirTxt}成交：${qty} ${inst.short} @ ${pxText(inst, fillPx)} · 保证金 ${fmt(fillMargin, 2)} USDT`);
+  } else {
+    state.acct.orders.push({
+      id: uid(), inst: inst.id, kind: 'open', side, price: ordPrice, qty, lev,
+      margin: fillMargin, fee: fillFee, frozenFee: fillFee, time: Date.now(),
+      placedPx: px, armedAt: Date.now(), armedSeq: state.tickSeq,
+    });
+    toast(`📌 挂单成功（未成交）：${dirTxt} ${qty} ${inst.short} @ ${pxText(inst, ordPrice)} · 现价需${isBuy ? '跌' : '涨'} ${fmt(gapPct, 2)}% 触及后才会成交`);
+  }
+  $('#orderQty').value = '';
+  saveAcct(); renderPositions(); renderOrders(); updatePricePanel(); renderEst();
+}
+
+/* ---------- 平仓：市价 / 限价 + 二次确认 ---------- */
+async function openCloseDialog(posId) {
+  const pos = state.acct.positions.find(p => p.id === posId);
+  if (!pos) { toast('持仓不存在或已平仓'); return; }
+  const inst = instOf(pos.inst);
+  const px = lastPrice(pos.inst);
+  if (px == null) { toast('暂无实时价格，无法平仓'); return; }
+
+  const dirTxt = pos.side === 'long' ? '多头' : '空头';
+  const pnl = posPnl(pos, px);
+  const availClose = Math.max(0, pos.qty - pendCloseQty(pos.id));
+  if (availClose <= 1e-9) { toast('该持仓已全部挂出限价平仓委托，请先撤销委托'); return; }
+  const pr = posRoi(pos, px);
+
+  const rows = [
+    { k: '持仓品种', v: inst.name + ' · ' + dirTxt, cls: pos.side === 'long' ? 'txt-up' : 'txt-down' },
+    { k: '持仓数量', v: pos.qty + ' ' + inst.short + (pendCloseQty(pos.id) > 0 ? `（已挂平仓委托 ${pendCloseQty(pos.id)}）` : '') },
+    { k: '开仓价 / 现价', v: pxText(inst, pos.entry) + ' → ' + pxText(inst, px) },
+    { k: '杠杆 / 保证金', v: posLev(pos).toFixed(0) + 'x / ' + fmt(pos.margin, 2) + ' USDT' },
+    { k: '强平价', v: pxText(inst, liqPrice(pos)) },
+    { k: '浮动盈亏', v: (pnl >= 0 ? '+' : '') + fmt(pnl, 2) + ' USDT（' + (pr >= 0 ? '+' : '') + (pr * 100).toFixed(2) + '%）', cls: upDownClass(pnl) },
+  ];
+
+  const bodyHtml = `
+    <div class="seg" id="closeType" style="margin-top:14px">
+      <button data-ct="market" class="active">市价平仓</button>
+      <button data-ct="limit">限价平仓</button>
+    </div>
+    <label class="of-row" id="closePriceRow" style="display:none">
+      <span>平仓价</span><input type="number" id="closePrice" class="md-input" step="any" value="${+px.toFixed(inst.dec)}">
+    </label>
+    <label class="of-row"><span>平仓数量</span><input type="number" id="closeQty" class="md-input" step="any" value="${availClose}"></label>
+    <div class="pct-row">
+      <button data-cp="0.25">25%</button><button data-cp="0.5">50%</button>
+      <button data-cp="0.75">75%</button><button data-cp="1">全部</button>
+    </div>
+    <div class="of-tip" id="closeTip">限价平仓：委托价达到后自动成交，未成交前可在「当前委托」撤销</div>`;
+
+  const r = await confirmDialog({
+    title: '平仓确认 · ' + inst.short + ' ' + dirTxt,
+    icon: '!',
+    btnStyle: pos.side === 'long' ? 'up' : 'down',
+    yesText: '是 · 确认平仓',
+    noText: '否 · 取消',
+    rows, bodyHtml,
+    warn: '平仓为不可逆操作，请确认品种、方向与数量无误。市价平仓立即以当前价格成交；限价平仓将转为挂单等待成交。',
+    onRender: (c) => {
+      c.querySelectorAll('#closeType button').forEach(b => b.addEventListener('click', () => {
+        c.querySelectorAll('#closeType button').forEach(x => x.classList.toggle('active', x === b));
+        const isLimit = b.dataset.ct === 'limit';
+        c.querySelector('#closePriceRow').style.display = isLimit ? 'flex' : 'none';
+        c.querySelector('#closeTip').textContent = isLimit
+          ? (pos.side === 'long' ? '限价平仓（多单）：委托价必须高于现价，挂单后行情真正涨到委托价才成交' : '限价平仓（空单）：委托价必须低于现价，挂单后行情真正跌到委托价才成交')
+          : '市价平仓：立即以当前最新价成交，手续费 0.10%';
+        $('#mdYes').textContent = isLimit ? '是 · 确认挂单' : '是 · 确认平仓';
+      }));
+      c.querySelectorAll('.pct-row button').forEach(b => b.addEventListener('click', () => {
+        c.querySelector('#closeQty').value = roundStep(availClose * parseFloat(b.dataset.cp), inst.qtyStep);
+      }));
+    },
+    validate: (c) => {
+      const t = c.querySelector('#closeType button.active').dataset.ct;
+      const q = parseFloat(c.querySelector('#closeQty').value);
+      if (!q || q <= 0) return '请输入有效的平仓数量';
+      if (q > availClose + 1e-9) return `平仓数量不能超过可平数量 ${availClose} ${inst.short}`;
+      if (t === 'limit') {
+        const p = parseFloat(c.querySelector('#closePrice').value);
+        if (!p || p <= 0) return '请输入限价平仓价格';
+        if (pos.side === 'long' && p <= px) return `多头限价平仓价必须高于现价 ${pxText(inst, px)}（限价单只挂单不立即成交，需等行情涨到该价）`;
+        if (pos.side === 'short' && p >= px) return `空头限价平仓价必须低于现价 ${pxText(inst, px)}（限价单只挂单不立即成交，需等行情跌到该价）`;
+      }
+      return null;
+    },
+    collect: (c) => ({
+      type: c.querySelector('#closeType button.active').dataset.ct,
+      qty: parseFloat(c.querySelector('#closeQty').value),
+      price: parseFloat(c.querySelector('#closePrice').value),
+    }),
+  });
+  if (!r.ok) { toast('已取消平仓操作'); return; }
+  if (!state.acct.positions.includes(pos)) { toast('该持仓已不存在（可能已触发强制平仓）'); renderPositions(); return; }
+
+  const { type, qty, price } = r.data;
+  if (type === 'market') {
+    const res = settleClose(pos, qty, px, FEE_TAKER, '市价平仓');
+    toast(`✅ 市价平仓完成：${qty} ${inst.short} @ ${pxText(inst, px)} · 盈亏 ${res.pnl >= 0 ? '+' : ''}${fmt(res.pnl, 2)} USDT`);
+  } else {
+    state.acct.orders.push({
+      id: uid(), inst: pos.inst, kind: 'close', posId: pos.id,
+      side: pos.side === 'long' ? 'sell' : 'buy',
+      price, qty, time: Date.now(), placedPx: px, armedAt: Date.now(), armedSeq: state.tickSeq,
+    });
+    toast(`📌 已挂限价平仓单（未成交）：${qty} ${inst.short} @ ${pxText(inst, price)} · 需行情${pos.side === 'long' ? '上涨' : '下跌'} ${fmt(Math.abs(price - px) / px * 100, 2)}% 触及后才成交`);
+  }
+  saveAcct(); renderPositions(); renderOrders(); updatePricePanel();
+}
+
+/* ---------- 委托撮合 / 强平风控 ---------- */
+function removeOrder(id) { state.acct.orders = state.acct.orders.filter(o => o.id !== id); }
+/* 限价单撮合：以下单之后的「真实成交价轨迹」为唯一依据
+   - 买入方向（限价开多 / 限价平空）：行情必须真正跌到委托价 → 期间最低成交价 ≤ 委托价
+   - 卖出方向（限价开空 / 限价平多）：行情必须真正涨到委托价 → 期间最高成交价 ≥ 委托价
+   下单瞬间的现价不算触发（委托价只能挂在尚未到达的一侧），因此不会出现“直接成交”。 */
+function orderHit(o) {
+  const { hi, lo } = tradedRangeSince(o.inst, o.armedSeq || 0);
+  if (lo === Infinity && hi === -Infinity) return false;
+  const tol = 1e-9;
+  return o.side === 'buy' ? lo <= o.price * (1 + tol) : hi >= o.price * (1 - tol);
+}
+function checkPendingOrders() {
+  if (!state.acct.orders || !state.acct.orders.length) return false;
+  let changed = false;
+  for (const o of [...state.acct.orders]) {
+    const inst = instOf(o.inst);
+    if (lastPrice(o.inst) == null) continue;
+    if (!orderHit(o)) continue;
+    if (o.kind === 'open') {
+      openPosition(inst, o.side === 'buy' ? 'long' : 'short', o.qty, o.price, o.margin);
+      state.acct.history.unshift({
+        inst: o.inst, side: o.side === 'buy' ? '开多' : '开空', qty: o.qty, price: o.price,
+        amount: o.qty * o.price, pnl: null, fee: o.fee, time: Date.now(), tag: '限价成交',
+      });
+      removeOrder(o.id); changed = true;
+      toast(`🔔 限价挂单成交（行情已触及委托价）：${o.side === 'buy' ? '开多' : '开空'} ${o.qty} ${inst.short} @ ${pxText(inst, o.price)}`);
+    } else {
+      const pos = state.acct.positions.find(p => p.id === o.posId);
+      if (!pos) { removeOrder(o.id); changed = true; toast('委托已失效：对应持仓已平，已自动撤单'); continue; }
+      const q = Math.min(o.qty, pos.qty);
+      const res = settleClose(pos, q, o.price, FEE_MAKER, '限价平仓');
+      removeOrder(o.id); changed = true;
+      toast(`🔔 限价平仓成交（行情已触及委托价）：${q} ${inst.short} @ ${pxText(inst, o.price)} · 盈亏 ${res.pnl >= 0 ? '+' : ''}${fmt(res.pnl, 2)} USDT`);
+    }
+  }
+  return changed;
+}
+function checkLiquidation() {
+  if (!state.acct.positions.length) return false;
+  let changed = false;
+  for (const pos of [...state.acct.positions]) {
+    const px = lastPrice(pos.inst);
+    if (px == null) continue;
+    const lp = liqPrice(pos);
+    const hit = pos.side === 'long' ? px <= lp : px >= lp;
+    if (!hit) continue;
+    const inst = instOf(pos.inst);
+    const pnl = (px - pos.entry) * pos.qty * posDir(pos);
+    const fee = pos.qty * px * FEE_TAKER;
+    const remain = Math.max(0, pos.margin + pnl - fee);
+    state.acct.cash += remain;
+    state.acct.history.unshift({
+      inst: pos.inst, side: pos.side === 'long' ? '强平多' : '强平空', qty: pos.qty, price: px,
+      amount: pos.qty * px, pnl: remain - pos.margin, fee, time: Date.now(), tag: '强制平仓',
+    });
+    state.acct.positions = state.acct.positions.filter(x => x !== pos);
+    state.acct.orders = state.acct.orders.filter(o => o.posId !== pos.id);
+    changed = true;
+    toast(`⚠️ ${inst.short} ${pos.side === 'long' ? '多' : '空'}单已触发强制平仓（强平价 ${pxText(inst, lp)}），剩余保证金 ${fmt(remain, 2)} USDT`);
+  }
+  return changed;
+}
+async function cancelOrder(id) {
+  const o = state.acct.orders.find(x => x.id === id);
+  if (!o) return;
+  const inst = instOf(o.inst);
+  const isOpen = o.kind === 'open';
+  const ok = await confirmYes({
+    title: '撤销委托确认',
+    icon: '×',
+    danger: true,
+    yesText: '是 · 确认撤单',
+    noText: '否 · 取消',
+    rows: [
+      { k: '交易品种', v: inst.name },
+      { k: '委托类型', v: isOpen ? (o.side === 'buy' ? '限价开多' : '限价开空') : (o.side === 'sell' ? '限价平多' : '限价平空') },
+      { k: '委托价 / 数量', v: pxText(inst, o.price) + ' / ' + o.qty + ' ' + inst.short },
+      { k: '委托时间', v: ts(o.time) },
+      ...(isOpen ? [{ k: '将退回保证金', v: fmt(o.margin + (o.frozenFee || 0), 2) + ' USDT' }] : []),
+    ],
+    warn: '撤单后该委托立即失效，不再参与撮合。',
+  });
+  if (!ok) { toast('已取消撤单操作'); return; }
+  if (isOpen) state.acct.cash += o.margin + (o.frozenFee || 0);
+  removeOrder(id);
+  saveAcct(); renderPositions(); renderOrders(); updatePricePanel(); renderEst();
+  toast(`已撤销委托：${inst.short} @ ${pxText(inst, o.price)}`);
+}
+
+/* ---------- 持仓 / 委托 / 成交渲染 ---------- */
+function renderPositions() {
+  const posBody = $('#posTable tbody'), histBody = $('#histTable tbody');
+  if (!state.acct.positions.length) {
+    posBody.innerHTML = '<tr><td colspan="12" class="empty">暂无持仓（可用余额 ' + fmt(state.acct.cash, 2) + ' USDT）</td></tr>';
+  } else {
+    posBody.innerHTML = state.acct.positions.map(p => {
+      const inst = instOf(p.inst), pr = lastPrice(p.inst);
+      const pnl = posPnl(p, pr), roi = posRoi(p, pr);
+      const lp = liqPrice(p);
+      const levTxt = posLev(p).toFixed(posLev(p) >= 1 ? 0 : 1) + 'x';
+      const nearLiq = pr != null && Math.abs(pr - lp) / pr < 0.02;
+      return `<tr>
+        <td>${inst.short}</td>
+        <td class="${p.side === 'long' ? 'txt-up' : 'txt-down'}">${p.side === 'long' ? '多' : '空'}</td>
+        <td>${p.qty}</td>
+        <td><span class="badge badge-lev">${levTxt}</span></td>
+        <td>${pxText(inst, p.entry)}</td>
+        <td>${pxText(inst, pr)}</td>
+        <td>${fmt(p.margin, 2)}</td>
+        <td class="${nearLiq ? 'txt-down' : ''}">${pxText(inst, lp)}</td>
+        <td class="${pnl != null ? upDownClass(pnl) : ''}">${pnl != null ? (pnl >= 0 ? '+' : '') + fmt(pnl, 2) : '—'}</td>
+        <td class="${roi != null ? upDownClass(roi) : ''}">${roi != null ? (roi >= 0 ? '+' : '') + (roi * 100).toFixed(2) + '%' : '—'}</td>
+        <td>${ts(p.time)}</td>
+        <td>
+          <button class="btn-sm" data-close="${p.id}">平仓</button>
+          <button class="btn-sm" data-reverse="${p.id}">反手</button>
+        </td></tr>`;
+    }).join('');
+  }
+  posBody.querySelectorAll('[data-close]').forEach(b =>
+    b.addEventListener('click', () => openCloseDialog(b.dataset.close)));
+  posBody.querySelectorAll('[data-reverse]').forEach(b => b.addEventListener('click', async () => {
+    const pos = state.acct.positions.find(x => x.id === b.dataset.reverse);
+    if (!pos) return;
+    const inst = instOf(pos.inst);
+    const px = lastPrice(pos.inst);
+    if (px == null) { toast('暂无实时价格'); return; }
+    const qty = pos.qty;
+    const ok = await confirmYes({
+      title: '反手确认 · ' + inst.short,
+      icon: '⇄',
+      btnStyle: 'accent',
+      yesText: '是 · 确认反手',
+      noText: '否 · 取消',
+      rows: [
+        { k: '当前持仓', v: pos.qty + ' ' + inst.short + ' ' + (pos.side === 'long' ? '多单' : '空单') },
+        { k: '反手后', v: qty + ' ' + inst.short + ' ' + (pos.side === 'long' ? '空单' : '多单') },
+        { k: '执行价格', v: '市价 ' + pxText(inst, px) },
+        { k: '杠杆倍数', v: posLev(pos).toFixed(0) + 'x' },
+      ],
+      warn: '反手 = 以市价平掉当前持仓，同时反向开立等量新仓（两步均按市价 0.10% 收取手续费）。',
+    });
+    if (!ok) { toast('已取消反手操作'); return; }
+    if (!state.acct.positions.includes(pos)) { toast('该持仓已不存在，反手取消'); renderPositions(); return; }
+    const revLev = Math.max(1, Math.round(posLev(pos)));
+    const res = settleClose(pos, qty, px, FEE_TAKER, '反手平仓');
+    const lev = revLev;
+    const feeRate = FEE_TAKER;
+    const notional = qty * px, margin = notional / lev, fee = notional * feeRate;
+    if (margin + fee > state.acct.cash + 1e-9) {
+      toast(`反手开仓余额不足：需 ${fmt(margin + fee, 2)} USDT，可用 ${fmt(state.acct.cash, 2)} USDT（已平仓）`);
+    } else {
+      state.acct.cash -= margin + fee;
+      const newSide = pos.side === 'long' ? 'short' : 'long';
+      openPosition(inst, newSide, qty, px, margin);
+      state.acct.history.unshift({ inst: inst.id, side: newSide === 'long' ? '开多' : '开空', qty, price: px, amount: notional, pnl: null, fee, time: Date.now(), tag: '反手' });
+      toast(`✅ 已反手：${inst.short} 转为 ${newSide === 'long' ? '多单' : '空单'} ${qty} @ ${pxText(inst, px)} · 平仓盈亏 ${res.pnl >= 0 ? '+' : ''}${fmt(res.pnl, 2)} USDT`);
+    }
+    saveAcct(); renderPositions(); renderOrders(); updatePricePanel();
+  }));
+
+  histBody.innerHTML = state.acct.history.length
+    ? state.acct.history.slice(0, 40).map(h => {
+        const inst = instOf(h.inst);
+        return `<tr><td>${inst.short}</td><td>${h.side}${h.tag ? ' <span class="badge badge-pend">' + h.tag + '</span>' : ''}</td><td>${h.qty}</td><td>${pxText(inst, h.price)}</td><td>${fmt(h.amount, 2)}</td>
+          <td class="${h.pnl != null ? upDownClass(h.pnl) : ''}">${h.pnl != null ? (h.pnl >= 0 ? '+' : '') + fmt(h.pnl, 2) : '—'}</td><td>${ts(h.time)}</td></tr>`;
+      }).join('')
+    : '<tr><td colspan="7" class="empty">暂无成交记录</td></tr>';
+}
+function renderOrders() {
+  const body = $('#orderTable tbody');
+  const orders = state.acct.orders || [];
+  if (!orders.length) { body.innerHTML = '<tr><td colspan="10" class="empty">暂无未成交委托（限价单只挂单不立即成交，未触及时会显示在这里）</td></tr>'; return; }
+  body.innerHTML = orders.map(o => {
+    const inst = instOf(o.inst);
+    const px = lastPrice(o.inst);
+    const typeTxt = o.kind === 'open' ? (o.side === 'buy' ? '限价开多' : '限价开空') : (o.side === 'sell' ? '限价平多' : '限价平空');
+    const sideTxt = o.side === 'buy' ? '买入' : '卖出';
+    // 触发条件：买入方向需行情跌到委托价，卖出方向需涨到委托价
+    const need = px == null ? null : (o.side === 'buy' ? (px - o.price) / px * 100 : (o.price - px) / px * 100);
+    const trig = need == null ? ''
+      : need <= 0 ? '<span class="txt-warn">行情已触及，撮合中…</span>'
+      : `需${o.side === 'buy' ? '再跌' : '再涨'} ${need.toFixed(2)}% 才成交`;
+    return `<tr>
+      <td>${inst.short}</td>
+      <td>${typeTxt}</td>
+      <td class="${o.side === 'buy' ? 'txt-up' : 'txt-down'}">${sideTxt}</td>
+      <td>${(o.side === 'buy' ? '≤ ' : '≥ ') + pxText(inst, o.price)}</td>
+      <td>${o.qty}</td>
+      <td>${o.kind === 'open' ? '<span class="badge badge-lev">' + o.lev + 'x</span>' : '—'}</td>
+      <td><span class="badge badge-pend">挂单未成交</span></td>
+      <td style="font-size:11px">${trig}</td>
+      <td>${ts(o.time)}</td>
+      <td><button class="btn-sm" data-cancel="${o.id}">撤单</button></td></tr>`;
+  }).join('');
+  body.querySelectorAll('[data-cancel]').forEach(b =>
+    b.addEventListener('click', () => cancelOrder(b.dataset.cancel)));
+}
+
+/* ---------- 回测 ---------- */
+async function runBacktest() {
+  const inst = instOf(state.current);
+  const box = $('#btResult');
+  box.innerHTML = '<div class="empty">加载近10年日线数据中（首次较慢，约几秒）…</div>';
+  try {
+    let candles = [];
+    if (inst.type === 'ust') {
+      const d = (await fetchTreasuryYields())[inst.id.toLowerCase()];
+      candles = d.dates.map((dt, i) => ({ time: Math.floor(new Date(dt + 'T00:00:00Z').getTime() / 1000), close: d.series[i] }));
+    } else {
+      let endTime = Date.now();
+      for (let page = 0; page < 5; page++) {
+        const part = await fetchKlines(inst.sym, '1d', 1000, endTime);
+        if (!part.length) break;
+        candles = part.concat(candles);
+        const firstOpen = part[0].time * 1000;
+        if (firstOpen < Date.now() - 365 * 10 * 86400 * 1000) break;
+        endTime = firstOpen - 1;
+      }
+    }
+    const closes = candles.map(c => c.close);
+    if (closes.length < 100) { box.innerHTML = '<div class="empty">历史数据不足，无法回测</div>'; return; }
+
+    // EMA20/60 趋势跟踪：金叉买入、死叉卖出（全仓模拟）
+    const e20 = ema(closes, 20), e60 = ema(closes, 60);
+    let cash = 100000, qty = 0, trades = [], wins = 0, entry = 0;
+    let peak = 100000, maxDD = 0;
+    const equity = [];
+    for (let i = 1; i < closes.length; i++) {
+      const crossUp = e20[i] > e60[i] && e20[i - 1] <= e60[i - 1];
+      const crossDn = e20[i] < e60[i] && e20[i - 1] >= e60[i - 1];
+      if (crossUp && qty === 0) { entry = closes[i]; qty = cash / (closes[i] * (1 + FEE)); cash = 0; trades.push({ t: candles[i].time, side: 'buy', p: entry }); }
+      else if (crossDn && qty > 0) {
+        const proceeds = qty * closes[i] * (1 - FEE);
+        const pnl = proceeds - entry * qty;
+        cash = proceeds; if (pnl > 0) wins++;
+        trades.push({ t: candles[i].time, side: 'sell', p: closes[i], pnl });
+        qty = 0;
+      }
+      const eq = qty > 0 ? qty * closes[i] : cash;
+      equity.push(eq);
+      peak = Math.max(peak, eq);
+      maxDD = Math.max(maxDD, (peak - eq) / peak);
+    }
+    const finalEq = qty > 0 ? qty * closes[closes.length - 1] : cash;
+    const bhRet = (closes[closes.length - 1] / closes[0] - 1) * 100;
+    const stratRet = (finalEq / 100000 - 1) * 100;
+    const years = (candles[candles.length - 1].time - candles[0].time) / (365.25 * 86400);
+    // 年化波动率
+    const rets = []; for (let i = 1; i < closes.length; i++) rets.push(closes[i] / closes[i - 1] - 1);
+    const mu = rets.reduce((a, b) => a + b, 0) / rets.length;
+    const vol = Math.sqrt(rets.reduce((a, b) => a + (b - mu) ** 2, 0) / rets.length) * Math.sqrt(252) * 100;
+
+    const closed = trades.filter(t => t.side === 'sell');
+    box.innerHTML = `
+      <div class="bt-grid">
+        <div class="bt-card"><div class="k">样本区间</div><div class="v" style="font-size:14px">${ts(candles[0].time * 1000).slice(0, 10)} ~ ${ts(candles[candles.length - 1].time * 1000).slice(0, 10)}</div></div>
+        <div class="bt-card"><div class="k">日线样本数</div><div class="v">${closes.length}</div></div>
+        <div class="bt-card"><div class="k">策略累计收益</div><div class="v ${stratRet >= 0 ? 'txt-up' : 'txt-down'}">${stratRet.toFixed(1)}%</div></div>
+        <div class="bt-card"><div class="k">买入持有收益</div><div class="v ${bhRet >= 0 ? 'txt-up' : 'txt-down'}">${bhRet.toFixed(1)}%</div></div>
+        <div class="bt-card"><div class="k">交易次数</div><div class="v">${closed.length}</div></div>
+        <div class="bt-card"><div class="k">胜率</div><div class="v">${closed.length ? (wins / closed.length * 100).toFixed(0) + '%' : '—'}</div></div>
+        <div class="bt-card"><div class="k">最大回撤</div><div class="v txt-down">${(maxDD * 100).toFixed(1)}%</div></div>
+        <div class="bt-card"><div class="k">年化波动率</div><div class="v" style="font-size:14px">${vol.toFixed(1)}%</div></div>
+      </div>
+      <div class="bt-note">策略规则：EMA20 上穿 EMA60 买入（全仓），下穿卖出；含 0.1% 单边手续费。最近一次信号：${trades.length && trades[trades.length - 1].side === 'buy' ? '持仓中（' + ts(trades[trades.length - 1].t * 1000).slice(0, 10) + ' 买入）' : (trades.length ? '空仓（' + ts(trades[trades.length - 1].t * 1000).slice(0, 10) + ' 卖出）' : '无')}。${inst.type === 'ust' ? '美债收益率为日频数据。' : ''}回测为历史模拟，不代表未来表现。</div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">回测失败：${e.message}</div>`;
+  }
+}
+
+/* ---------- 热力图：多品种多周期 ---------- */
+const BARS_24H = { '15m': 96, '30m': 48, '1h': 24, '4h': 6 };
+const TF_CACHE_TTL = 60000;
+
+async function ensureCandles(inst, tf, force) {
+  const key = inst.id + '_' + tf;
+  const tsMap = state.cacheTs;
+  const cached = state.candles[key];
+  if (!force && cached && tsMap[key] && Date.now() - tsMap[key] < TF_CACHE_TTL) return cached;
+  let c;
+  try {
+    if (inst.type === 'ust') { c = await fetchUstKlines(inst, tf); if (c.length > 300) c = c.slice(-300); }
+    else c = await fetchKlines(inst.sym, tf, 200);
+    if (!c || !c.length) throw new NetError('K线为空', 'empty');
+    state.candles[key] = c; tsMap[key] = Date.now();
+    snapSave('k:' + key, slimCandles(c));       // 成功即落盘，供断网时回显
+    dataSrc.degraded = false; dataSrc.staleTs = 0;
+    return c;
+  } catch (e) {
+    /* 全源失败 → 回显本地快照。宁可显示「X 分钟前的离线数据」，
+       也不要让用户面对一片空白却不知道发生了什么。 */
+    const snap = snapLoad('k:' + key);
+    if (snap && snap.data && snap.data.length) {
+      c = fatCandles(snap.data);
+      state.candles[key] = c; tsMap[key] = snap.ts;
+      dataSrc.degraded = true; dataSrc.staleTs = snap.ts;
+      return c;
+    }
+    throw e;
+  }
+}
+function chgPct(candles, bars) {
+  if (!candles || candles.length < bars + 1) return null;
+  const a = candles[candles.length - 1 - bars].close, b = candles[candles.length - 1].close;
+  if (!a) return null;
+  return (b / a - 1) * 100;
+}
+function heatStyle(v) {
+  if (v == null || isNaN(v)) return { bg: '#f8fafc', color: '#9ca3af', text: '—' };
+  const a = Math.min(Math.abs(v) / 3, 1), alpha = 0.14 + a * 0.86;
+  /* 涨绿跌红：v>0 用绿系，v<0 用红系 */
+  if (v > 0) return { bg: `rgba(10,143,78,${alpha.toFixed(2)})`, color: alpha > 0.55 ? '#fff' : '#075e37', text: '+' + v.toFixed(2) + '%' };
+  if (v < 0) return { bg: `rgba(217,44,44,${alpha.toFixed(2)})`, color: alpha > 0.55 ? '#fff' : '#8c1d1d', text: v.toFixed(2) + '%' };
+  return { bg: '#f1f3f6', color: '#6b7280', text: '0.00%' };
+}
+async function renderHeatmap(force) {
+  $('#heatNote').textContent = '热力图计算中…';
+  const out = {};
+  await Promise.all(INSTRUMENTS.map(async inst => {
+    const row = {};
+    try {
+      if (inst.type === 'ust') {
+        const c = await ensureCandles(inst, '1h', !!force);
+        const v = chgPct(c, 1);
+        TFS.forEach(tf => row[tf] = v); row.h24 = v; row.daily = true;
+      } else {
+        await Promise.all(TFS.map(async tf => {
+          try { const c = await ensureCandles(inst, tf, !!force); row[tf] = chgPct(c, BARS_24H[tf]); }
+          catch (e) { row[tf] = null; }
+        }));
+        row.h24 = state.dayChange[inst.id] != null ? state.dayChange[inst.id] : null;
+      }
+    } catch (e) { TFS.forEach(tf => row[tf] = null); }
+    out[inst.id] = row;
+  }));
+  state.heat = out;
+  paintHeatmap();
+}
+function paintHeatmap() {
+  const box = $('#heatMatrix'); if (!box || !state.heat) return;
+  let html = '<div class="hm-hcell"></div>' + TFS.map(tf => `<div class="hm-hcell">${TF_NAME[tf]}</div>`).join('') + '<div class="hm-hcell">24小时</div>';
+  INSTRUMENTS.forEach(inst => {
+    const row = state.heat[inst.id] || {};
+    html += `<div class="hm-name" data-id="${inst.id}"><b>${inst.short}</b><span class="tag">${inst.type === 'ust' ? '收益率' : inst.type === 'gold' ? '黄金' : '币'}</span></div>`;
+    [...TFS, 'h24'].forEach(col => {
+      const v = row[col], st = heatStyle(v);
+      html += `<div class="hm-cell ${v == null ? 'dim' : ''}" title="${inst.name} · ${col === 'h24' ? '24小时' : TF_NAME[col]}：${st.text}"
+        style="background:${st.bg};color:${st.color}">${st.text}</div>`;
+    });
+  });
+  box.innerHTML = html;
+  box.querySelectorAll('.hm-name').forEach(el => el.addEventListener('click', () => selectInstrument(el.dataset.id)));
+  $('#heatNote').textContent = `共 ${INSTRUMENTS.length} 个品种 × 5 个周期 · 颜色越深幅度越大（±3% 满色）· 美债为日频数据（四周期显示同一日涨跌）· 更新于 ${ts(Date.now())}`;
+}
+
+/* ---------- 成交量价分布热力图 + 交易区间 ---------- */
+function volumeProfile(candles, bins = 26) {
+  if (!candles || candles.length < 20) return null;
+  let hi = -Infinity, lo = Infinity;
+  candles.forEach(c => { hi = Math.max(hi, c.high); lo = Math.min(lo, c.low); });
+  if (!(hi > lo)) return null;
+  const step = (hi - lo) / bins;
+  const arr = new Array(bins).fill(0);
+  candles.forEach(c => {
+    const w = c.volume > 0 ? c.volume : 1;
+    let i0 = Math.floor((c.low - lo) / step), i1 = Math.floor((c.high - lo) / step);
+    i0 = Math.max(0, Math.min(bins - 1, i0)); i1 = Math.max(0, Math.min(bins - 1, i1));
+    const n = i1 - i0 + 1;
+    for (let i = i0; i <= i1; i++) arr[i] += w / n;
+  });
+  const total = arr.reduce((a, b) => a + b, 0) || 1;
+  const max = Math.max(...arr);
+  const poc = arr.indexOf(max);
+  let loI = poc, hiI = poc, acc = arr[poc];
+  while (acc < total * 0.7 && (loI > 0 || hiI < bins - 1)) {
+    const l = loI > 0 ? arr[loI - 1] : -1, r = hiI < bins - 1 ? arr[hiI + 1] : -1;
+    if (r >= l) { hiI++; acc += Math.max(r, 0); } else { loI--; acc += Math.max(l, 0); }
+  }
+  return { arr, total, max, poc, vaLo: loI, vaHi: hiI, step, lo, hi };
+}
+/* ---------- 「当下」成交热力图口径：真实逐笔成交 ---------- */
+function fmtVol(v) {
+  if (!isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+  if (a >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (a >= 1e4) return (v / 1e4).toFixed(2) + '万';
+  if (a >= 1) return v.toFixed(2);
+  return v.toPrecision(3);
+}
+/* 按真实逐笔成交（aggTrades）分价格档累计成交量：
+   只统计最近 N 分钟的成交，反映「当下」的成交密集价位，而非长周期历史。 */
+function volumeProfileFromTrades(trades, bins = 26) {
+  if (!trades || trades.length < 20) return null;
+  let hi = -Infinity, lo = Infinity, total = 0, amount = 0, buy = 0, sell = 0;
+  for (const t of trades) {
+    const p = +t.p, q = +t.q;
+    if (!(p > 0) || !(q >= 0)) continue;
+    if (p > hi) hi = p;
+    if (p < lo) lo = p;
+    total += q; amount += p * q;
+    if (t.m) sell += q; else buy += q;    // m=true → 主动卖出成交
+  }
+  if (!isFinite(hi) || !(hi > lo) || !(total > 0)) return null;
+
+  const step = (hi - lo) / bins;
+  const arr = new Array(bins).fill(0);
+  for (const t of trades) {
+    const p = +t.p, q = +t.q;
+    if (!(p > 0) || !(q >= 0)) continue;
+    const i = Math.max(0, Math.min(bins - 1, Math.floor((p - lo) / step)));
+    arr[i] += q;
+  }
+  const tot = arr.reduce((a, b) => a + b, 0) || 1;
+  const max = Math.max(...arr);
+  const poc = arr.indexOf(max);
+  let loI = poc, hiI = poc, acc = arr[poc];
+  while (acc < tot * 0.7 && (loI > 0 || hiI < bins - 1)) {
+    const l = loI > 0 ? arr[loI - 1] : -1, r = hiI < bins - 1 ? arr[hiI + 1] : -1;
+    if (r >= l) { hiI++; acc += Math.max(r, 0); } else { loI--; acc += Math.max(l, 0); }
+  }
+  return {
+    arr, total: tot, max, poc, vaLo: loI, vaHi: hiI, step, lo, hi,
+    count: trades.length, amount, buy, sell, realtime: true,
+  };
+}
+/* 实时逐笔成交缓存（默认 12 秒），避免每次刷新都打接口 */
+const FLOW_MIN = 15, FLOW_TTL = 12000;
+async function ensureFlow(inst, force) {
+  const c = state.flow[inst.id];
+  if (!force && c && Date.now() - c.ts < FLOW_TTL) return c;
+  const trades = await fetchAggTrades(inst.sym, FLOW_MIN);
+  const rec = { trades, ts: Date.now(), min: FLOW_MIN };
+  state.flow[inst.id] = rec;
+  return rec;
+}
+
+function atr(candles, p = 14) {
+  if (candles.length < p + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], pv = candles[i - 1];
+    trs.push(Math.max(c.high - c.low, Math.abs(c.high - pv.close), Math.abs(c.low - pv.close)));
+  }
+  const seg = trs.slice(-p);
+  return seg.reduce((a, b) => a + b, 0) / seg.length;
+}
+
+/* ============================================================
+   止盈止损区间引擎
+   输入：某周期的真实K线（真实成交数据），输出该周期的
+        止损价 / 止盈1 / 止盈2 / 盈亏比 / 参考入场区
+   依据（六类指标共同定价）：
+        ATR(14) 波动 + 近N根结构高低点 + 布林带（%B/带宽分位）
+        + KDJ 超买超卖 + OBV 量价背离 + MACD 动能增强/衰减 + 信号方向
+   ============================================================ */
+
+/* 指标驱动的止损/止盈调整系数：
+   atrKMul 放大/收紧止损距离 · tp1Mul / tp2Mul 调整止盈远近 · stopBuf 给结构止损加缓冲 */
+function indAdjust(sig, candles, dir) {
+  const ind = (sig && sig.ind) || {};
+  const reasons = [];
+  let atrKMul = 1, tp1Mul = 1, tp2Mul = 1, stopBuf = 0;
+
+  const ar = atrRank(candles);
+  if (ar != null) {
+    if (ar > 0.72) { atrKMul *= 1.15; reasons.push(`ATR 处于历史高位分位(${(ar * 100) | 0}%)，止损放宽 15%`); }
+    else if (ar < 0.28) { atrKMul *= 0.90; reasons.push(`ATR 处于历史低位分位(${(ar * 100) | 0}%)，止损收紧 10%`); }
+  }
+  if (ind.squeeze) { stopBuf = 0.25; reasons.push('布林带收口（波动压缩），止损附加 0.25×ATR 缓冲防扫损'); }
+  else if (ind.expand) { atrKMul *= 1.08; reasons.push('布林带开口扩张，止损随波动上浮 8%'); }
+
+  const J = ind.j;
+  if (J != null) {
+    if (J > 100) { tp1Mul *= 0.80; tp2Mul *= 0.88; reasons.push('KDJ 超买（J>100），止盈位提前锁定'); }
+    else if (J < 0) { tp1Mul *= 0.80; tp2Mul *= 0.88; reasons.push('KDJ 超卖（J<0），止盈位提前锁定'); }
+  }
+
+  const dvg = ind.dvg || 0;
+  if (dvg === -1) { tp1Mul *= 0.80; tp2Mul *= 0.75; atrKMul *= 0.92; reasons.push('OBV 顶背离（价涨量缩），止盈收紧 20%、止损上移'); }
+  else if (dvg === 1) { tp1Mul *= 0.80; tp2Mul *= 0.75; atrKMul *= 0.92; reasons.push('OBV 底背离（价跌量缩），止盈收紧 20%、止损下移'); }
+  else if (ind.obv != null && ind.obvMa != null && ind.obv > ind.obvMa) { tp2Mul *= 1.10; reasons.push('OBV 量能配合（量增价涨），止盈二可看更远'); }
+
+  const h = ind.hist;
+  if (h != null) {
+    const strong = (dir === 'long' && h > 0) || (dir === 'short' && h < 0);
+    if (strong) { tp2Mul *= 1.08; reasons.push('MACD 动能同向增强，止盈二适度看远'); }
+    else { tp2Mul *= 0.88; reasons.push('MACD 动能反向/衰减，止盈二下修'); }
+  }
+  return { atrKMul, tp1Mul, tp2Mul, stopBuf, reasons, atrRank: ar, ind };
+}
+
+/* 单周期方案 */
+function tpSlPlan(candles, tf, price) {
+  if (!candles || candles.length < 45) return null;
+  const cfg = TPSL_CFG[tf] || TPSL_CFG['1h'];
+  const closes = candles.map(c => c.close);
+  const i = closes.length - 1;
+  const px = (price != null && price > 0) ? price : closes[i];
+  const a = atr(candles, 14);
+  if (!a || !(a > 0) || !(px > 0)) return null;
+
+  const seg = candles.slice(-cfg.look);
+  const swLow = Math.min(...seg.map(c => c.low));      // 结构支撑（近N根最低）
+  const swHigh = Math.max(...seg.map(c => c.high));    // 结构压力（近N根最高）
+  const b = boll(closes);
+  const bUp = b.up[i], bLo = b.lo[i], bMid = b.mid[i];
+  const sig = computeSignal(candles);
+  const score = sig && !isNaN(sig.score) ? sig.score : 0;
+  const label = sig ? sig.label : '—';
+
+  // 方向：由六因子信号引擎判定（含主导因子与趋势门槛两道闸门）
+  const dir = (sig && sig.dir) ? sig.dir : 'wait';
+  const adj = indAdjust(sig, candles, dir);
+  const effK = cfg.atrK * adj.atrKMul;                 // 指标调整后的有效 ATR 止损倍数
+  const cap = cfg.maxAtrK * a;                         // 单笔最大风险（ATR 倍数上限）
+
+  /* ---- 做多方案 ---- */
+  const structStopL = swLow - (0.15 + adj.stopBuf) * a;
+  const riskSL = px - structStopL;
+  let stopL, riskL;
+  if (riskSL > 0.15 * a && riskSL <= cap) { stopL = structStopL; riskL = riskSL; }   // 结构止损（前低下方）
+  else { stopL = px - effK * a; riskL = effK * a; }                                  // 结构过远/过近 → 改用 ATR 止损
+  const tp1L = px + cfg.rr[0] * adj.tp1Mul * riskL;
+  // 止盈二：结构性目标（布林上轨 / 近期高点）需在至少 1.5R 之外才采用，否则退回 2R 度量目标
+  const candL = [bUp, swHigh].filter(v => v != null && v > px + 1.5 * riskL);
+  const tp2L = candL.length ? px + (Math.min(...candL) - px) * adj.tp2Mul : px + cfg.rr[1] * adj.tp2Mul * riskL;
+  const tp2SrcL = candL.length ? '结构' : '度量';
+  const tp3L = px + cfg.rr[2] * adj.tp2Mul * riskL;
+
+  /* ---- 做空方案 ---- */
+  const structStopS = swHigh + (0.15 + adj.stopBuf) * a;
+  const riskSS = structStopS - px;
+  let stopS, riskS;
+  if (riskSS > 0.15 * a && riskSS <= cap) { stopS = structStopS; riskS = riskSS; }
+  else { stopS = px + effK * a; riskS = effK * a; }
+  const tp1S = px - cfg.rr[0] * adj.tp1Mul * riskS;
+  const candS = [bLo, swLow].filter(v => v != null && v < px - 1.5 * riskS);
+  const tp2S = candS.length ? px - (px - Math.max(...candS)) * adj.tp2Mul : px - cfg.rr[1] * adj.tp2Mul * riskS;
+  const tp2SrcS = candS.length ? '结构' : '度量';
+  const tp3S = px - cfg.rr[2] * adj.tp2Mul * riskS;
+
+  const long = {
+    stop: stopL, risk: riskL, riskPct: riskL / px,
+    tp1: tp1L, tp2: tp2L, tp3: tp3L, tp2Src: tp2SrcL,
+    rr1: (tp1L - px) / riskL, rr2: (tp2L - px) / riskL,
+    entryLo: px - 0.60 * a, entryHi: px - 0.12 * a,     // 回踩买入区（低于现价 → 符合限价买规则）
+  };
+  const short = {
+    stop: stopS, risk: riskS, riskPct: riskS / px,
+    tp1: tp1S, tp2: tp2S, tp3: tp3S, tp2Src: tp2SrcS,
+    rr1: (px - tp1S) / riskS, rr2: (px - tp2S) / riskS,
+    entryLo: px + 0.12 * a, entryHi: px + 0.60 * a,     // 反弹卖出区（高于现价 → 符合限价卖规则）
+  };
+  // 自动基线快照：手动微调只在此基线上叠加，清除手填值后可完整还原
+  long.auto = { stop: stopL, tp1: tp1L, tp2: tp2L, risk: riskL, riskPct: riskL / px, rr1: long.rr1, rr2: long.rr2 };
+  short.auto = { stop: stopS, tp1: tp1S, tp2: tp2S, risk: riskS, riskPct: riskS / px, rr1: short.rr1, rr2: short.rr2 };
+
+  // 主方案：方向明确用对应侧；震荡则取打分偏好的一侧并标记（区间交易）
+  const primary = dir === 'short' ? 'short' : 'long';
+  const side = primary === 'short' ? short : long;
+
+  return {
+    tf, cfg, px, atr: a, atrPct: a / px, score, label, dir, primary,
+    swLow, swHigh, bUp, bLo, bMid,
+    long, short,
+    // 指标优化依据（界面展示「为什么这么定」）
+    adj: { atrKMul: adj.atrKMul, tp1Mul: adj.tp1Mul, tp2Mul: adj.tp2Mul, stopBuf: adj.stopBuf, reasons: adj.reasons },
+    ind: adj.ind, atrRank: adj.atrRank,
+    // 主方案关键位（便于列表与综合统计）
+    stop: side.stop, risk: side.risk, riskPct: side.riskPct,
+    tp1: side.tp1, tp2: side.tp2, tp3: side.tp3, tp2Src: side.tp2Src,
+    rr1: side.rr1, rr2: side.rr2,
+    entryLo: side.entryLo, entryHi: side.entryHi,
+  };
+}
+
+/* 多周期综合：共振方向 + 加权综合止损/止盈 + 置信度 + 建议数量 */
+function tpSlSummary(plans, px, inst) {
+  if (!plans || !plans.length) return null;
+  const wOf = p => (TPSL_CFG[p.tf] ? TPSL_CFG[p.tf].w : 1 / plans.length);
+  const totalW = plans.reduce((s, p) => s + wOf(p), 0) || 1;
+
+  let wLong = 0, wShort = 0;
+  plans.forEach(p => { const w = wOf(p); if (p.dir === 'long') wLong += w; else if (p.dir === 'short') wShort += w; });
+  const mainDir = wLong >= wShort ? 'long' : 'short';
+  const aligned = plans.filter(p => p.dir === mainDir);
+  const neutral = plans.filter(p => p.dir === 'wait');
+
+  // 方向一致性权重（明确同向的周期占比）
+  const agreeW = aligned.reduce((s, p) => s + wOf(p), 0) / totalW;
+  const dirW = aligned.reduce((s, p) => s + wOf(p) * Math.min(1, Math.abs(p.score) / 0.5), 0) / totalW;
+
+  // 综合价位：优先用同向周期，加权平均绝对价位（不随现价漂移）
+  const use = aligned.length ? aligned : plans;
+  const useW = use.reduce((s, p) => s + wOf(p), 0) || 1;
+  let stop = 0, tp1 = 0, tp2 = 0;
+  use.forEach(p => { const w = wOf(p) / useW; stop += w * p.stop; tp1 += w * p.tp1; tp2 += w * p.tp2; });
+
+  const riskDist = Math.abs(px - stop);
+  const riskPct = riskDist / px;
+  const rr1 = riskDist > 0 ? Math.abs(tp1 - px) / riskDist : 0;
+  const rr2 = riskDist > 0 ? Math.abs(tp2 - px) / riskDist : 0;
+
+  // 置信度：方向一致性 60% + 信号强度 40%，盈亏比达标加成
+  let conf = Math.round(Math.max(0, Math.min(1, agreeW * 0.6 + dirW * 0.6)) * 100);
+  if (rr2 >= 1.8) conf = Math.min(100, conf + 8);
+  if (neutral.length >= 2) conf = Math.max(0, conf - 12);
+
+  // 建议数量：单笔风险预算 ÷ 止损距离
+  const equity = acctEquity();
+  const budget = equity * TPSL_RISK_BUDGET;
+  const step = inst ? inst.qtyStep : 0.0001;
+  const sugQty = riskDist > 0 ? roundStep(budget / riskDist, step) : 0;
+  const maxQty = Math.max(0, maxQtyFor(px, state.lever, FEE_MARKET_RATE(), state.acct.cash));
+
+  return {
+    mainDir, alignedCount: aligned.length, total: plans.length, neutralCount: neutral.length,
+    agreeW, conf, stop, tp1, tp2, riskPct, rr1, rr2,
+    budget, sugQty, sugQtyCapped: Math.min(sugQty, roundStep(maxQty, step)),
+    atrPctAvg: use.reduce((s, p) => s + wOf(p) / useW * p.atrPct, 0),
+  };
+}
+function FEE_MARKET_RATE() { return state.orderType === 'limit' ? FEE_MAKER : FEE_TAKER; }
+
+/* ---------- 止盈止损手动微调 ----------
+   自动方案基于六类指标生成；允许对任一周期手工覆盖 止损 / 止盈一 / 止盈二，
+   覆盖后盈亏比、风险预算与建议数量全部按手填价联动重算，可一键恢复自动。 */
+const TPOV_KEY = 'simtrader_tpov_v1';
+function loadTpOv() {
+  try { const s = JSON.parse(localStorage.getItem(TPOV_KEY) || '{}'); return (s && typeof s === 'object') ? s : {}; }
+  catch (e) { return {}; }
+}
+function saveTpOv() { try { localStorage.setItem(TPOV_KEY, JSON.stringify(state.tpOv)); } catch (e) {} }
+function tpOvKey(tf) { return state.current + ':' + tf; }
+function tpOvOf(tf) { return state.tpOv[tpOvKey(tf)] || null; }
+function setTpOvField(tf, field, val) {
+  const k = tpOvKey(tf);
+  const cur = state.tpOv[k] || (state.tpOv[k] = {});
+  if (val == null || isNaN(val) || !(val > 0)) delete cur[field]; else cur[field] = +val;
+  if (!Object.keys(cur).length) delete state.tpOv[k];
+  saveTpOv(); applyTpSlOverride(); renderAllTpSl();
+}
+function clearTpOv(tf) {
+  const k = tpOvKey(tf);
+  if (!state.tpOv[k]) { state.tpOv = loadTpOv(); }
+  delete state.tpOv[k];
+  saveTpOv(); applyTpSlOverride(); renderAllTpSl();
+  toast(`已恢复 ${TF_NAME[tf]} 自动止盈止损方案`);
+}
+/* 把手动覆盖合并进 plans（只覆盖主方向一侧），并重算风险与盈亏比 */
+function applyTpSlOverride() {
+  const t = state.tpsl;
+  if (!t || !t.plans) return;
+  t.plans.forEach(p => {
+    p.manual = false; p.ovF = {};
+    const side = p.dir === 'short' ? p.short : p.long;
+    // 先从自动基线还原（否则手填过的值会残留在方案对象上，清除覆盖后回不去）
+    const auto = side.auto || { stop: side.stop, tp1: side.tp1, tp2: side.tp2 };
+    ['stop', 'tp1', 'tp2'].forEach(f => { side[f] = auto[f]; p[f] = auto[f]; });
+    const ov = state.tpOv[state.current + ':' + p.tf];
+    if (ov) {
+      ['stop', 'tp1', 'tp2'].forEach(f => {
+        if (ov[f] != null) { side[f] = ov[f]; p[f] = ov[f]; p.ovF[f] = true; p.manual = true; }
+      });
+    }
+    side.risk = Math.abs(p.px - side.stop);
+    side.riskPct = side.risk / p.px;
+    side.rr1 = side.risk > 0 ? Math.abs(side.tp1 - p.px) / side.risk : 0;
+    side.rr2 = side.risk > 0 ? Math.abs(side.tp2 - p.px) / side.risk : 0;
+    p.risk = side.risk; p.riskPct = side.riskPct; p.rr1 = side.rr1; p.rr2 = side.rr2;
+  });
+  const inst = instOf(state.current);
+  const px = lastPrice(inst.id) ?? (t.plans[0] && t.plans[0].px);
+  if (px) t.summary = tpSlSummary(t.plans, px, inst);
+}
+
+/* 计算并缓存当前品种的多周期止盈止损方案 */
+function computeTpSl() {
+  const tc = state.tfCandles;
+  if (!tc || tc._inst !== state.current) { state.tpsl = null; return; }
+  const inst = instOf(state.current);
+  const px = lastPrice(inst.id);
+  const plans = TFS.map(tf => tpSlPlan(tc[tf], tf, px)).filter(Boolean);
+  if (!plans.length) { state.tpsl = null; return; }
+  state.tpsl = {
+    inst: state.current, plans, ts: Date.now(),
+    summary: tpSlSummary(plans, px || plans[plans.length - 1].px, inst),
+  };
+  applyTpSlOverride();
+}
+
+/* 止盈止损相关界面的统一重绘（四格 + 综合区 + 指标面板 + 微调面板） */
+function renderAllTpSl() {
+  renderSigCards();
+  renderTpSl();
+  renderIndPanel();
+  renderTpOvPanel();
+}
+
+/* 渲染信号栏内的止盈止损提示列表 */
+function renderTpSl() {
+  const box = $('#tpslBlock');
+  if (!box) return;
+  const inst = instOf(state.current);
+  const t = state.tpsl;
+  if (!t || t.inst !== state.current) {
+    box.innerHTML = '<div class="tpsl-empty">止盈止损区间计算中…（需等待多周期K线加载完成）</div>';
+    return;
+  }
+  const px = lastPrice(inst.id) ?? t.plans[0].px;
+  const dec = inst.dec;
+  const P = v => fmt(v, dec);
+  const dist = v => ((v - px) / px * 100);
+  const dTxt = v => { const d = dist(v); return `<small class="${d >= 0 ? 'txt-up' : 'txt-down'}">${d >= 0 ? '+' : ''}${d.toFixed(2)}%</small>`; };
+  const s = t.summary;
+
+  /* ---- 综合结论提示条（各周期明细见 K 线下方的四个格子） ---- */
+  let head = '';
+  if (s && s.alignedCount >= 1) {
+    const isLong = s.mainDir === 'long';
+    const agreeTxt = `${s.alignedCount}/${s.total} 个周期同向`;
+    const lvl = s.alignedCount >= 3 ? '四周期共振' : s.alignedCount === 2 ? '多周期偏' : '单周期偏';
+    const dirTfs = t.plans.filter(p => p.dir === s.mainDir).map(p => TF_NAME[p.tf]).join(' / ');
+    head = `<div class="tpsl-hint ${isLong ? 'long' : 'short'}">
+      <div class="th-main">${isLong ? '📈' : '📉'} ${lvl}${isLong ? '多' : '空'} · ${agreeTxt} · 置信度 ${s.conf}%</div>
+      <div class="th-line">同向周期：<b>${dirTfs || '—'}</b>（四周期：${TFS.map(tf => TF_NAME[tf]).join(' / ')}）</div>
+      <div class="th-line">参考止损 <b>${P(s.stop)}</b>${dTxt(s.stop)} · 止盈一 <b>${P(s.tp1)}</b>${dTxt(s.tp1)} · 止盈二 <b>${P(s.tp2)}</b>${dTxt(s.tp2)} · 盈亏比 <b>1:${s.rr1.toFixed(1)} / 1:${s.rr2.toFixed(1)}</b></div>
+      <div class="th-line">止损距离 <b>${(s.riskPct * 100).toFixed(2)}%</b> · 单笔风险预算 ${(TPSL_RISK_BUDGET * 100).toFixed(0)}% 权益 = <b>${fmt(s.budget, 2)}</b> USDT → 建议数量 ≈ <b>${s.sugQtyCapped}</b> ${inst.short}（按当前 ${state.lever}x）</div>
+      ${s.neutralCount >= 2 ? `<div class="th-line th-warn">⚠ ${s.neutralCount} 个周期信号中性（震荡），方向一致性不足，建议降低仓位或等待突破确认</div>` : ''}
+    </div>`;
+  } else {
+    head = `<div class="tpsl-hint wait"><div class="th-main">⏸ 四周期均处于震荡区间，暂无明确方向</div>
+      <div class="th-line">建议按区间交易：靠近支撑挂限价买、靠近压力挂限价卖，跌破/突破后再顺势跟进</div></div>`;
+  }
+
+  /* ---- 当前品种持仓的止盈止损提示 ---- */
+  const myPos = state.acct.positions.filter(p => p.inst === state.current);
+  let posHtml = '';
+  if (myPos.length) {
+    const pf = tpSlPlanForTf();
+    posHtml = `<div class="tpsl-sub">当前品种持仓（按 ${TF_NAME[state.tf]} 方案给出的止盈止损参考）</div>
+      <table class="tpsl-tbl tpsl-tbl-sm">
+        <thead><tr><th>方向</th><th>开仓价</th><th>现价</th><th>参考止损</th><th>止盈一</th><th>止盈二</th><th>浮盈</th><th>建议</th></tr></thead>
+        <tbody>${myPos.map(p => {
+          const isLong = p.side === 'long';
+          const plan = isLong ? pf.long : pf.short;
+          const pnl = posPnl(p, px);
+          const dStop = (px - plan.stop) * (isLong ? 1 : -1);
+          const dTp1 = (plan.tp1 - px) * (isLong ? 1 : -1);
+          let advice = '持有观察', cls = 'adv-hold';
+          if (dStop <= 0) { advice = '已触及/跌破止损参考'; cls = 'adv-stop'; }
+          else if (dTp1 <= 0) { advice = '已达止盈一，可考虑减仓'; cls = 'adv-tp'; }
+          else if (plan.risk && Math.abs(px - plan.stop) < 0.4 * (isLong ? (plan.tp1 - plan.stop) : (plan.stop - plan.tp1))) { advice = '接近止损，注意减仓'; cls = 'adv-near'; }
+          return `<tr>
+            <td class="${isLong ? 'txt-up' : 'txt-down'}">${isLong ? '多' : '空'}</td>
+            <td>${P(p.entry)}</td><td>${P(px)}</td>
+            <td class="tpsl-stop">${P(plan.stop)}</td>
+            <td class="tpsl-tp">${P(plan.tp1)}</td>
+            <td class="tpsl-tp">${P(plan.tp2)}</td>
+            <td class="${pnl != null ? upDownClass(pnl) : ''}">${pnl != null ? (pnl >= 0 ? '+' : '') + fmt(pnl, 2) : '—'}</td>
+            <td class="${cls}">${advice}</td></tr>`;
+        }).join('')}</tbody>
+      </table>`;
+  }
+
+  const manTfs = t.plans.filter(p => p.manual).map(p => TF_NAME[p.tf]);
+  box.innerHTML = head + posHtml + `
+    ${manTfs.length ? `<div class="tpsl-manual">✎ 已手动微调：${manTfs.join(' / ')}（黄框为手填价，盈亏比与建议数量已按手填价重算）</div>` : ''}
+    <div class="tpsl-note">${inst.type === 'ust' ? '⚠ 美债为日频官方数据，四个周期共用同一日线序列，各周期差异仅来自风险倍数设定 · ' : ''}定价格局：<b>六因子信号</b>（趋势30% / MACD22% / KDJ15% / RSI13% / 布林10% / OBV10%）判方向 · <b>止损</b> = 近N根结构高低点 与 ATR(14) 波动取优，并按 ATR 分位、布林带宽（收口加缓冲）修正 · <b>止盈</b> = 结构压力/布林轨 与 风险回报倍数取优，并按 KDJ 极值、OBV 量价背离、MACD 动能再修正 · 综合结论按周期权重（15m 20% / 30m 24% / 1h 26% / 4h 30%）加权 · 更新于 ${ts(t.ts)}</div>`;
+
+  box.querySelectorAll('[data-use]').forEach(b => b.addEventListener('click', () => applyTpSlPlan(b.dataset.use)));
+  renderTpOvPanel();     // 同步微调面板的联动数值（不重建输入框，避免焦点丢失）
+}
+
+/* ---------- 指标全景面板 ----------
+   展示当前所选周期的六类指标原值与多空判定，便于人工复核止盈止损的生成依据。 */
+const IND_TONE = { up: 'up', down: 'down', wait: 'wait' };
+function indTag(txt, tone) {
+  return `<span class="ind-tag ${tone || 'wait'}">${txt}</span>`;
+}
+function renderIndPanel() {
+  const box = $('#indPanel');
+  if (!box) return;
+  const t = state.tpsl;
+  const sig = state.signals[state.tf];
+  if (!t || t.inst !== state.current || !sig || !sig.ind) {
+    box.innerHTML = '<div class="ind-empty">指标计算中…（需等待K线加载完成）</div>';
+    return;
+  }
+  const p = t.plans.find(x => x.tf === state.tf) || t.plans[0];
+  const inst = instOf(state.current), dec = inst.dec;
+  const ind = sig.ind;
+  const P = v => (v == null || isNaN(v)) ? '—' : fmt(v, inst.type === 'ust' ? 3 : dec);
+  const n2 = v => (v == null || isNaN(v)) ? '—' : v.toFixed(2);
+  const n0 = v => (v == null || isNaN(v)) ? '—' : v.toFixed(0);
+
+  /* KDJ */
+  const jTone = ind.j == null ? 'wait' : (ind.j > 100 || ind.j > 80 ? 'down' : ind.j < 0 || ind.j < 20 ? 'up' : 'wait');
+  const jTag = ind.j == null ? '—' : ind.j > 100 ? '超买区' : ind.j > 80 ? '偏超买' : ind.j < 0 ? '超卖区' : ind.j < 20 ? '偏超卖' : '中性区';
+  /* MACD */
+  const mTone = ind.hist == null ? 'wait' : (ind.hist > 0 ? 'up' : 'down');
+  const mTag = ind.macdCross ? (ind.macdCross > 0 ? '金叉' : '死叉') : (ind.hist > 0 ? '红柱 · 多头' : '绿柱 · 空头');
+  /* BOLL */
+  const bTone = ind.pb == null ? 'wait' : (ind.pb > 0.8 ? 'down' : ind.pb < 0.2 ? 'up' : 'wait');
+  const bTag = ind.squeeze ? '收口（变盘临近）' : ind.expand ? '开口扩张' : (ind.pb == null ? '—' : ind.pb > 0.8 ? '贴上轨' : ind.pb < 0.2 ? '贴下轨' : '通道中部');
+  /* OBV */
+  const oTone = ind.dvg === -1 ? 'down' : ind.dvg === 1 ? 'up' : (ind.obv != null && ind.obvMa != null ? (ind.obv > ind.obvMa ? 'up' : 'down') : 'wait');
+  const oTag = ind.dvg === -1 ? '⚠ 顶背离' : ind.dvg === 1 ? '⚠ 底背离' : (ind.obv != null && ind.obvMa != null ? (ind.obv > ind.obvMa ? '量能偏多' : '量能偏空') : '—');
+  /* RSI */
+  const rTone = ind.rsi == null ? 'wait' : (ind.rsi > 70 ? 'down' : ind.rsi < 30 ? 'up' : 'wait');
+  const rTag = ind.rsi == null ? '—' : ind.rsi > 70 ? '超买' : ind.rsi < 30 ? '超卖' : '中性';
+  /* ATR */
+  const aTone = p.atrRank == null ? 'wait' : (p.atrRank > 0.72 ? 'down' : p.atrRank < 0.28 ? 'wait' : 'wait');
+  const aTag = p.atrRank == null ? '—' : p.atrRank > 0.72 ? '高波动' : p.atrRank < 0.28 ? '低波动' : '常态波动';
+
+  const card = (title, main, rows, tag, tone) => `<div class="ind-card">
+    <div class="ind-k">${title}</div>
+    <div class="ind-v ${tone || ''}">${main}</div>
+    <div class="ind-rows">${rows}</div>
+    <div>${indTag(tag, tone)}</div>
+  </div>`;
+
+  box.innerHTML = `
+    <div class="ind-head">
+      <span class="ind-title">指标全景 · <b>${TF_NAME[state.tf]}</b></span>
+      <span class="ind-sub">KDJ · MACD · 布林 · OBV · RSI · ATR 共同决定止盈止损</span>
+    </div>
+    <div class="ind-grid">
+      ${card('KDJ(9,3,3)', `K ${n2(ind.k)} / D ${n2(ind.d)}`,
+        `<div class="ind-r"><span>J 值</span><b>${n0(ind.j)}</b></div><div class="ind-r"><span>形态</span><b>${ind.kdjTxt || '—'}</b></div>`, jTag, jTone)}
+      ${card('MACD(12,26,9)', `DIF ${P(ind.dif)}`,
+        `<div class="ind-r"><span>DEA</span><b>${P(ind.dea)}</b></div><div class="ind-r"><span>柱</span><b class="${ind.hist >= 0 ? 'txt-up' : 'txt-down'}">${P(ind.hist)}</b></div>`, mTag, mTone)}
+      ${card('布林带(20,2)', `%B ${ind.pb == null ? '—' : (ind.pb * 100).toFixed(0) + '%'}`,
+        `<div class="ind-r"><span>上/中轨</span><b>${P(ind.bUp)} / ${P(ind.bMid)}</b></div><div class="ind-r"><span>下轨</span><b>${P(ind.bLo)}</b></div>`, bTag, bTone)}
+      ${card('OBV 能量潮', ind.obv == null ? '—' : (ind.obv >= 0 ? '+' : '') + fmt(ind.obv, 0),
+        `<div class="ind-r"><span>20期均线</span><b>${ind.obvMa == null ? '—' : fmt(ind.obvMa, 0)}</b></div><div class="ind-r"><span>量价</span><b>${ind.dvg ? (ind.dvg > 0 ? '底背离' : '顶背离') : '同步'}</b></div>`, oTag, oTone)}
+      ${card('RSI(14)', n2(ind.rsi),
+        `<div class="ind-r"><span>超买线</span><b>70</b></div><div class="ind-r"><span>超卖线</span><b>30</b></div>`, rTag, rTone)}
+      ${card('ATR(14)', P(p.atr),
+        `<div class="ind-r"><span>占现价</span><b>${(p.atrPct * 100).toFixed(2)}%</b></div><div class="ind-r"><span>分位</span><b>${p.atrRank == null ? '—' : (p.atrRank * 100).toFixed(0) + '%'}</b></div>`, aTag, aTone)}
+    </div>
+    ${p.adj && p.adj.reasons && p.adj.reasons.length ? `<div class="ind-why"><b>${TF_NAME[state.tf]}方案优化依据：</b>${p.adj.reasons.map(r => '· ' + r).join(' ')}</div>` : '<div class="ind-why">当前周期内指标无极端信号，止盈止损按结构与 ATR 基准生成</div>'}`;
+}
+
+/* ---------- 止盈止损手动微调面板 ----------
+   面板为静态 DOM（避免每 5 秒重绘导致输入焦点丢失），这里只同步占位值/状态。 */
+function renderTpOvPanel() {
+  const wrap = $('#tpOvPanel');
+  if (!wrap) return;
+  const inst = instOf(state.current);
+  const tf = state.tf;
+  const t = state.tpsl;
+  const p = (t && t.inst === state.current) ? t.plans.find(x => x.tf === tf) : null;
+  const ov = tpOvOf(tf);
+  const tfEl = $('#tpovTf'); if (tfEl) tfEl.textContent = TF_NAME[tf];
+  const px = lastPrice(inst.id);
+
+  ['stop', 'tp1', 'tp2'].forEach(f => {
+    const el = $('#ov' + f.charAt(0).toUpperCase() + f.slice(1));
+    if (!el) return;
+    el.step = inst.dec >= 4 ? '0.0001' : (inst.dec >= 2 ? '0.01' : '1');
+    const base = p ? p[f] : null;
+    el.placeholder = base != null ? (+base.toFixed(inst.dec)) : '—';
+    el.disabled = !p;
+    if (document.activeElement !== el) el.value = (ov && ov[f] != null) ? +ov[f].toFixed(inst.dec) : '';
+    el.classList.toggle('edited', !!(ov && ov[f] != null));
+  });
+
+  const btn = $('#tpovReset');
+  if (btn) btn.disabled = !ov;
+
+  const note = $('#tpovNote');
+  if (note) {
+    if (!p) { note.innerHTML = '等待方案生成…'; return; }
+    const side = p.dir === 'short' ? p.short : p.long;
+    const risk = Math.abs(p.px - side.stop);
+    const rr1 = risk > 0 ? Math.abs(side.tp1 - p.px) / risk : 0;
+    const rr2 = risk > 0 ? Math.abs(side.tp2 - p.px) / risk : 0;
+    const budget = acctEquity() * TPSL_RISK_BUDGET;
+    const qty = risk > 0 ? roundStep(budget / risk, inst.qtyStep) : 0;
+    const warn = [];
+    if (p.dir === 'long' && side.stop >= p.px) warn.push('止损价高于基准价，方向可能设反');
+    if (p.dir === 'short' && side.stop <= p.px) warn.push('止损价低于基准价，方向可能设反');
+    if (p.dir === 'long' && side.tp1 <= p.px) warn.push('止盈一低于基准价，方向可能设反');
+    if (p.dir === 'short' && side.tp1 >= p.px) warn.push('止盈一高于基准价，方向可能设反');
+    note.innerHTML = `${ov ? '<b class="txt-warn">已启用手动值</b>（黄框为手填） · ' : ''}方向 <b>${p.dir === 'short' ? '空' : '多'}</b> · 基准价 <b>${fmt(p.px, inst.dec)}</b>${px ? ` · 现价 ${fmt(px, inst.dec)}` : ''} · 风险 <b>${fmt(risk, inst.dec)}</b>（${(risk / p.px * 100).toFixed(2)}%） · 盈亏比 <b>1:${rr1.toFixed(1)} / 1:${rr2.toFixed(1)}</b> · 建议数量 ≈ <b>${qty}</b> ${inst.short}`
+      + (warn.length ? `<br><span class="txt-warn">⚠ ${warn.join('；')}</span>` : '');
+  }
+}
+
+/* 绑定微调面板事件（一次性） */
+function bindTpOvEvents() {
+  ['stop', 'tp1', 'tp2'].forEach(f => {
+    const el = $('#ov' + f.charAt(0).toUpperCase() + f.slice(1));
+    if (!el) return;
+    const commit = () => {
+      const raw = el.value.trim();
+      if (raw === '') { setTpOvField(state.tf, f, null); return; }
+      const v = +raw;
+      if (!isFinite(v) || v <= 0) { toast('请输入大于 0 的价格'); el.value = ''; return; }
+      setTpOvField(state.tf, f, v);
+    };
+    el.addEventListener('change', commit);
+    el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
+  });
+  const rst = $('#tpovReset');
+  if (rst) rst.addEventListener('click', () => clearTpOv(state.tf));
+}
+
+/* 下单确认弹窗中的止盈止损参考（按当前所选周期的方案） */
+function tpSlRefRows(isLong) {
+  const t = state.tpsl;
+  if (!t || t.inst !== state.current) return [];
+  const p = tpSlPlanForTf();
+  if (!p || !p.long || !p.short) return [];
+  const inst = instOf(state.current);
+  const side = isLong ? p.long : p.short;
+  return [{
+    k: '参考止损 / 止盈',
+    v: `${pxText(inst, side.stop)} / ${pxText(inst, side.tp1)} / ${pxText(inst, side.tp2)}（止损 / 止盈一 / 止盈二 · ${TF_NAME[state.tf]}）`,
+    cls: 'txt-warn',
+  }];
+}
+
+/* 当前所选周期的方案（用于持仓提示） */
+function tpSlPlanForTf() {
+  const t = state.tpsl;
+  if (!t) return null;
+  const p = t.plans.find(x => x.tf === state.tf) || t.plans[t.plans.length - 1];
+  const inst = instOf(state.current);
+  const px = lastPrice(inst.id) ?? p.px;
+  if (p.dir !== 'wait') return p;
+  // 震荡周期：用区间边缘构造参考止损/止盈
+  const a = p.atr;
+  return {
+    long: { stop: p.swLow - 0.4 * a, tp1: (p.swLow + p.swHigh) / 2, tp2: p.swHigh, risk: 0.4 * a },
+    short: { stop: p.swHigh + 0.4 * a, tp1: (p.swLow + p.swHigh) / 2, tp2: p.swLow, risk: 0.4 * a },
+    px,
+  };
+}
+
+/* 一键把某周期的止盈止损方案填入下单面板（只填参数，仍需手动二次确认） */
+function applyTpSlPlan(tf) {
+  const t = state.tpsl;
+  if (!t) { toast('止盈止损方案尚未生成'); return; }
+  const p = t.plans.find(x => x.tf === tf);
+  if (!p) return;
+  const inst = instOf(state.current);
+  const px = lastPrice(inst.id);
+  if (px == null) { toast('暂无实时价格'); return; }
+  const isLong = p.dir === 'long' ? true : p.dir === 'short' ? false : p.score >= 0;
+  const side = isLong ? p.long : p.short;
+
+  // 限价单委托价：优先用方案入场区中值；若落在可立即成交一侧，则退让到现价下方/上方
+  let price = p.dir === 'wait'
+    ? (isLong ? p.swLow + 0.10 * p.atr : p.swHigh - 0.10 * p.atr)
+    : (side.entryLo + side.entryHi) / 2;
+  const eps = px * 1e-6;
+  if (isLong && price >= px - eps) price = px * (1 - 0.0015);
+  if (!isLong && price <= px + eps) price = px * (1 + 0.0015);
+
+  setOrderType('limit');
+  $('#orderPrice').value = +price.toFixed(inst.dec);
+
+  // 数量：按单笔风险预算 2% 权益 ÷ 止损距离 反推，并不超过当前杠杆下的最大可开量
+  const riskDist = Math.abs(price - side.stop);
+  const budget = acctEquity() * TPSL_RISK_BUDGET;
+  const qtyByRisk = riskDist > 0 ? roundStep(budget / riskDist, inst.qtyStep) : 0;
+  const maxQ = roundStep(maxQtyFor(price, state.lever, FEE_MAKER, state.acct.cash), inst.qtyStep);
+  const qty = Math.min(qtyByRisk, maxQ);
+  $('#orderQty').value = qty;
+  renderEst();
+  toast(`已填入 ${TF_NAME[tf]} 方案：${isLong ? '买入/开多' : '卖出/开空'} 限价 ${fmt(price, inst.dec)} · 数量 ${qty} ${inst.short} · 参考止损 ${fmt(side.stop, inst.dec)} · 止盈一 ${fmt(side.tp1, inst.dec)}（需点「${isLong ? '买入 / 开多' : '卖出 / 开空'}」并二次确认）`);
+}
+
+function renderVolumeProfile(candles, flow) {
+  const inst = instOf(state.current);
+  const vpBox = $('#vpChart'), rcBox = $('#rangeCards'), meta = $('#vpMeta');
+  /* 成交口径：优先「当下」真实逐笔成交（近 FLOW_MIN 分钟），
+     该品种无逐笔数据（如美债）时降级到当前周期K线口径 */
+  const flowRec = flow || state.flow[inst.id];
+  const rvp = (flowRec && flowRec.trades && flowRec.trades.length) ? volumeProfileFromTrades(flowRec.trades) : null;
+  const vp = rvp || volumeProfile(candles);
+  if (!vp) { vpBox.innerHTML = '<div class="empty">数据不足，无法绘制价量分布</div>'; rcBox.innerHTML = ''; meta.textContent = ''; return; }
+  const dec = inst.type === 'ust' ? 3 : inst.dec;
+  const priceOf = i => (vp.lo + (i + 0.5) * vp.step);
+  const nowP = lastPrice(inst.id) ?? candles[candles.length - 1].close;
+  const nowBin = Math.max(0, Math.min(vp.arr.length - 1, Math.floor((nowP - vp.lo) / vp.step)));
+
+  let html = '';
+  for (let i = vp.arr.length - 1; i >= 0; i--) {
+    const v = vp.arr[i], ratio = v / vp.max;
+    const alpha = (0.12 + ratio * 0.88).toFixed(2);
+    const isPoc = i === vp.poc, inVA = i >= vp.vaLo && i <= vp.vaHi;
+    html += `<div class="vp-row ${isPoc ? 'poc' : ''} ${inVA ? 'va' : ''}">
+      <div class="vp-price">${fmt(priceOf(i), dec)}${isPoc ? ' POC' : ''}</div>
+      <div class="vp-bar-wrap"><div class="vp-bar" style="width:${(ratio * 100).toFixed(1)}%;background:rgba(67,56,202,${alpha})"></div></div>
+      <div class="vp-pct">${(v / vp.total * 100).toFixed(1)}%</div>
+    </div>`;
+    if (i === nowBin) html += `<div class="vp-now"><div class="lbl">现价 ${fmt(nowP, dec)}</div><div class="line"></div><div></div></div>`;
+  }
+  vpBox.innerHTML = html;
+  if (rvp) {
+    const mins = flowRec.min || FLOW_MIN;
+    const age = Math.max(0, Math.round((Date.now() - flowRec.ts) / 1000));
+    const buyPct = rvp.total > 0 ? (rvp.buy / rvp.total * 100) : 50;
+    /* 取数有页数上限：成交极活跃时会优先保留最新成交，此时实际覆盖时长会短于窗口 */
+    let minT = Infinity, maxT = -Infinity;
+    for (const t of flowRec.trades) { const v = +t.T; if (v < minT) minT = v; if (v > maxT) maxT = v; }
+    const spanMin = isFinite(minT) && isFinite(maxT) ? (maxT - minT) / 60000 : 0;
+    const spanTxt = (spanMin > 0 && spanMin < mins - 1)
+      ? `（成交活跃，实际覆盖最近 ${spanMin.toFixed(1)} 分钟，已取满 ${AGG_PAGE_LIMIT}000 笔并优先保留最新）` : '';
+    meta.textContent = `当下成交口径 · 近 ${mins} 分钟真实逐笔 ${rvp.count} 笔${spanTxt} · 共 ${fmtVol(rvp.total)} · 主动买 ${buyPct.toFixed(0)}% / 主动卖 ${(100 - buyPct).toFixed(0)}% · 更新于 ${ts(flowRec.ts)}（${age}s 前）`;
+  } else {
+    const hasVol = candles.some(c => c.volume > 0);
+    meta.textContent = `降级口径：${TF_NAME[state.tf]} · 近 ${candles.length} 根K线 · ${hasVol ? '按成交量加权' : '按价格停留时间加权'}（该品种无逐笔成交数据）`;
+  }
+  if (meta.classList) meta.classList.toggle('rt', !!rvp);
+
+  const last20 = candles.slice(-20), last60 = candles.slice(-60);
+  const rLow = Math.min(...last20.map(c => c.low)), rHigh = Math.max(...last20.map(c => c.high));
+  const a = atr(candles) || (rHigh - rLow) / 10;
+  const mid = last60.reduce((s, c) => s + c.close, 0) / last60.length;
+  const support = Math.max(rLow, mid - a);
+  const resist = Math.min(rHigh, mid + a);
+  const posInRange = resist > support ? ((nowP - support) / (resist - support)) * 100 : 50;
+  const pocPrice = priceOf(vp.poc);
+  const sig = state.signals[state.tf];
+  let bias, biasColor;
+  if (nowP > pocPrice && sig && sig.score > 0.15) { bias = '偏多（站上成交密集区）'; biasColor = 'var(--up)'; }
+  else if (nowP < pocPrice && sig && sig.score < -0.15) { bias = '偏空（跌破成交密集区）'; biasColor = 'var(--down)'; }
+  else if (nowP > pocPrice) { bias = '偏多震荡（密集区上方）'; biasColor = 'var(--up)'; }
+  else if (nowP < pocPrice) { bias = '偏空震荡（密集区下方）'; biasColor = 'var(--down)'; }
+  else { bias = '区间内震荡'; biasColor = 'var(--muted)'; }
+  rcBox.innerHTML = `
+    <div class="rc"><div class="k">短线支撑位</div><div class="v" style="color:var(--down)">${fmt(support, dec)}<small> ${TF_NAME[state.tf]}K线 · 近20根低点/ATR</small></div></div>
+    <div class="rc"><div class="k">短线压力位</div><div class="v" style="color:var(--up)">${fmt(resist, dec)}<small> ${TF_NAME[state.tf]}K线 · 近20根高点/ATR</small></div></div>
+    <div class="rc"><div class="k">交易区间宽度</div><div class="v">${fmt(resist - support, dec)}<small> ${support > 0 ? ((resist - support) / support * 100).toFixed(2) + '%' : ''}</small></div></div>
+    <div class="rc"><div class="k">ATR(14) 波动</div><div class="v">${fmt(a, dec)}<small> ${(a / nowP * 100).toFixed(2)}%</small></div></div>
+    <div class="rc"><div class="k">成交密集价 POC</div><div class="v" style="color:#4338ca">${fmt(pocPrice, dec)}<small> ${rvp ? `当下磁吸位 · 近${flowRec.min || FLOW_MIN}分钟` : '磁吸位 · K线口径'}</small></div></div>
+    <div class="rc"><div class="k">价值区间 VA70</div><div class="v" style="font-size:13px">${fmt(priceOf(vp.vaLo), dec)} ~ ${fmt(priceOf(vp.vaHi), dec)}<small> ${rvp ? '当下70%成交量所在' : 'K线口径'}</small></div></div>
+    <div class="rc"><div class="k">现价在区间内位置</div><div class="v">${posInRange.toFixed(0)}%<small> 0=支撑 100=压力</small></div></div>
+    <div class="rc"><div class="k">方向偏向</div><div class="v" style="font-size:13px;color:${biasColor}">${bias}</div></div>`;
+}
+
+/* ---------- 事件与启动 ---------- */
+function selectInstrument(id) {
+  state.current = id;
+  state.tpsl = null;                   // 品种切换后重新推导止盈止损区间
+  document.querySelectorAll('.wl-item').forEach(el => el.classList.toggle('active', el.dataset.id === id));
+  $('#instName').textContent = instOf(id).name;
+  $('#sigMatrix').innerHTML = ''; $('#sigDetail').innerHTML = '<div class="empty">加载中…</div>';
+  $('#orderQty').value = '';
+  if (state.orderType === 'limit') { const p = lastPrice(id); $('#orderPrice').value = p == null ? '' : +p.toFixed(instOf(id).dec); }
+  /* 切换品种时同步切换清算图（美债等无永续合约的品种 → 自动关闭） */
+  if (window.LiqMap) window.LiqMap.setInstrument(id, GATE_FUT_PAIR[instOf(id).sym] || '', instOf(id).dec);
+  loadChart();
+  updatePricePanel();
+  refreshVenues(true);       // 切换品种后立即拉取该品种的多平台比价
+  renderTpSl(); renderIndPanel(); renderTpOvPanel();
+  renderEst();
+}
+function switchTf(tf) {
+  state.tf = tf;
+  document.querySelectorAll('#tfTabs button').forEach(b => b.classList.toggle('active', b.dataset.tf === tf));
+  renderTpSl(); renderIndPanel(); renderTpOvPanel();   // 指标全景与微调面板随所选周期联动
+  loadChart();
+}
+function switchTab(name) {
+  document.querySelectorAll('.bottom-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  ['pos', 'bt', 'doc'].forEach(t => $('#tab-' + t).classList.toggle('hidden', t !== name));
+}
+
+function boot() {
+  renderWatchlist();
+  initChart();
+  renderLeverBtns();
+  document.querySelectorAll('#tfTabs button').forEach(b => b.addEventListener('click', () => switchTf(b.dataset.tf)));
+  document.querySelectorAll('.bottom-tabs button').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+  document.querySelectorAll('#orderType button').forEach(b => b.addEventListener('click', () => setOrderType(b.dataset.ot)));
+  document.querySelectorAll('#pctRow button').forEach(b => b.addEventListener('click', () => {
+    const inst = instOf(state.current);
+    const px = lastPrice(inst.id);
+    if (px == null) { toast('暂无实时价格'); return; }
+    const type = state.orderType;
+    const feeRate = type === 'limit' ? FEE_MAKER : FEE_TAKER;
+    const p = type === 'limit' ? (parseFloat($('#orderPrice').value) || px) : px;
+    const q = roundStep(maxQtyFor(p, state.lever, feeRate, state.acct.cash) * parseFloat(b.dataset.pct), inst.qtyStep);
+    $('#orderQty').value = q;
+    renderEst();
+  }));
+  ['#orderQty', '#orderPrice'].forEach(sel => {
+    const el = $(sel); if (el) el.addEventListener('input', renderEst);
+  });
+  $('#btnBuy').addEventListener('click', () => doOrder('buy'));
+  $('#btnSell').addEventListener('click', () => doOrder('sell'));
+  bindTpOvEvents();                    // 止盈止损手动微调（输入即联动，可一键恢复自动）
+  $('#btnBacktest').addEventListener('click', runBacktest);
+  $('#btnReset').addEventListener('click', async () => {
+    const ok = await confirmYes({
+      title: '重置模拟账户',
+      icon: '↺',
+      danger: true,
+      yesText: '是 · 确认重置',
+      noText: '否 · 取消',
+      rows: [
+        { k: '持仓数量', v: state.acct.positions.length + ' 个' },
+        { k: '未成交委托', v: (state.acct.orders || []).length + ' 笔' },
+        { k: '成交记录', v: state.acct.history.length + ' 条' },
+        { k: '重置后可用余额', v: '100,000.00 USDT' },
+      ],
+      warn: '重置将清空全部持仓、委托与成交记录，恢复初始 100,000 USDT 模拟资金，操作不可撤销。',
+    });
+    if (!ok) { toast('已取消重置'); return; }
+    state.acct = freshAcct();
+    saveAcct(); renderPositions(); renderOrders(); updatePricePanel(); renderEst(); toast('模拟账户已重置');
+  });
+  selectInstrument('BTC');
+  pollPrices();
+  renderHeatmap();
+  connectTradeStream();                 // 逐笔实时成交推送（限价单撮合的实时数据源）
+  startTickLoops();
+  setInterval(pollPrices, 5000);        // 行情/24h涨跌/美债轮询兜底（含撮合与强平检查）——固定 5s，不随档位变慢
+  setInterval(() => refreshVenues(false), 20000);   // 多平台比价：20 秒（与主源 5s 解耦，避免高频打第三方接口）
+  initRefreshCtl();                     // 右上角刷新控件（立即刷新 + 档位选择 + 倒计时）
+  scheduleRefresh();                    // 按已保存/默认档位启动定时刷新
+  initDataSourceCtl();                  // 数据源状态条 + 手动锁定主源
+  initLiqMapCtl();                      // 多空清算图：开关 + 状态文字 + 定时增量刷新
+  probeSources();                       // 探测 Gate.io 永续延迟，写入健康度并显示到状态条
+  netHint = (t) => { const n = $('#chartNote'); if (n && t) { n.textContent = t; n.classList.add('stale'); } };
+  renderPositions();
+  renderOrders();
+  renderEst();
+}
+/* ================= 多空清算图（K线左侧） =================
+   数据来自 Gate.io 永续强平订单（liq_orders）近 24 小时，按价位聚合后画在 K 线左侧。
+   开关持久化；每 60 秒增量刷新最近 2 小时，手动全量刷新时回溯 24 小时。 */
+function initLiqMapCtl() {
+  const btn = $('#liqToggle');
+  if (btn && window.LiqMap) {
+    btn.classList.toggle('on', window.LiqMap.isOn());
+    btn.addEventListener('click', () => {
+      const on = !window.LiqMap.isOn();
+      window.LiqMap.setEnabled(on);
+      btn.classList.toggle('on', on);
+      toast(on ? '已开启多空清算图（Gate 永续 · 近24h 强平）' : '已关闭多空清算图');
+      paintLiqStat();
+    });
+  }
+  setInterval(() => { if (window.LiqMap) window.LiqMap.refresh(false); }, 60000);   // 增量刷新
+  setInterval(paintLiqStat, 8000);
+  paintLiqStat();
+}
+function paintLiqStat() {
+  const el = $('#liqStat');
+  if (!el || !window.LiqMap) return;
+  const t = window.LiqMap.statusLine();
+  el.textContent = t || '';
+  el.style.display = t ? '' : 'none';
+}
+
+async function refreshVolumeProfile(useCacheCandles, forceFlow) {
+  try {
+    const inst = instOf(state.current);
+    let flow = null;
+    if (inst.sym) { try { flow = await ensureFlow(inst, !!forceFlow); } catch (e) { flow = null; } }
+    let c = useCacheCandles ? state.candles[state.current + '_' + state.tf] : null;
+    if (!c || !c.length) c = await ensureCandles(inst, state.tf, !!forceFlow);
+    renderVolumeProfile(c, flow);
+  } catch (e) {}
+}
+
+/* ================= 右上角刷新控件 =================
+   档位只影响「行情/分析数据」刷新节奏；实时价格与撮合强平仍为 5s，不受档位影响。 */
+
+/* 全量刷新：K线 + 四周期信号 + 止盈止损 + 涨跌热力矩阵 + 成交热力图 */
+async function refreshAll(manual) {
+  const ico = $('#btnRefresh');
+  if (ico) ico.classList.add('spin');
+  try {
+    await Promise.all([loadChart(true), renderHeatmap(true)]);
+    await refreshVolumeProfile(true, true);
+    await Promise.all([pollPrices(), refreshVenues(true), window.LiqMap ? window.LiqMap.refresh(true) : Promise.resolve()]);
+  } catch (e) {
+    if (manual) toast('刷新失败：' + e.message);
+  } finally {
+    if (ico) ico.classList.remove('spin');
+  }
+  if (manual) toast('已刷新 · ' + rfLevel().name + '档');
+}
+
+/* 按当前档位重建定时器（切档时先清旧定时器，避免叠加） */
+function scheduleRefresh() {
+  (state.refreshTimers || []).forEach(t => clearInterval(t));
+  state.refreshTimers = [];
+  const lv = rfLevel();
+  // 信号 + 涨跌热力矩阵（含止盈止损区间重算）
+  state.refreshTimers.push(setInterval(() => { runSignals(null, true); renderHeatmap(); }, lv.sigMs));
+  // 成交热力图（当下逐笔口径）
+  state.refreshTimers.push(setInterval(() => refreshVolumeProfile(false, true), lv.flowMs));
+  state.nextRefreshAt = Date.now() + lv.flowMs;   // 以较快的那个为准做倒计时
+  renderRefreshCtl();
+}
+
+function renderRefreshCtl() {
+  const seg = $('#rfSeg');
+  if (seg) seg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.rf === state.refreshLevel));
+  const lv = rfLevel();
+  const btn = $('#btnRefresh');
+  if (btn) btn.title = `立即刷新全部行情、信号与热力图（当前档位：${lv.name}）`;
+  paintCountdown();
+}
+
+function paintCountdown() {
+  const el = $('#rfCountdown'); if (!el) return;
+  if (state.refreshLevel === 'realtime') { el.className = 'rf-cd'; el.textContent = '实时刷新中'; return; }
+  const left = Math.max(0, Math.round((state.nextRefreshAt - Date.now()) / 1000));
+  if (left <= 0) { el.className = 'rf-cd due'; el.textContent = '刷新中…'; return; }
+  const m = Math.floor(left / 60), s = left % 60;
+  el.className = 'rf-cd';
+  el.textContent = `下次 ${m}:${String(s).padStart(2, '0')}`;
+}
+
+function setRefreshLevel(id) {
+  if (!REFRESH_LEVELS.some(l => l.id === id)) return;
+  if (state.refreshLevel === id) return;
+  state.refreshLevel = id;
+  saveRefreshLevel();
+  scheduleRefresh();
+  toast(id === 'realtime' ? '刷新档位：实时（K线/信号 60 秒 · 成交热力图 15 秒）'
+    : `刷新档位：每 ${rfLevel().name.replace('分钟', ' 分钟')}自动刷新`);
+}
+
+function initRefreshCtl() {
+  const btn = $('#btnRefresh');
+  if (btn) btn.addEventListener('click', () => refreshAll(true));
+  const seg = $('#rfSeg');
+  if (seg) seg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => setRefreshLevel(b.dataset.rf)));
+  // 快捷键：R = 立即刷新（输入框/弹窗内不触发）
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'r' && e.key !== 'R') return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target, tag = t && t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+    const mm = document.getElementById('modalMask');
+    if (mm && mm.classList.contains('show')) return;   // 二次确认弹窗打开时不刷新
+    e.preventDefault();
+    refreshAll(true);
+  });
+  renderRefreshCtl();
+  setInterval(() => { paintCountdown(); if (state.refreshLevel !== 'realtime' && Date.now() >= state.nextRefreshAt) state.nextRefreshAt = Date.now() + rfLevel().flowMs; }, 1000);
+}
+
+boot();

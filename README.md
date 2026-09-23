@@ -1,6 +1,17 @@
 > **lejialin** — mybestAI
 > <sub>（仓库创建时的原始说明，已保留）</sub>
 
+## 仓库导航
+
+本仓库目前存放两个**互相独立**的静态站点，代码不共用：
+
+| 目录 | 项目 | 线上地址 |
+| --- | --- | --- |
+| 仓库根目录（`src/` + `build.js` + `app.js`） | **Market Board** · 五品种永续行情看板 | https://e6cf4c9fa8d941b6b5dcebf2b00f82a9.app.workbuddy.host |
+| [`simtrader/`](simtrader/) | **SimTrader** · 永续模拟交易看板（含多空清算图） | https://ab382104b589442e974dd50ce7cf9965.app.workbuddy.host |
+
+---
+
 # Market Board · 五品种永续行情看板
 
 纯前端静态站点，**无后端**。源码按 `src/` 分模块编写，用 `build.js` 拼成单文件 `app.js`，
