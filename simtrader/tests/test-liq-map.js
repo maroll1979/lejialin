@@ -1,6 +1,6 @@
 /* 多空清算图逻辑校验：mock DOM + 真实 Gate 强平数据 + 真实 K 线 */
 const fs = require('fs');
-const path = require('path').join(__dirname, '..', 'liq-map.js');
+const path = 'C:/Users/windos/WorkBuddy/2026-09-14-14-42-49/sim-trader/liq-map.js';
 
 /* ---- mock 浏览器环境 ---- */
 const store = {};

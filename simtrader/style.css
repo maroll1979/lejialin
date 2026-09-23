@@ -178,6 +178,16 @@ button { font-family: inherit; }
 .liq-sw.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 .liq-stat { font-size: 11px; color: var(--muted-2); white-space: nowrap; }
 
+/* ---------- K线缩放 / 清算图时间窗口 ---------- */
+.ch-zoom, .liq-win { display: flex; gap: 3px; }
+.ch-zoom button, .liq-win button {
+  border: 1px solid var(--line); background: #fff; padding: 4px 8px;
+  border-radius: var(--r-sm); cursor: pointer; font-size: 12px; color: var(--muted); transition: .15s; line-height: 1;
+}
+.ch-zoom button:hover, .liq-win button:hover { border-color: var(--accent); color: var(--accent); }
+.liq-win button.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.liq-win.hide { display: none; }
+
 .chart-note { position: absolute; left: calc(var(--liqw, 118px) + 8px); bottom: 4px; font-size: 13px; color: var(--muted-2); pointer-events: none; }
 .chart-note.stale { color: #7c3aed; font-weight: 600; }
 

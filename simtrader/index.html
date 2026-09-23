@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260923f">
+<link rel="stylesheet" href="style.css?v=20260923g">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -56,7 +56,17 @@
         <span class="src-tag" id="instSrcTag">—</span>
       </div>
       <div class="ch-right">
-        <button id="liqToggle" class="liq-sw" title="显示/隐藏 K线左侧的「多空清算图」：Gate.io 永续近 24 小时真实强平订单，按价位聚合">清算图</button>
+        <div class="ch-zoom" title="缩放与复位；也可鼠标滚轮上下缩放、按住图表左右拖动、Shift+滚轮横向平移">
+          <button id="zoomOut" title="缩小">－</button>
+          <button id="zoomIn" title="放大">＋</button>
+          <button id="zoomReset" title="复位到铺满">复位</button>
+        </div>
+        <button id="liqToggle" class="liq-sw" title="显示/隐藏 K线左侧的「多空清算图」：Gate.io 永续真实强平订单，按价位聚合">清算图</button>
+        <span class="liq-win" id="liqWin">
+          <button data-liqwin="24" class="active">24h</button>
+          <button data-liqwin="72">3天</button>
+          <button data-liqwin="168">7天</button>
+        </span>
         <span class="liq-stat" id="liqStat"></span>
         <div class="tf-tabs" id="tfTabs">
         <button data-tf="15m" class="active">15分钟</button>
@@ -241,8 +251,11 @@
         <li><b>价格用途区分</b>：只有<b>主源 Gate.io 永续</b>的价格参与限价单撮合、强平与盈亏计算；其余平台价格<b>仅作参考比价</b>，不参与成交判定</li>
         <li><b>永续与现货的差异</b>：永续价格围绕现货上下浮动（资金费率导致），两者通常相差几十到几百点不等；本终端以永续为唯一基准，K线、信号、止盈止损与撮合全部使用同一口径</li>
         <li><b>美债 2Y/5Y/10Y</b>：美国财政部每日国债收益率曲线（<b>单一来源</b>，日频数据，无多平台概念，界面标注为「美国财政部」）</li>
-        <li><b>多空清算图（K线左侧）</b>：取自 Gate.io 永续的<b>真实强平订单</b>（<code>/futures/usdt/liq_orders</code>），回溯近 <b>24 小时</b>，按成交价位分桶累计成横向强度条，画在 K 线左侧（Y 轴左）。<b>绿色=多头仓位被强平</b>（强平单卖出成交，形成下杀压力），<b>红色=空头仓位被强平</b>（强平单买入成交，形成上冲压力）；强度条越长=该价位附近累计爆仓金额越大。金额口径 = <code>|张数| × 合约面值 × 成交价</code>（名义 USDT）</li>
+        <li><b>多空清算图（K线左侧）</b>：取自 Gate.io 永续的<b>真实强平订单</b>（<code>/futures/usdt/liq_orders</code>），按成交价位分桶累计成横向强度条，画在 K 线左侧（Y 轴左）。<b>绿色=多头仓位被强平</b>（强平单卖出成交，形成下杀压力），<b>红色=空头仓位被强平</b>（强平单买入成交，形成上冲压力）；强度条越长=该价位附近累计爆仓金额越大。金额口径 = <code>|张数| × 合约面值 × 成交价</code>（名义 USDT）。统计窗口可在图表头部切 <b>24h / 3天 / 7天</b></li>
+        <li><b>历史爆仓会保留</b>：抓到的强平订单写入浏览器本地缓存（localStorage，按合约保留 7 天），<b>重新打开页面先立刻画出本地已有的历史</b>，再补齐最近 24 小时，随后在后台分块回补到 7 天——不是只有页面开着时才累积</li>
         <li><b>清算价位横线</b>：在强度最高的若干个价位上自动画虚线横贯 K 线，并在左端标注「<b>价位 · 多头/空头爆仓 $金额</b>」，即把清算价位与图上价格一一对应；缩放或平移 K 线时按当前可见价格区间重新聚合。接口单次只能查 1 小时窗口，因此按小时切片并发回溯后再合并去重；每 60 秒增量刷新最近 2 小时</li>
+        <li><b>K线交互</b>：鼠标<b>滚轮上下缩放</b>、<b>按住图表左右拖动平移</b>、Shift+滚轮横向滚动、拖动时间轴或价格轴缩放、双击轴复位；也可用图表头部的「－ / ＋ / 复位」按钮。数据自动刷新时<b>不再重置你的缩放位置</b>（只有换品种或换周期才重新铺满）</li>
+        <li><b>止盈止损的三套盈亏比口径</b>：卡片里同时给出<b>参考价口径</b>（方案参考价 P）、<b>预计入场价口径</b>（入场区中点，挂单实际面对的风险收益）与<b>扣费净口径</b>（再扣掉开仓与平仓两道手续费，市价 0.10% / 限价 0.05%）。三者不一致时以净口径为准；<code>maxAtrK</code> 是最终风险的硬上限，ATR 回退分支同样受它约束</li>
         <li>石油 / 美股 / A股：免费实时接口存在跨域与授权限制，未纳入本版本；模型可平滑扩展</li>
       </ul>
       <h4>数据刷新（页面右上角刷新控件）</h4>
@@ -299,7 +312,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260923f · Gate.io 永续单一数据源 · 多空清算图</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260923g · Gate.io 永续单一数据源 · 多空清算图（历史可保留） · K线缩放拖动</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -319,7 +332,7 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260923f"></script>
-<script src="app.js?v=20260923f"></script>
+<script src="liq-map.js?v=20260923g"></script>
+<script src="app.js?v=20260923g"></script>
 </body>
 </html>

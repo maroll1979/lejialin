@@ -1080,6 +1080,19 @@ function initChart() {
     timeScale: { borderColor: '#e3e8ef', timeVisible: true, secondsVisible: false },
     crosshair: { mode: 0 },
     watermark: { visible: false },     // 视觉去噪：隐藏图表库水印
+    /* 交互：滚轮缩放（上下滚动）、按住拖动平移、双指/价格轴拖动缩放 */
+    handleScroll: {
+      mouseWheel: true,        // Shift+滚轮 / 触控板横向 → 左右平移
+      pressedMouseMove: true,  // 按住鼠标左右拖动 → 平移
+      horzTouchDrag: true, vertTouchDrag: true,
+    },
+    handleScale: {
+      mouseWheel: true,        // 鼠标上下滚动 → 缩放
+      pinch: true,
+      axisPressedMouseMove: { time: true, price: true },  // 拖动时间轴/价格轴 → 缩放
+      axisDoubleClickReset: true,                          // 双击轴 → 复位
+    },
+    kineticScroll: { mouse: true, touch: true },
   });
   state.chart = chart;
   state.candleSeries = chart.addCandlestickSeries({
@@ -1095,6 +1108,41 @@ function initChart() {
     window.LiqMap.init(chart, state.candleSeries, $('#chartBox'), $('#chart'));
     try { chart.timeScale().subscribeVisibleTimeRangeChange(() => window.LiqMap.render()); } catch (e) {}
   }
+  /* 缩放 / 复位按钮（滚轮与拖动由图表库原生提供） */
+  const bind = (id, fn) => { const b = $(id); if (b) b.addEventListener('click', fn); };
+  bind('#zoomIn', () => zoomChart(1 / 1.5));
+  bind('#zoomOut', () => zoomChart(1.5));
+  bind('#zoomReset', () => resetChartZoom());
+  /* 清算图统计窗口：24h / 3天 / 7天 */
+  const winBox = $('#liqWin');
+  if (winBox) {
+    const savedWin = window.LiqMap ? window.LiqMap.windowHours() : 24;
+    winBox.querySelectorAll('[data-liqwin]').forEach(b => {
+      b.classList.toggle('active', +b.dataset.liqwin === savedWin);
+      b.addEventListener('click', () => {
+        const h = +b.dataset.liqwin;
+        winBox.querySelectorAll('[data-liqwin]').forEach(x => x.classList.toggle('active', x === b));
+        if (window.LiqMap) window.LiqMap.setWindow(h);
+        paintLiqStat();
+      });
+    });
+  }
+}
+
+/* 以当前视图中心为锚点缩放（factor < 1 放大，> 1 缩小） */
+function zoomChart(factor) {
+  if (!state.chart) return;
+  const ts = state.chart.timeScale();
+  let lr = null;
+  try { lr = ts.getVisibleLogicalRange(); } catch (e) {}
+  if (!lr || !isFinite(lr.from) || !isFinite(lr.to)) return;
+  const span = Math.max(6, Math.min(3000, (lr.to - lr.from) * factor));
+  const mid = (lr.from + lr.to) / 2;
+  try { ts.setVisibleLogicalRange({ from: mid - span / 2, to: mid + span / 2 }); } catch (e) {}
+}
+function resetChartZoom() {
+  if (!state.chart) return;
+  try { state.chart.timeScale().fitContent(); } catch (e) {}
 }
 async function loadChart(force) {
   const inst = instOf(state.current);
@@ -1139,7 +1187,12 @@ function paintChart(candles) {
   const e9 = ema(closes, 9), e21 = ema(closes, 21);
   state.ema9Series.setData(candles.map((c, i) => ({ time: c.time, value: e9[i] })).filter(x => x.value));
   state.ema21Series.setData(candles.map((c, i) => ({ time: c.time, value: e21[i] })).filter(x => x.value));
-  state.chart.timeScale().fitContent();
+  /* 只在「首次加载 / 换品种 / 换周期」时自适应铺满；之后的数据刷新保留用户当前的缩放与拖动位置 */
+  const fitKey = state.current + '|' + state.tf;
+  if (state.chartFitKey !== fitKey) {
+    state.chartFitKey = fitKey;
+    state.chart.timeScale().fitContent();
+  }
   if (window.LiqMap) { window.LiqMap.setCandles(candles); window.LiqMap.render(); }   // 清算图随 K 线重绘
 }
 
@@ -1207,9 +1260,12 @@ function renderSigCards() {
   const isUst = inst.type === 'ust';
   const P = v => (v == null ? '—' : fmt(v, dec) + (isUst ? ' %' : ''));
   const planOf = tf => (t && t.inst === state.current) ? t.plans.find(x => x.tf === tf) : null;
-  const dTxt = v => {
+  /* 右侧百分比按「持仓方向」折算，而不是单纯的价格方向距离：
+     做空时价格下跌才是盈利，所以止损（在上方）显示负值、止盈（在下方）显示正值。 */
+  const dTxt = (v, dir) => {
     if (v == null || px == null || !px) return '';
-    const d = (v - px) / px * 100;
+    let d = (v - px) / px * 100;
+    if (dir === 'short') d = -d;
     return `<small class="${d >= 0 ? 'txt-up' : 'txt-down'}">${d >= 0 ? '+' : ''}${d.toFixed(2)}%</small>`;
   };
 
@@ -1234,16 +1290,21 @@ function renderSigCards() {
       rows.push(`<div class="sc-r"><span>操作建议</span><b>区间高抛低吸</b></div>`);
     } else if (p) {
       rows.push(`<div class="sc-r"><span>入场区</span><b>${P(p.entryLo)} ~ ${P(p.entryHi)}</b></div>`);
+      rows.push(`<div class="sc-r"><span>预计入场</span><b>${P(p.entry)}</b><small>盈亏比按此价计</small></div>`);
       const mk = f => (p.ovF && p.ovF[f]) ? '<i class="ov-dot" title="手动微调值">✎</i>' : '';
-      rows.push(`<div class="sc-r"><span>止损${mk('stop')}</span><b class="txt-down">${P(p.stop)}</b>${dTxt(p.stop)}</div>`);
-      rows.push(`<div class="sc-r"><span>止盈一${mk('tp1')}</span><b class="txt-up">${P(p.tp1)}</b>${dTxt(p.tp1)}</div>`);
-      rows.push(`<div class="sc-r"><span>止盈二${mk('tp2')}</span><b class="txt-up">${P(p.tp2)}</b>${dTxt(p.tp2)}</div>`);
+      rows.push(`<div class="sc-r"><span>止损${mk('stop')}</span><b class="txt-down">${P(p.stop)}</b>${dTxt(p.stop, p.dir)}</div>`);
+      rows.push(`<div class="sc-r"><span>止盈一${mk('tp1')}</span><b class="txt-up">${P(p.tp1)}</b>${dTxt(p.tp1, p.dir)}</div>`);
+      rows.push(`<div class="sc-r"><span>止盈二${mk('tp2')}</span><b class="txt-up">${P(p.tp2)}</b>${dTxt(p.tp2, p.dir)}</div>`);
     } else {
       rows.push(`<div class="sc-r"><span>提示</span><b>止损止盈计算中…</b></div>`);
     }
     const meta = [];
     if (p) meta.push(`ATR ${(p.atrPct * 100).toFixed(2)}%`);
-    if (p && p.dir !== 'wait') meta.push(`盈亏比 1:${p.rr1.toFixed(1)}`);
+    if (p && p.dir !== 'wait') {
+      const e = p.rr1Entry == null ? p.rr1 : p.rr1Entry;
+      const n = p.rr1Net == null ? 0 : p.rr1Net;
+      meta.push(`盈亏比 <b>1:${e.toFixed(1)}</b><small>（参考价 1:${p.rr1.toFixed(1)} · 扣费净 1:${n.toFixed(1)}）</small>`);
+    }
     return `<div class="sc-card ${cls}${active ? ' active' : ''}">
       <div class="sc-top">
         <span class="sc-tf">${TF_NAME[tf]}</span>
@@ -2258,6 +2319,22 @@ function indAdjust(sig, candles, dir) {
 }
 
 /* 单周期方案 */
+/* 盈亏比口径工具
+   rrAtEntry：以「预计入场价」（入场区中点）为基准，而不是方案参考价 P。
+              参考价口径会低估实际风险：按截图例子，做空时参考价口径 1:1.00，
+              换成入场区中点口径是 1:1.86，两者差接近一倍。
+   rrNetOf  ：在入场价口径上再扣掉开仓与平仓两道手续费（费率 = 下单方式对应费率），
+              这才是真正拿得到的净盈亏比。手续费按名义金额计，与模拟盘开平仓扣费一致。 */
+function rrAtEntry(entry, stop, tp) {
+  const r = Math.abs(entry - stop);
+  return r > 0 ? Math.abs(tp - entry) / r : 0;
+}
+function rrNetOf(entry, stop, tp, fee) {
+  const loss = Math.abs(entry - stop) + (entry + stop) * fee;   // 被打止损：价差 + 开平仓两道费
+  const gain = Math.abs(tp - entry) - (entry + tp) * fee;       // 止盈离场：价差 − 开平仓两道费
+  return loss > 0 ? gain / loss : 0;
+}
+
 function tpSlPlan(candles, tf, price) {
   if (!candles || candles.length < 45) return null;
   const cfg = TPSL_CFG[tf] || TPSL_CFG['1h'];
@@ -2279,7 +2356,9 @@ function tpSlPlan(candles, tf, price) {
   // 方向：由六因子信号引擎判定（含主导因子与趋势门槛两道闸门）
   const dir = (sig && sig.dir) ? sig.dir : 'wait';
   const adj = indAdjust(sig, candles, dir);
-  const effK = cfg.atrK * adj.atrKMul;                 // 指标调整后的有效 ATR 止损倍数
+  /* maxAtrK 是最终风险的硬上限：指标系数叠加后（如 2.4×1.15×1.08=2.98 > 2.8）不允许突破，
+     ATR 回退分支同样受它约束，不再只筛结构止损。 */
+  const effK = Math.min(cfg.atrK * adj.atrKMul, cfg.maxAtrK);
   const cap = cfg.maxAtrK * a;                         // 单笔最大风险（ATR 倍数上限）
 
   /* ---- 做多方案 ---- */
@@ -2287,7 +2366,7 @@ function tpSlPlan(candles, tf, price) {
   const riskSL = px - structStopL;
   let stopL, riskL;
   if (riskSL > 0.15 * a && riskSL <= cap) { stopL = structStopL; riskL = riskSL; }   // 结构止损（前低下方）
-  else { stopL = px - effK * a; riskL = effK * a; }                                  // 结构过远/过近 → 改用 ATR 止损
+  else { const d = Math.min(effK * a, cap); stopL = px - d; riskL = d; }             // 结构过远/过近 → ATR 止损（同样受硬上限约束）
   const tp1L = px + cfg.rr[0] * adj.tp1Mul * riskL;
   // 止盈二：结构性目标（布林上轨 / 近期高点）需在至少 1.5R 之外才采用，否则退回 2R 度量目标
   const candL = [bUp, swHigh].filter(v => v != null && v > px + 1.5 * riskL);
@@ -2300,13 +2379,14 @@ function tpSlPlan(candles, tf, price) {
   const riskSS = structStopS - px;
   let stopS, riskS;
   if (riskSS > 0.15 * a && riskSS <= cap) { stopS = structStopS; riskS = riskSS; }
-  else { stopS = px + effK * a; riskS = effK * a; }
+  else { const d = Math.min(effK * a, cap); stopS = px + d; riskS = d; }
   const tp1S = px - cfg.rr[0] * adj.tp1Mul * riskS;
   const candS = [bLo, swLow].filter(v => v != null && v < px - 1.5 * riskS);
   const tp2S = candS.length ? px - (px - Math.max(...candS)) * adj.tp2Mul : px - cfg.rr[1] * adj.tp2Mul * riskS;
   const tp2SrcS = candS.length ? '结构' : '度量';
   const tp3S = px - cfg.rr[2] * adj.tp2Mul * riskS;
 
+  const fee = FEE_MARKET_RATE();                       // 当前下单方式的费率（市价 0.10% / 限价 0.05%）
   const long = {
     stop: stopL, risk: riskL, riskPct: riskL / px,
     tp1: tp1L, tp2: tp2L, tp3: tp3L, tp2Src: tp2SrcL,
@@ -2319,9 +2399,23 @@ function tpSlPlan(candles, tf, price) {
     rr1: (px - tp1S) / riskS, rr2: (px - tp2S) / riskS,
     entryLo: px + 0.12 * a, entryHi: px + 0.60 * a,     // 反弹卖出区（高于现价 → 符合限价卖规则）
   };
+  /* 三套盈亏比口径：
+     rr1/rr2   —— 按方案参考价 P（卡片历史口径，未扣费）
+     rr*Entry  —— 按预计入场价（入场区中点），这才是挂单实际面对的风险收益
+     rr*Net    —— 在预计入场价基础上扣掉开仓与平仓两道手续费后的净口径 */
+  for (const side of [long, short]) {
+    side.entry = (side.entryLo + side.entryHi) / 2;
+    side.rr1Entry = rrAtEntry(side.entry, side.stop, side.tp1);
+    side.rr2Entry = rrAtEntry(side.entry, side.stop, side.tp2);
+    side.rr1Net = rrNetOf(side.entry, side.stop, side.tp1, fee);
+    side.rr2Net = rrNetOf(side.entry, side.stop, side.tp2, fee);
+  }
   // 自动基线快照：手动微调只在此基线上叠加，清除手填值后可完整还原
-  long.auto = { stop: stopL, tp1: tp1L, tp2: tp2L, risk: riskL, riskPct: riskL / px, rr1: long.rr1, rr2: long.rr2 };
-  short.auto = { stop: stopS, tp1: tp1S, tp2: tp2S, risk: riskS, riskPct: riskS / px, rr1: short.rr1, rr2: short.rr2 };
+  const snap = side => ({ stop: side.stop, tp1: side.tp1, tp2: side.tp2, risk: side.risk, riskPct: side.riskPct,
+    rr1: side.rr1, rr2: side.rr2, entry: side.entry, rr1Entry: side.rr1Entry, rr2Entry: side.rr2Entry,
+    rr1Net: side.rr1Net, rr2Net: side.rr2Net });
+  long.auto = snap(long);
+  short.auto = snap(short);
 
   // 主方案：方向明确用对应侧；震荡则取打分偏好的一侧并标记（区间交易）
   const primary = dir === 'short' ? 'short' : 'long';
@@ -2339,6 +2433,8 @@ function tpSlPlan(candles, tf, price) {
     tp1: side.tp1, tp2: side.tp2, tp3: side.tp3, tp2Src: side.tp2Src,
     rr1: side.rr1, rr2: side.rr2,
     entryLo: side.entryLo, entryHi: side.entryHi,
+    entry: side.entry, rr1Entry: side.rr1Entry, rr2Entry: side.rr2Entry,
+    rr1Net: side.rr1Net, rr2Net: side.rr2Net,
   };
 }
 
@@ -2381,9 +2477,14 @@ function tpSlSummary(plans, px, inst) {
   const sugQty = riskDist > 0 ? roundStep(budget / riskDist, step) : 0;
   const maxQty = Math.max(0, maxQtyFor(px, state.lever, FEE_MARKET_RATE(), state.acct.cash));
 
+  // 综合价的加权明细：同向周期按权重归一化（不同向的周期不参与），界面要写清楚是哪几个周期、各占多少
+  const weights = use.map(p => ({ tf: p.tf, w: wOf(p) / useW }));
+  const fee = FEE_MARKET_RATE();
   return {
     mainDir, alignedCount: aligned.length, total: plans.length, neutralCount: neutral.length,
     agreeW, conf, stop, tp1, tp2, riskPct, rr1, rr2,
+    rr1Net: rrNetOf(px, stop, tp1, fee), rr2Net: rrNetOf(px, stop, tp2, fee),
+    weights, usedTfs: use.map(p => p.tf),
     budget, sugQty, sugQtyCapped: Math.min(sugQty, roundStep(maxQty, step)),
     atrPctAvg: use.reduce((s, p) => s + wOf(p) / useW * p.atrPct, 0),
   };
@@ -2435,7 +2536,16 @@ function applyTpSlOverride() {
     side.riskPct = side.risk / p.px;
     side.rr1 = side.risk > 0 ? Math.abs(side.tp1 - p.px) / side.risk : 0;
     side.rr2 = side.risk > 0 ? Math.abs(side.tp2 - p.px) / side.risk : 0;
+    // 手填价同样要重算「预计入场价口径」与「扣费净口径」
+    const fee = FEE_MARKET_RATE();
+    side.entry = (side.entryLo + side.entryHi) / 2;
+    side.rr1Entry = rrAtEntry(side.entry, side.stop, side.tp1);
+    side.rr2Entry = rrAtEntry(side.entry, side.stop, side.tp2);
+    side.rr1Net = rrNetOf(side.entry, side.stop, side.tp1, fee);
+    side.rr2Net = rrNetOf(side.entry, side.stop, side.tp2, fee);
     p.risk = side.risk; p.riskPct = side.riskPct; p.rr1 = side.rr1; p.rr2 = side.rr2;
+    p.entry = side.entry; p.rr1Entry = side.rr1Entry; p.rr2Entry = side.rr2Entry;
+    p.rr1Net = side.rr1Net; p.rr2Net = side.rr2Net;
   });
   const inst = instOf(state.current);
   const px = lastPrice(inst.id) ?? (t.plans[0] && t.plans[0].px);
@@ -2479,7 +2589,8 @@ function renderTpSl() {
   const dec = inst.dec;
   const P = v => fmt(v, dec);
   const dist = v => ((v - px) / px * 100);
-  const dTxt = v => { const d = dist(v); return `<small class="${d >= 0 ? 'txt-up' : 'txt-down'}">${d >= 0 ? '+' : ''}${d.toFixed(2)}%</small>`; };
+  /* 百分比按持仓方向折算：做空时价格下跌才是盈利（止损显示负、止盈显示正） */
+  const dTxt = v => { let d = dist(v); if (s && s.mainDir === 'short') d = -d; return `<small class="${d >= 0 ? 'txt-up' : 'txt-down'}">${d >= 0 ? '+' : ''}${d.toFixed(2)}%</small>`; };
   const s = t.summary;
 
   /* ---- 综合结论提示条（各周期明细见 K 线下方的四个格子） ---- */
@@ -2489,11 +2600,14 @@ function renderTpSl() {
     const agreeTxt = `${s.alignedCount}/${s.total} 个周期同向`;
     const lvl = s.alignedCount >= 3 ? '四周期共振' : s.alignedCount === 2 ? '多周期偏' : '单周期偏';
     const dirTfs = t.plans.filter(p => p.dir === s.mainDir).map(p => TF_NAME[p.tf]).join(' / ');
+    const wTxt = (s.weights && s.weights.length)
+      ? s.weights.map(w => `${TF_NAME[w.tf]} ${(w.w * 100).toFixed(0)}%`).join(' / ') : '—';
     head = `<div class="tpsl-hint ${isLong ? 'long' : 'short'}">
       <div class="th-main">${isLong ? '📈' : '📉'} ${lvl}${isLong ? '多' : '空'} · ${agreeTxt} · 置信度 ${s.conf}%</div>
       <div class="th-line">同向周期：<b>${dirTfs || '—'}</b>（四周期：${TFS.map(tf => TF_NAME[tf]).join(' / ')}）</div>
-      <div class="th-line">参考止损 <b>${P(s.stop)}</b>${dTxt(s.stop)} · 止盈一 <b>${P(s.tp1)}</b>${dTxt(s.tp1)} · 止盈二 <b>${P(s.tp2)}</b>${dTxt(s.tp2)} · 盈亏比 <b>1:${s.rr1.toFixed(1)} / 1:${s.rr2.toFixed(1)}</b></div>
-      <div class="th-line">止损距离 <b>${(s.riskPct * 100).toFixed(2)}%</b> · 单笔风险预算 ${(TPSL_RISK_BUDGET * 100).toFixed(0)}% 权益 = <b>${fmt(s.budget, 2)}</b> USDT → 建议数量 ≈ <b>${s.sugQtyCapped}</b> ${inst.short}（按当前 ${state.lever}x）</div>
+      <div class="th-line">参考止损 <b>${P(s.stop)}</b>${dTxt(s.stop)} · 止盈一 <b>${P(s.tp1)}</b>${dTxt(s.tp1)} · 止盈二 <b>${P(s.tp2)}</b>${dTxt(s.tp2)} · 盈亏比 <b>1:${s.rr1.toFixed(1)} / 1:${s.rr2.toFixed(1)}</b><small>（扣开平仓手续费后净 1:${(s.rr1Net || 0).toFixed(1)} / 1:${(s.rr2Net || 0).toFixed(1)}）</small></div>
+      <div class="th-line">综合价 = 同向周期按权重归一化：<b>${wTxt}</b>（仅加权参考值，不是另行识别的支撑压力位）</div>
+      <div class="th-line">止损距离 <b>${(s.riskPct * 100).toFixed(2)}%</b> · 单笔风险预算 ${(TPSL_RISK_BUDGET * 100).toFixed(0)}% 权益 = <b>${fmt(s.budget, 2)}</b> USDT → 建议数量 ≈ <b>${s.sugQtyCapped}</b> ${inst.short}（按当前 ${state.lever}x）<small> · 风险预算未计手续费与滑点，实际净亏损不封顶于 ${(TPSL_RISK_BUDGET * 100).toFixed(0)}%</small></div>
       ${s.neutralCount >= 2 ? `<div class="th-line th-warn">⚠ ${s.neutralCount} 个周期信号中性（震荡），方向一致性不足，建议降低仓位或等待突破确认</div>` : ''}
     </div>`;
   } else {
@@ -2738,7 +2852,7 @@ function applyTpSlPlan(tf) {
   const qty = Math.min(qtyByRisk, maxQ);
   $('#orderQty').value = qty;
   renderEst();
-  toast(`已填入 ${TF_NAME[tf]} 方案：${isLong ? '买入/开多' : '卖出/开空'} 限价 ${fmt(price, inst.dec)} · 数量 ${qty} ${inst.short} · 参考止损 ${fmt(side.stop, inst.dec)} · 止盈一 ${fmt(side.tp1, inst.dec)}（需点「${isLong ? '买入 / 开多' : '卖出 / 开空'}」并二次确认）`);
+  toast(`已填入 ${TF_NAME[tf]} 方案：${isLong ? '买入/开多' : '卖出/开空'} 限价 ${fmt(price, inst.dec)} · 数量 ${qty} ${inst.short} · 参考止损 ${fmt(side.stop, inst.dec)} · 止盈一 ${fmt(side.tp1, inst.dec)}（需点「${isLong ? '买入 / 开多' : '卖出 / 开空'}」并二次确认；本操作只填参数，不会创建止盈/止损委托单）`);
 }
 
 function renderVolumeProfile(candles, flow) {
@@ -2920,8 +3034,11 @@ function initLiqMapCtl() {
   paintLiqStat();
 }
 function paintLiqStat() {
+  if (!window.LiqMap) return;
+  const winBox = $('#liqWin');
+  if (winBox) winBox.classList.toggle('hide', !window.LiqMap.isActive());
   const el = $('#liqStat');
-  if (!el || !window.LiqMap) return;
+  if (!el) return;
   const t = window.LiqMap.statusLine();
   el.textContent = t || '';
   el.style.display = t ? '' : 'none';

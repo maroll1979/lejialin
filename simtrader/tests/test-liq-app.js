@@ -2,7 +2,7 @@
    验证新增的清算图钩子不破坏启动，且接入点齐全 */
 const fs = require('fs');
 const path = require('path');
-const DIR = path.join(__dirname, '..');   // 站点文件在 tests/ 的上一级 simtrader/
+const DIR = path.join(__dirname, 'simtrader');
 const appSrc = fs.readFileSync(path.join(DIR, 'app.js'), 'utf8');
 const liqSrc = fs.readFileSync(path.join(DIR, 'liq-map.js'), 'utf8');
 const html = fs.readFileSync(path.join(DIR, 'index.html'), 'utf8');
@@ -12,7 +12,9 @@ let fail = 0;
 const ok = (c, m, x) => { console.log((c ? '  PASS ' : '  FAIL ') + m + (x != null ? ' → ' + x : '')); if (!c) fail++; };
 
 console.log('【接入点静态检查】');
-ok(/liq-map\.js\?v=20260923f/.test(html), 'index.html 引入 liq-map.js（在 app.js 之前）');
+ok(/liq-map\.js\?v=\d+/.test(html), 'index.html 引入 liq-map.js 且带版本号（在 app.js 之前）');
+ok(/id="zoomIn"/.test(html) && /id="zoomOut"/.test(html) && /id="zoomReset"/.test(html), '页面含 K线缩放/复位按钮');
+ok(/data-liqwin="168"/.test(html), '页面含清算图 7 天窗口切换');
 ok(html.indexOf('liq-map.js') < html.indexOf('app.js?v='), 'liq-map.js 先于 app.js 加载');
 ok(/id="liqToggle"/.test(html) && /id="liqStat"/.test(html), '页面含清算图开关与状态位');
 ok(/window\.LiqMap\.init\(chart, state\.candleSeries/.test(appSrc), 'initChart 中初始化清算图');

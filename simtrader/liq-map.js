@@ -16,10 +16,13 @@
   const LS_REC = 'simtrader_liq_v1';       // 强平记录缓存（按合约）
   const LS_MULT = 'simtrader_liqmult_v1';  // 合约面值缓存
   const LS_ON = 'simtrader_liqon_v1';      // 开关偏好
-  const LOOKBACK_H = 24;                   // 首次加载回溯 24 小时
+  const LS_WIN = 'simtrader_liqwin_v1';    // 统计窗口偏好（24 / 72 / 168 小时）
+  const LOOKBACK_H = 24;                   // 常规加载回溯 24 小时
   const TICK_H = 2;                        // 定时增量刷新最近 2 小时
-  const KEEP_H = 48;                       // 本地最多保留 48 小时
-  const MAX_REC = 8000;                    // 单合约最多缓存条数
+  const DEEP_H = 168;                      // 后台深度回补上限 7 天（历史爆仓可跨会话累积）
+  const KEEP_H = 168;                      // 本地最多保留 7 天
+  const MAX_REC = 12000;                   // 单合约最多缓存条数
+  const CHUNK_H = 24;                      // 深度回补每次补 24 小时
   const BINS = 62;                         // 价格分桶数
   const W_LEFT = 118;                      // 左侧清算图区域宽度（与 CSS --liqw 保持一致）
 
@@ -29,7 +32,12 @@
     instId: '', contract: '', dec: 2, mult: 0,
     recs: [], candles: [], loading: false, err: '', lastTs: 0, n: 0,
     totLong: 0, totShort: 0,
+    winH: 24,              // 当前统计窗口（小时）
+    backfilling: false,    // 是否正在深度回补历史
+    gen: 0,                // 品种切换代号：回补过程中换品种则中止
   };
+  /* 窗口文案：24h / 3天 / 7天 */
+  function winText(h) { return h >= 168 ? '近7天' : h >= 72 ? '近3天' : '近24h'; }
 
   /* ---------- 工具 ---------- */
   function px(v, dec) {
@@ -45,7 +53,7 @@
     return v.toFixed(0);
   }
   function lsGet(k, def) { try { const v = JSON.parse(localStorage.getItem(k) || 'null'); return v == null ? def : v; } catch (e) { return def; } }
-  function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } }
 
   async function fetchJson(url, ms) {
     const ac = new AbortController();
@@ -70,8 +78,8 @@
   }
 
   /* ---------- 抓强平订单（按 1 小时窗口回溯，并发 6） ---------- */
-  async function fetchWindows(contract, hours) {
-    const now = Math.floor(Date.now() / 1000);
+  async function fetchWindows(contract, hours, endTs) {
+    const now = endTs == null ? Math.floor(Date.now() / 1000) : endTs;
     const wins = [];
     for (let h = 0; h < hours; h++) { const to = now - h * 3600; wins.push([to - 3599, to]); }
     const out = [];
@@ -115,10 +123,21 @@
     const cut = Math.floor(Date.now() / 1000) - KEEP_H * 3600;
     return e.recs.filter(r => r.t >= cut);
   }
+  /* 落盘：历史爆仓要跨会话累积，localStorage 写满时逐级裁剪而不是静默丢弃 */
   function saveRecs(contract, recs) {
     const all = lsGet(LS_REC, {});
     all[contract] = { ts: Date.now(), recs };
-    lsSet(LS_REC, all);
+    if (lsSet(LS_REC, all)) return;
+    for (const keep of [8000, 5000, 3000, 1500, 600]) {          // 配额超限 → 只保留最近 N 条
+      all[contract] = { ts: Date.now(), recs: recs.slice(-keep) };
+      if (lsSet(LS_REC, all)) return;
+    }
+    for (const c of Object.keys(all)) {                          // 仍失败 → 丢弃其它合约的旧缓存后重试
+      if (c === contract) continue;
+      delete all[c];
+      if (lsSet(LS_REC, all)) return;
+    }
+    try { localStorage.removeItem(LS_REC); } catch (e) {}
   }
 
   async function load(hours) {
@@ -128,7 +147,8 @@
     try {
       await ensureMult(c);
       const fresh = norm(await fetchWindows(c, hours));
-      S.recs = merge(localRecs(c), fresh);
+      const base = (S.recs && S.recs.length) ? S.recs : localRecs(c);
+      S.recs = merge(base, fresh);
       saveRecs(c, S.recs);
       S.err = '';
       S.lastTs = Date.now();
@@ -142,9 +162,43 @@
     }
   }
 
+  /* ---------- 深度回补：把历史爆仓一直往前补到 7 天，跨会话累积 ----------
+     每次只补一段（默认 24 小时），补完落盘再补下一段，
+     这样第二次打开页面时本地已有完整历史，不必等网络。 */
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function deepBackfill() {
+    if (!S.contract || S.backfilling) return;
+    const gen = S.gen;
+    S.backfilling = true;
+    try {
+      const oldestAllowed = Math.floor(Date.now() / 1000) - DEEP_H * 3600;
+      for (let round = 0; round < 10; round++) {
+        if (gen !== S.gen || !S.contract) return;                 // 期间换了品种 → 放弃本次回补
+        const cur = S.recs.length ? S.recs[0].t : Math.floor(Date.now() / 1000);
+        if (cur <= oldestAllowed) return;                         // 已补满 7 天
+        const hours = Math.min(CHUNK_H, Math.ceil((cur - oldestAllowed) / 3600));
+        const fresh = norm(await fetchWindows(S.contract, hours, cur - 1));
+        if (gen !== S.gen) return;
+        if (fresh.length) {
+          S.recs = merge(S.recs, fresh);
+          saveRecs(S.contract, S.recs);
+          recalcTotals();
+          schedule();
+        }
+        if (!fresh.length && hours < CHUNK_H) return;             // 更早的时段没有数据 → 停止
+        await sleep(150);
+      }
+    } catch (e) {
+      S.err = e && e.message ? e.message : String(e);
+    } finally {
+      if (gen === S.gen) S.backfilling = false;
+      schedule();
+    }
+  }
+
   function recalcTotals() {
     let l = 0, s = 0, n = 0;
-    const cut = Math.floor(Date.now() / 1000) - LOOKBACK_H * 3600;
+    const cut = Math.floor(Date.now() / 1000) - S.winH * 3600;
     for (const r of S.recs) {
       if (r.t < cut) continue;
       const v = Math.abs(r.s) * (S.mult || 0) * r.p;
@@ -184,7 +238,7 @@
     const { lo, hi } = rg;
     const bw = (hi - lo) / BINS;
     const long = new Array(BINS).fill(0), short = new Array(BINS).fill(0);
-    const cut = Math.floor(Date.now() / 1000) - LOOKBACK_H * 3600;
+    const cut = Math.floor(Date.now() / 1000) - S.winH * 3600;
     for (const r of S.recs) {
       if (r.t < cut) continue;
       if (r.p < lo || r.p > hi) continue;
@@ -244,7 +298,7 @@
     parts.push(`<rect x="0" y="0" width="${W_LEFT}" height="${H}" fill="#fafbfc"/>`);
     parts.push(`<line x1="${W_LEFT - 0.5}" y1="0" x2="${W_LEFT - 0.5}" y2="${H}" stroke="#e6e9ee"/>`);
     /* 标题 + 24h 多空总额 */
-    parts.push(`<text x="7" y="17" font-size="13" font-weight="700" fill="#374151">多空清算图 · 近24h</text>`);
+    parts.push(`<text x="7" y="17" font-size="13" font-weight="700" fill="#374151">多空清算图 · ${winText(S.winH)}</text>`);
     parts.push(`<text x="7" y="35" font-size="13" font-weight="700" fill="#0a8f4e">多头爆仓 $${usd(S.totLong)}</text>`);
     parts.push(`<text x="7" y="52" font-size="13" font-weight="700" fill="#d92c2c">空头爆仓 $${usd(S.totShort)}</text>`);
     parts.push(`<line x1="0" y1="60" x2="${W_LEFT}" y2="60" stroke="#e6e9ee"/>`);
@@ -314,6 +368,8 @@
   function init(chart, series, box, chartEl) {
     S.chart = chart; S.series = series; S.box = box; S.chartEl = chartEl;
     S.on = lsGet(LS_ON, true) !== false;
+    const w = +lsGet(LS_WIN, 24);
+    S.winH = (w === 72 || w === 168) ? w : 24;
     if (!S.layer && box) {
       const el = document.createElement('div');
       el.id = 'liqLayer';
@@ -331,16 +387,23 @@
 
   /* 品种切换：contract 为空（如美债）则关闭清算图 */
   async function setInstrument(instId, contract, dec) {
+    S.gen++;                                    // 中止上一个品种正在进行的深度回补
+    S.backfilling = false;
     S.instId = instId; S.contract = contract || ''; S.dec = dec == null ? 2 : dec;
     S.recs = []; S.candles = []; S.err = ''; S.mult = 0;
     S.totLong = 0; S.totShort = 0; S.n = 0;
     S.active = !!contract && S.on;
     if (S.box) S.box.classList.toggle('liq-off', !S.active);
     if (!S.active) { if (S.layer) S.layer.innerHTML = ''; return; }
+    /* 先把本地已累积的历史渲染出来（打开页面即可见，不必等网络），再补齐最近 24h，最后后台深度回补 */
+    const mc = lsGet(LS_MULT, {});                      // 面值先取缓存：否则离线瞬间金额会算成 0
+    S.mult = (contract && mc[contract] > 0) ? mc[contract] : 0;
     S.recs = localRecs(contract);
     recalcTotals();
     schedule();
     await load(LOOKBACK_H);
+    const gen = S.gen;
+    setTimeout(() => { if (gen === S.gen) deepBackfill(); }, 1200);
   }
 
   function setCandles(c) { S.candles = c || []; schedule(); }
@@ -348,7 +411,23 @@
   async function refresh(full) {
     if (!S.active || !S.contract) return;
     await load(full ? LOOKBACK_H : TICK_H);
+    if (full) { const gen = S.gen; setTimeout(() => { if (gen === S.gen) deepBackfill(); }, 300); }
   }
+
+  /* 统计窗口切换：24 / 72 / 168 小时；窗口拉长而本地历史不足时自动补 */
+  function setWindow(h) {
+    const v = (h === 72 || h === 168) ? h : 24;
+    S.winH = v;
+    lsSet(LS_WIN, v);
+    recalcTotals();
+    schedule();
+    if (S.active && S.contract) {
+      const need = Math.floor(Date.now() / 1000) - v * 3600;
+      const oldest = S.recs.length ? S.recs[0].t : 0;
+      if (!oldest || oldest > need) { const gen = S.gen; setTimeout(() => { if (gen === S.gen) deepBackfill(); }, 100); }
+    }
+  }
+  function windowHours() { return S.winH; }
 
   function setEnabled(on) {
     S.on = !!on;
@@ -363,11 +442,14 @@
   function statusLine() {
     if (!S.active) return '';
     if (S.err && !S.recs.length) return '清算图：' + S.err;
-    return `近24h 强平 ${S.n} 笔 · 多头 $${usd(S.totLong)} · 空头 $${usd(S.totShort)}`;
+    const kept = S.recs.length ? Math.round((Math.floor(Date.now() / 1000) - S.recs[0].t) / 3600) : 0;
+    const tail = S.backfilling ? ' · 回补历史中' : (kept > S.winH ? ` · 本地已存 ${kept}h` : '');
+    return `${winText(S.winH)} 强平 ${S.n} 笔 · 多头 $${usd(S.totLong)} · 空头 $${usd(S.totShort)}${tail}`;
   }
 
   window.LiqMap = {
     init, setInstrument, setCandles, render: schedule, refresh, setEnabled, statusLine,
+    setWindow, windowHours,
     isOn: () => S.on, isActive: () => S.active, W_LEFT,
   };
 })();
