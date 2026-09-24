@@ -2,9 +2,10 @@
    验证新增的清算图钩子不破坏启动，且接入点齐全 */
 const fs = require('fs');
 const path = require('path');
-const DIR = path.join(__dirname, 'simtrader');
+const DIR = path.join(__dirname, '..');   /* 仓库内相对路径：simtrader/tests/ → simtrader/ */
 const appSrc = fs.readFileSync(path.join(DIR, 'app.js'), 'utf8');
 const liqSrc = fs.readFileSync(path.join(DIR, 'liq-map.js'), 'utf8');
+const lsSrc = fs.readFileSync(path.join(DIR, 'lsmap.js'), 'utf8');
 const html = fs.readFileSync(path.join(DIR, 'index.html'), 'utf8');
 const css = fs.readFileSync(path.join(DIR, 'style.css'), 'utf8');
 
@@ -12,6 +13,19 @@ let fail = 0;
 const ok = (c, m, x) => { console.log((c ? '  PASS ' : '  FAIL ') + m + (x != null ? ' → ' + x : '')); if (!c) fail++; };
 
 console.log('【接入点静态检查】');
+ok(/lsmap\.js\?v=\d+/.test(html), 'index.html 引入 lsmap.js 且带版本号');
+ok(html.indexOf('liq-map.js') < html.indexOf('lsmap.js') && html.indexOf('lsmap.js') < html.indexOf('app.js?v='), '加载顺序 liq-map → lsmap → app');
+ok(/id="lsChart"/.test(html) && /id="lsCards"/.test(html) && /id="lsMeta"/.test(html), '页面含多空热力图容器/卡片/状态行');
+ok(/data-lsiv="live"/.test(html) && /data-lsiv="5m"/.test(html) && /data-lsiv="15m"/.test(html) && /data-lsiv="1h"/.test(html) && /data-lsiv="4h"/.test(html), '页面含 实时/5m/15m/1h/4h 五个窗口按钮');
+ok(/data-lslayer="real"/.test(html) && /data-lslayer="model"/.test(html) && /data-lslayer="both"/.test(html), '页面含 真实/推算/叠加 三个图层按钮');
+ok(!/heat-matrix|vpChart|vpMeta|heatMatrix/.test(html + css + appSrc), '已无「多品种多周期热力图 / 成交热力图」残留');
+ok(/window\.LsMap\.init\(\$\('#lsChart'\)/.test(appSrc), 'initChart 中初始化多空热力图');
+ok(/window\.LsMap\.setInstrument\(/.test(appSrc), '切换品种时切换多空热力图合约');
+ok(/window\.LsMap\.setIv\(b\.dataset\.lsiv\)/.test(appSrc), '窗口按钮绑定 setIv');
+ok(/window\.LsMap\.setLayer\(b\.dataset\.lslayer\)/.test(appSrc), '图层按钮绑定 setLayer');
+ok(/window\.LsMap\.refresh\(true\)/.test(appSrc) && /window\.LsMap\.refresh\(false\)/.test(appSrc), '全量刷新与定时刷新都已接入');
+ok(/handleScale/.test(appSrc) && /handleScroll/.test(appSrc) && /minBarSpacing/.test(appSrc), 'K线缩放/拖动配置齐全（含最大缩放范围）');
+ok(/bindChartHotkeys/.test(appSrc), 'K线键盘微调已绑定');
 ok(/liq-map\.js\?v=\d+/.test(html), 'index.html 引入 liq-map.js 且带版本号（在 app.js 之前）');
 ok(/id="zoomIn"/.test(html) && /id="zoomOut"/.test(html) && /id="zoomReset"/.test(html), '页面含 K线缩放/复位按钮');
 ok(/data-liqwin="168"/.test(html), '页面含清算图 7 天窗口切换');
@@ -30,15 +44,19 @@ ok(/#chart \{ position: absolute; left: var\(--liqw\)/.test(css), 'CSS：K线容
 const store = {};
 const LS = { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }, removeItem: k => { delete store[k]; } };
 const children = [];
-const el = () => ({
+const el = (depth) => ({
   style: {}, classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
-  addEventListener() {}, appendChild(c) { children.push(c); }, querySelector: () => null, querySelectorAll: () => [],
+  getBoundingClientRect: () => ({ top: 0, left: 0, width: 900, height: 460 }),
+  setPointerCapture() {}, releasePointerCapture() {},
+  querySelector: () => (depth > 0 ? el(depth - 1) : null),
+  addEventListener() {}, appendChild(c) { children.push(c); }, querySelectorAll: () => [],
   setAttribute() {}, getAttribute: () => null, remove() {}, dataset: {},
   textContent: '', innerHTML: '', value: '', clientWidth: 900, clientHeight: 460,
 });
 const doc = {
-  createElement: el, createElementNS: el, getElementById: () => el(),
-  querySelector: () => el(), querySelectorAll: () => [], addEventListener() {}, body: el(), documentElement: el(),
+  hidden: false,
+  createElement: () => el(0), createElementNS: () => el(0), getElementById: () => el(2),
+  querySelector: () => el(3), querySelectorAll: () => [], addEventListener() {}, body: el(0), documentElement: el(0),
 };
 const win = {
   addEventListener() {}, removeEventListener() {}, localStorage: LS,
@@ -62,14 +80,17 @@ function deepProxy() {
 const LWC = { createChart: () => deepProxy() };
 
 console.log('\n【模块加载 + boot 冒烟】');
-new Function('window', 'document', 'localStorage', 'requestAnimationFrame', 'ResizeObserver', 'AbortController', 'fetch', liqSrc)(win, doc, LS, win.requestAnimationFrame, win.ResizeObserver, AbortController, async () => ({ json: async () => [], ok: true }));
+new Function('window', 'document', 'localStorage', 'requestAnimationFrame', 'cancelAnimationFrame', 'ResizeObserver', 'AbortController', 'fetch', liqSrc)(win, doc, LS, win.requestAnimationFrame, () => {}, win.ResizeObserver, AbortController, async () => ({ json: async () => [], ok: true }));
 ok(!!win.LiqMap, 'liq-map.js 挂载 window.LiqMap');
-ok(typeof win.LiqMap.init === 'function' && typeof win.LiqMap.setInstrument === 'function', '对外接口齐全');
+ok(typeof win.LiqMap.init === 'function' && typeof win.LiqMap.setInstrument === 'function', '清算图对外接口齐全');
+new Function('window', 'document', 'localStorage', 'requestAnimationFrame', 'cancelAnimationFrame', 'ResizeObserver', 'AbortController', 'fetch', lsSrc)(win, doc, LS, win.requestAnimationFrame, () => {}, win.ResizeObserver, AbortController, async () => ({ json: async () => [], ok: true }));
+ok(!!win.LsMap, 'lsmap.js 挂载 window.LsMap');
+ok(typeof win.LsMap.init === 'function' && typeof win.LsMap.setIv === 'function' && typeof win.LsMap.setLayer === 'function', '多空热力图对外接口齐全');
 
 let bootErr = null;
 try {
   const factory = new Function('window', 'document', 'localStorage', 'navigator', 'LightweightCharts',
-    'ResizeObserver', 'WebSocket', 'fetch', appSrc + '\nreturn { LiqMapInitOK: typeof window.LiqMap !== "undefined" };');
+    'ResizeObserver', 'WebSocket', 'fetch', appSrc + '\nreturn { ok: typeof window.LiqMap !== "undefined" && typeof window.LsMap !== "undefined" };');
   factory(win, doc, LS, win.navigator, LWC, win.ResizeObserver, function () {}, async () => ({ json: async () => ([]), ok: true }));
 } catch (e) { bootErr = e; }
 ok(!bootErr, 'app.js 加载并完成 boot() 无异常', bootErr ? bootErr.message : 'ok');

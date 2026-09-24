@@ -475,7 +475,10 @@ const SYM_FALLBACK = { XAUUSDT: 'PAXGUSDT' };
 /* Gate.io USDT 永续源（本终端唯一行情源） */
 const GATE_FUT_SOURCE = {
   key: 'gate_perp', name: 'Gate·永续', host: GATE_HOST, kind: 'perp',
-  pingUrl: GATE_HOST + '/api/v4/futures/usdt/time',
+  /* 健康探测地址：必须是带 CORS 头的公开接口。
+     /futures/usdt/time 会返回 400 且不带 Access-Control-Allow-Origin，
+     浏览器端会被 CORS 拦掉、把数据源误判为不可用，故改用合约详情接口 */
+  pingUrl: GATE_HOST + '/api/v4/futures/usdt/contracts/BTC_USDT',
   async klines(sym, tf, limit) {
     const pair = GATE_FUT_PAIR[sym];
     if (!pair) throw new NetError('Gate.io 无此永续合约 ' + sym, 'unsupported');
@@ -661,27 +664,6 @@ function initDataSourceCtl() {
   document.addEventListener('click', (e) => { if (!ctl.contains(e.target)) ctl.classList.remove('open'); });
   renderDataSource();
 }
-/* 真实逐笔成交（aggTrades）：用于「当下」成交分布口径。
-   从最新一笔开始向前翻页（首屏不带参数 = 最新 1000 笔），
-   直到覆盖满时间窗口或达到页数上限——这样即使窗口内成交笔数极多，
-   也优先保证「最近」的成交数据完整，不会漏掉当下最新的成交。 */
-const AGG_PAGE_LIMIT = 8;      // 单次最多 8 页 × 1000 笔
-async function fetchAggTrades(symbol, minutes) {
-  const cut = Date.now() - minutes * 60000;
-  let all = [], endTime = null;
-  for (let page = 0; page < AGG_PAGE_LIMIT; page++) {
-    let batch;
-    try { batch = await srcFetch('kline', '逐笔成交', s => callSym((x, opt) => s.aggTrades(x, opt), symbol, { limit: 1000, endTime: endTime })); }
-    catch (e) { break; }
-    if (!Array.isArray(batch) || !batch.length) break;
-    all = batch.concat(all);
-    const first = batch[0];
-    if (+first.T <= cut) break;          // 已覆盖到窗口起点
-    endTime = +first.T - 1;              // 否则继续向前翻
-  }
-  return all.filter(t => +t.T >= cut);
-}
-
 /* ---------- 多平台实时比价 ----------
    同一品种并行取 Gate.io 永续（主源）/ OKX / Coinbase / Bitstamp 的实时价。
    主源只有一个：Gate.io USDT 永续；其余平台直连公开 REST，仅作比价参考。
@@ -876,8 +858,6 @@ const state = {
   prevPrices: {},
   dayChange: {},       // 24h 涨跌幅
   signals: {},         // tf -> signal
-  heat: null,          // 涨跌热力矩阵数据
-  flow: {},            // 品种 -> { trades:[], ts, min } 当下真实逐笔成交（成交热力图口径）
   venueQuotes: {},     // 品种 -> { gate:{px,open24h}, okx:{...}, ... } 多平台实时比价
   venueTs: {},         // 品种 -> 比价缓存时间戳
   tfCandles: null,     // { _inst, 15m:[], 30m:[], 1h:[], 4h:[] } 各周期真实K线
@@ -1077,7 +1057,13 @@ function initChart() {
     layout: { background: { type: 'solid', color: '#ffffff' }, textColor: '#4b5563', fontSize: 15 },
     grid: { vertLines: { color: '#f0f2f5' }, horzLines: { color: '#f0f2f5' } },
     rightPriceScale: { borderColor: '#e3e8ef' },
-    timeScale: { borderColor: '#e3e8ef', timeVisible: true, secondsVisible: false },
+    /* 时间轴：放大/缩小都留足余量，方便看清局部细节或整体走势 */
+    timeScale: {
+      borderColor: '#e3e8ef', timeVisible: true, secondsVisible: false,
+      minBarSpacing: 0.2, maxBarSpacing: 60,      // 最大可缩放范围（0.2 看全局 / 60 看单根）
+      rightOffset: 3,
+      lockVisibleTimeRangeOnResize: true,          // 窗口尺寸变化不重置缩放
+    },
     crosshair: { mode: 0 },
     watermark: { visible: false },     // 视觉去噪：隐藏图表库水印
     /* 交互：滚轮缩放（上下滚动）、按住拖动平移、双指/价格轴拖动缩放 */
@@ -1127,6 +1113,32 @@ function initChart() {
       });
     });
   }
+  /* 多空热力图：初始化 + 周期按钮（5m/15m/1h/4h/实时）+ 图层按钮（真实/推算/叠加） */
+  if (window.LsMap) {
+    window.LsMap.init($('#lsChart'), $('#lsCards'), $('#lsMeta'));
+    const ivBox = $('#lsIv');
+    if (ivBox) {
+      ivBox.querySelectorAll('[data-lsiv]').forEach(b => {
+        b.classList.toggle('active', b.dataset.lsiv === window.LsMap.interval());
+        b.addEventListener('click', () => {
+          ivBox.querySelectorAll('[data-lsiv]').forEach(x => x.classList.toggle('active', x === b));
+          window.LsMap.setIv(b.dataset.lsiv);
+        });
+      });
+    }
+    const lyBox = $('#lsLayer');
+    if (lyBox) {
+      lyBox.querySelectorAll('[data-lslayer]').forEach(b => {
+        b.classList.toggle('active', b.dataset.lslayer === window.LsMap.layer());
+        b.addEventListener('click', () => {
+          lyBox.querySelectorAll('[data-lslayer]').forEach(x => x.classList.toggle('active', x === b));
+          window.LsMap.setLayer(b.dataset.lslayer);
+        });
+      });
+    }
+    const rBtn = $('#lsReset');
+    if (rBtn) rBtn.addEventListener('click', () => window.LsMap.resetView());
+  }
 }
 
 /* 以当前视图中心为锚点缩放（factor < 1 放大，> 1 缩小） */
@@ -1143,6 +1155,28 @@ function zoomChart(factor) {
 function resetChartZoom() {
   if (!state.chart) return;
   try { state.chart.timeScale().fitContent(); } catch (e) {}
+}
+/* 键盘微调：↑↓ 放大/缩小、←→ 左右平移（输入框内不接管），配合滚轮与拖动一起用 */
+function bindChartHotkeys() {
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target, tag = t && t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+    const mm = document.getElementById('modalMask');
+    if (mm && mm.classList.contains('show')) return;
+    if (!state.chart) return;
+    if (e.key === 'ArrowUp') { e.preventDefault(); zoomChart(1 / 1.25); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); zoomChart(1.25); }
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      const ts = state.chart.timeScale();
+      let lr = null;
+      try { lr = ts.getVisibleLogicalRange(); } catch (err) {}
+      if (!lr) return;
+      e.preventDefault();
+      const span = lr.to - lr.from, step = span * 0.12 * (e.key === 'ArrowLeft' ? -1 : 1);
+      try { ts.setVisibleLogicalRange({ from: lr.from + step, to: lr.to + step }); } catch (err) {}
+    }
+  });
 }
 async function loadChart(force) {
   const inst = instOf(state.current);
@@ -2096,8 +2130,6 @@ async function runBacktest() {
   }
 }
 
-/* ---------- 热力图：多品种多周期 ---------- */
-const BARS_24H = { '15m': 96, '30m': 48, '1h': 24, '4h': 6 };
 const TF_CACHE_TTL = 60000;
 
 async function ensureCandles(inst, tf, force) {
@@ -2127,142 +2159,6 @@ async function ensureCandles(inst, tf, force) {
     throw e;
   }
 }
-function chgPct(candles, bars) {
-  if (!candles || candles.length < bars + 1) return null;
-  const a = candles[candles.length - 1 - bars].close, b = candles[candles.length - 1].close;
-  if (!a) return null;
-  return (b / a - 1) * 100;
-}
-function heatStyle(v) {
-  if (v == null || isNaN(v)) return { bg: '#f8fafc', color: '#9ca3af', text: '—' };
-  const a = Math.min(Math.abs(v) / 3, 1), alpha = 0.14 + a * 0.86;
-  /* 涨绿跌红：v>0 用绿系，v<0 用红系 */
-  if (v > 0) return { bg: `rgba(10,143,78,${alpha.toFixed(2)})`, color: alpha > 0.55 ? '#fff' : '#075e37', text: '+' + v.toFixed(2) + '%' };
-  if (v < 0) return { bg: `rgba(217,44,44,${alpha.toFixed(2)})`, color: alpha > 0.55 ? '#fff' : '#8c1d1d', text: v.toFixed(2) + '%' };
-  return { bg: '#f1f3f6', color: '#6b7280', text: '0.00%' };
-}
-async function renderHeatmap(force) {
-  $('#heatNote').textContent = '热力图计算中…';
-  const out = {};
-  await Promise.all(INSTRUMENTS.map(async inst => {
-    const row = {};
-    try {
-      if (inst.type === 'ust') {
-        const c = await ensureCandles(inst, '1h', !!force);
-        const v = chgPct(c, 1);
-        TFS.forEach(tf => row[tf] = v); row.h24 = v; row.daily = true;
-      } else {
-        await Promise.all(TFS.map(async tf => {
-          try { const c = await ensureCandles(inst, tf, !!force); row[tf] = chgPct(c, BARS_24H[tf]); }
-          catch (e) { row[tf] = null; }
-        }));
-        row.h24 = state.dayChange[inst.id] != null ? state.dayChange[inst.id] : null;
-      }
-    } catch (e) { TFS.forEach(tf => row[tf] = null); }
-    out[inst.id] = row;
-  }));
-  state.heat = out;
-  paintHeatmap();
-}
-function paintHeatmap() {
-  const box = $('#heatMatrix'); if (!box || !state.heat) return;
-  let html = '<div class="hm-hcell"></div>' + TFS.map(tf => `<div class="hm-hcell">${TF_NAME[tf]}</div>`).join('') + '<div class="hm-hcell">24小时</div>';
-  INSTRUMENTS.forEach(inst => {
-    const row = state.heat[inst.id] || {};
-    html += `<div class="hm-name" data-id="${inst.id}"><b>${inst.short}</b><span class="tag">${inst.type === 'ust' ? '收益率' : inst.type === 'gold' ? '黄金' : '币'}</span></div>`;
-    [...TFS, 'h24'].forEach(col => {
-      const v = row[col], st = heatStyle(v);
-      html += `<div class="hm-cell ${v == null ? 'dim' : ''}" title="${inst.name} · ${col === 'h24' ? '24小时' : TF_NAME[col]}：${st.text}"
-        style="background:${st.bg};color:${st.color}">${st.text}</div>`;
-    });
-  });
-  box.innerHTML = html;
-  box.querySelectorAll('.hm-name').forEach(el => el.addEventListener('click', () => selectInstrument(el.dataset.id)));
-  $('#heatNote').textContent = `共 ${INSTRUMENTS.length} 个品种 × 5 个周期 · 颜色越深幅度越大（±3% 满色）· 美债为日频数据（四周期显示同一日涨跌）· 更新于 ${ts(Date.now())}`;
-}
-
-/* ---------- 成交量价分布热力图 + 交易区间 ---------- */
-function volumeProfile(candles, bins = 26) {
-  if (!candles || candles.length < 20) return null;
-  let hi = -Infinity, lo = Infinity;
-  candles.forEach(c => { hi = Math.max(hi, c.high); lo = Math.min(lo, c.low); });
-  if (!(hi > lo)) return null;
-  const step = (hi - lo) / bins;
-  const arr = new Array(bins).fill(0);
-  candles.forEach(c => {
-    const w = c.volume > 0 ? c.volume : 1;
-    let i0 = Math.floor((c.low - lo) / step), i1 = Math.floor((c.high - lo) / step);
-    i0 = Math.max(0, Math.min(bins - 1, i0)); i1 = Math.max(0, Math.min(bins - 1, i1));
-    const n = i1 - i0 + 1;
-    for (let i = i0; i <= i1; i++) arr[i] += w / n;
-  });
-  const total = arr.reduce((a, b) => a + b, 0) || 1;
-  const max = Math.max(...arr);
-  const poc = arr.indexOf(max);
-  let loI = poc, hiI = poc, acc = arr[poc];
-  while (acc < total * 0.7 && (loI > 0 || hiI < bins - 1)) {
-    const l = loI > 0 ? arr[loI - 1] : -1, r = hiI < bins - 1 ? arr[hiI + 1] : -1;
-    if (r >= l) { hiI++; acc += Math.max(r, 0); } else { loI--; acc += Math.max(l, 0); }
-  }
-  return { arr, total, max, poc, vaLo: loI, vaHi: hiI, step, lo, hi };
-}
-/* ---------- 「当下」成交热力图口径：真实逐笔成交 ---------- */
-function fmtVol(v) {
-  if (!isFinite(v)) return '—';
-  const a = Math.abs(v);
-  if (a >= 1e9) return (v / 1e9).toFixed(2) + 'B';
-  if (a >= 1e6) return (v / 1e6).toFixed(2) + 'M';
-  if (a >= 1e4) return (v / 1e4).toFixed(2) + '万';
-  if (a >= 1) return v.toFixed(2);
-  return v.toPrecision(3);
-}
-/* 按真实逐笔成交（aggTrades）分价格档累计成交量：
-   只统计最近 N 分钟的成交，反映「当下」的成交密集价位，而非长周期历史。 */
-function volumeProfileFromTrades(trades, bins = 26) {
-  if (!trades || trades.length < 20) return null;
-  let hi = -Infinity, lo = Infinity, total = 0, amount = 0, buy = 0, sell = 0;
-  for (const t of trades) {
-    const p = +t.p, q = +t.q;
-    if (!(p > 0) || !(q >= 0)) continue;
-    if (p > hi) hi = p;
-    if (p < lo) lo = p;
-    total += q; amount += p * q;
-    if (t.m) sell += q; else buy += q;    // m=true → 主动卖出成交
-  }
-  if (!isFinite(hi) || !(hi > lo) || !(total > 0)) return null;
-
-  const step = (hi - lo) / bins;
-  const arr = new Array(bins).fill(0);
-  for (const t of trades) {
-    const p = +t.p, q = +t.q;
-    if (!(p > 0) || !(q >= 0)) continue;
-    const i = Math.max(0, Math.min(bins - 1, Math.floor((p - lo) / step)));
-    arr[i] += q;
-  }
-  const tot = arr.reduce((a, b) => a + b, 0) || 1;
-  const max = Math.max(...arr);
-  const poc = arr.indexOf(max);
-  let loI = poc, hiI = poc, acc = arr[poc];
-  while (acc < tot * 0.7 && (loI > 0 || hiI < bins - 1)) {
-    const l = loI > 0 ? arr[loI - 1] : -1, r = hiI < bins - 1 ? arr[hiI + 1] : -1;
-    if (r >= l) { hiI++; acc += Math.max(r, 0); } else { loI--; acc += Math.max(l, 0); }
-  }
-  return {
-    arr, total: tot, max, poc, vaLo: loI, vaHi: hiI, step, lo, hi,
-    count: trades.length, amount, buy, sell, realtime: true,
-  };
-}
-/* 实时逐笔成交缓存（默认 12 秒），避免每次刷新都打接口 */
-const FLOW_MIN = 15, FLOW_TTL = 12000;
-async function ensureFlow(inst, force) {
-  const c = state.flow[inst.id];
-  if (!force && c && Date.now() - c.ts < FLOW_TTL) return c;
-  const trades = await fetchAggTrades(inst.sym, FLOW_MIN);
-  const rec = { trades, ts: Date.now(), min: FLOW_MIN };
-  state.flow[inst.id] = rec;
-  return rec;
-}
-
 function atr(candles, p = 14) {
   if (candles.length < p + 1) return null;
   const trs = [];
@@ -2855,76 +2751,6 @@ function applyTpSlPlan(tf) {
   toast(`已填入 ${TF_NAME[tf]} 方案：${isLong ? '买入/开多' : '卖出/开空'} 限价 ${fmt(price, inst.dec)} · 数量 ${qty} ${inst.short} · 参考止损 ${fmt(side.stop, inst.dec)} · 止盈一 ${fmt(side.tp1, inst.dec)}（需点「${isLong ? '买入 / 开多' : '卖出 / 开空'}」并二次确认；本操作只填参数，不会创建止盈/止损委托单）`);
 }
 
-function renderVolumeProfile(candles, flow) {
-  const inst = instOf(state.current);
-  const vpBox = $('#vpChart'), rcBox = $('#rangeCards'), meta = $('#vpMeta');
-  /* 成交口径：优先「当下」真实逐笔成交（近 FLOW_MIN 分钟），
-     该品种无逐笔数据（如美债）时降级到当前周期K线口径 */
-  const flowRec = flow || state.flow[inst.id];
-  const rvp = (flowRec && flowRec.trades && flowRec.trades.length) ? volumeProfileFromTrades(flowRec.trades) : null;
-  const vp = rvp || volumeProfile(candles);
-  if (!vp) { vpBox.innerHTML = '<div class="empty">数据不足，无法绘制价量分布</div>'; rcBox.innerHTML = ''; meta.textContent = ''; return; }
-  const dec = inst.type === 'ust' ? 3 : inst.dec;
-  const priceOf = i => (vp.lo + (i + 0.5) * vp.step);
-  const nowP = lastPrice(inst.id) ?? candles[candles.length - 1].close;
-  const nowBin = Math.max(0, Math.min(vp.arr.length - 1, Math.floor((nowP - vp.lo) / vp.step)));
-
-  let html = '';
-  for (let i = vp.arr.length - 1; i >= 0; i--) {
-    const v = vp.arr[i], ratio = v / vp.max;
-    const alpha = (0.12 + ratio * 0.88).toFixed(2);
-    const isPoc = i === vp.poc, inVA = i >= vp.vaLo && i <= vp.vaHi;
-    html += `<div class="vp-row ${isPoc ? 'poc' : ''} ${inVA ? 'va' : ''}">
-      <div class="vp-price">${fmt(priceOf(i), dec)}${isPoc ? ' POC' : ''}</div>
-      <div class="vp-bar-wrap"><div class="vp-bar" style="width:${(ratio * 100).toFixed(1)}%;background:rgba(67,56,202,${alpha})"></div></div>
-      <div class="vp-pct">${(v / vp.total * 100).toFixed(1)}%</div>
-    </div>`;
-    if (i === nowBin) html += `<div class="vp-now"><div class="lbl">现价 ${fmt(nowP, dec)}</div><div class="line"></div><div></div></div>`;
-  }
-  vpBox.innerHTML = html;
-  if (rvp) {
-    const mins = flowRec.min || FLOW_MIN;
-    const age = Math.max(0, Math.round((Date.now() - flowRec.ts) / 1000));
-    const buyPct = rvp.total > 0 ? (rvp.buy / rvp.total * 100) : 50;
-    /* 取数有页数上限：成交极活跃时会优先保留最新成交，此时实际覆盖时长会短于窗口 */
-    let minT = Infinity, maxT = -Infinity;
-    for (const t of flowRec.trades) { const v = +t.T; if (v < minT) minT = v; if (v > maxT) maxT = v; }
-    const spanMin = isFinite(minT) && isFinite(maxT) ? (maxT - minT) / 60000 : 0;
-    const spanTxt = (spanMin > 0 && spanMin < mins - 1)
-      ? `（成交活跃，实际覆盖最近 ${spanMin.toFixed(1)} 分钟，已取满 ${AGG_PAGE_LIMIT}000 笔并优先保留最新）` : '';
-    meta.textContent = `当下成交口径 · 近 ${mins} 分钟真实逐笔 ${rvp.count} 笔${spanTxt} · 共 ${fmtVol(rvp.total)} · 主动买 ${buyPct.toFixed(0)}% / 主动卖 ${(100 - buyPct).toFixed(0)}% · 更新于 ${ts(flowRec.ts)}（${age}s 前）`;
-  } else {
-    const hasVol = candles.some(c => c.volume > 0);
-    meta.textContent = `降级口径：${TF_NAME[state.tf]} · 近 ${candles.length} 根K线 · ${hasVol ? '按成交量加权' : '按价格停留时间加权'}（该品种无逐笔成交数据）`;
-  }
-  if (meta.classList) meta.classList.toggle('rt', !!rvp);
-
-  const last20 = candles.slice(-20), last60 = candles.slice(-60);
-  const rLow = Math.min(...last20.map(c => c.low)), rHigh = Math.max(...last20.map(c => c.high));
-  const a = atr(candles) || (rHigh - rLow) / 10;
-  const mid = last60.reduce((s, c) => s + c.close, 0) / last60.length;
-  const support = Math.max(rLow, mid - a);
-  const resist = Math.min(rHigh, mid + a);
-  const posInRange = resist > support ? ((nowP - support) / (resist - support)) * 100 : 50;
-  const pocPrice = priceOf(vp.poc);
-  const sig = state.signals[state.tf];
-  let bias, biasColor;
-  if (nowP > pocPrice && sig && sig.score > 0.15) { bias = '偏多（站上成交密集区）'; biasColor = 'var(--up)'; }
-  else if (nowP < pocPrice && sig && sig.score < -0.15) { bias = '偏空（跌破成交密集区）'; biasColor = 'var(--down)'; }
-  else if (nowP > pocPrice) { bias = '偏多震荡（密集区上方）'; biasColor = 'var(--up)'; }
-  else if (nowP < pocPrice) { bias = '偏空震荡（密集区下方）'; biasColor = 'var(--down)'; }
-  else { bias = '区间内震荡'; biasColor = 'var(--muted)'; }
-  rcBox.innerHTML = `
-    <div class="rc"><div class="k">短线支撑位</div><div class="v" style="color:var(--down)">${fmt(support, dec)}<small> ${TF_NAME[state.tf]}K线 · 近20根低点/ATR</small></div></div>
-    <div class="rc"><div class="k">短线压力位</div><div class="v" style="color:var(--up)">${fmt(resist, dec)}<small> ${TF_NAME[state.tf]}K线 · 近20根高点/ATR</small></div></div>
-    <div class="rc"><div class="k">交易区间宽度</div><div class="v">${fmt(resist - support, dec)}<small> ${support > 0 ? ((resist - support) / support * 100).toFixed(2) + '%' : ''}</small></div></div>
-    <div class="rc"><div class="k">ATR(14) 波动</div><div class="v">${fmt(a, dec)}<small> ${(a / nowP * 100).toFixed(2)}%</small></div></div>
-    <div class="rc"><div class="k">成交密集价 POC</div><div class="v" style="color:#4338ca">${fmt(pocPrice, dec)}<small> ${rvp ? `当下磁吸位 · 近${flowRec.min || FLOW_MIN}分钟` : '磁吸位 · K线口径'}</small></div></div>
-    <div class="rc"><div class="k">价值区间 VA70</div><div class="v" style="font-size:13px">${fmt(priceOf(vp.vaLo), dec)} ~ ${fmt(priceOf(vp.vaHi), dec)}<small> ${rvp ? '当下70%成交量所在' : 'K线口径'}</small></div></div>
-    <div class="rc"><div class="k">现价在区间内位置</div><div class="v">${posInRange.toFixed(0)}%<small> 0=支撑 100=压力</small></div></div>
-    <div class="rc"><div class="k">方向偏向</div><div class="v" style="font-size:13px;color:${biasColor}">${bias}</div></div>`;
-}
-
 /* ---------- 事件与启动 ---------- */
 function selectInstrument(id) {
   state.current = id;
@@ -2936,6 +2762,13 @@ function selectInstrument(id) {
   if (state.orderType === 'limit') { const p = lastPrice(id); $('#orderPrice').value = p == null ? '' : +p.toFixed(instOf(id).dec); }
   /* 切换品种时同步切换清算图（美债等无永续合约的品种 → 自动关闭） */
   if (window.LiqMap) window.LiqMap.setInstrument(id, GATE_FUT_PAIR[instOf(id).sym] || '', instOf(id).dec);
+  /* 多空热力图：换成该品种的永续合约；无永续合约（如美债）时清空并提示 */
+  if (window.LsMap) {
+    const inst = instOf(id);
+    const contract = inst.sym ? (GATE_FUT_PAIR[inst.sym] || '') : '';
+    window.LsMap.setInstrument(contract ? { id: inst.id, contract, dec: inst.dec } : null);
+    const t = $('#lsSym'); if (t) t.textContent = contract ? `${inst.short} · ${contract}` : `${inst.short} · 无永续合约`;
+  }
   loadChart();
   updatePricePanel();
   refreshVenues(true);       // 切换品种后立即拉取该品种的多平台比价
@@ -2999,7 +2832,7 @@ function boot() {
   });
   selectInstrument('BTC');
   pollPrices();
-  renderHeatmap();
+  bindChartHotkeys();                   // K线键盘微调（↑↓缩放 / ←→平移）
   connectTradeStream();                 // 逐笔实时成交推送（限价单撮合的实时数据源）
   startTickLoops();
   setInterval(pollPrices, 5000);        // 行情/24h涨跌/美债轮询兜底（含撮合与强平检查）——固定 5s，不随档位变慢
@@ -3044,28 +2877,21 @@ function paintLiqStat() {
   el.style.display = t ? '' : 'none';
 }
 
-async function refreshVolumeProfile(useCacheCandles, forceFlow) {
-  try {
-    const inst = instOf(state.current);
-    let flow = null;
-    if (inst.sym) { try { flow = await ensureFlow(inst, !!forceFlow); } catch (e) { flow = null; } }
-    let c = useCacheCandles ? state.candles[state.current + '_' + state.tf] : null;
-    if (!c || !c.length) c = await ensureCandles(inst, state.tf, !!forceFlow);
-    renderVolumeProfile(c, flow);
-  } catch (e) {}
-}
 
 /* ================= 右上角刷新控件 =================
    档位只影响「行情/分析数据」刷新节奏；实时价格与撮合强平仍为 5s，不受档位影响。 */
 
-/* 全量刷新：K线 + 四周期信号 + 止盈止损 + 涨跌热力矩阵 + 成交热力图 */
+/* 全量刷新：K线 + 四周期信号 + 止盈止损 + 多空热力图 + 左侧清算图 */
 async function refreshAll(manual) {
   const ico = $('#btnRefresh');
   if (ico) ico.classList.add('spin');
   try {
-    await Promise.all([loadChart(true), renderHeatmap(true)]);
-    await refreshVolumeProfile(true, true);
-    await Promise.all([pollPrices(), refreshVenues(true), window.LiqMap ? window.LiqMap.refresh(true) : Promise.resolve()]);
+    await loadChart(true);
+    await Promise.all([
+      pollPrices(), refreshVenues(true),
+      window.LiqMap ? window.LiqMap.refresh(true) : Promise.resolve(),
+      window.LsMap ? window.LsMap.refresh(true) : Promise.resolve(),
+    ]);
   } catch (e) {
     if (manual) toast('刷新失败：' + e.message);
   } finally {
@@ -3079,11 +2905,9 @@ function scheduleRefresh() {
   (state.refreshTimers || []).forEach(t => clearInterval(t));
   state.refreshTimers = [];
   const lv = rfLevel();
-  // 信号 + 涨跌热力矩阵（含止盈止损区间重算）
-  state.refreshTimers.push(setInterval(() => { runSignals(null, true); renderHeatmap(); }, lv.sigMs));
-  // 成交热力图（当下逐笔口径）
-  state.refreshTimers.push(setInterval(() => refreshVolumeProfile(false, true), lv.flowMs));
-  state.nextRefreshAt = Date.now() + lv.flowMs;   // 以较快的那个为准做倒计时
+  // 信号 + 多空热力图（含止盈止损区间重算）
+  state.refreshTimers.push(setInterval(() => { runSignals(null, true); if (window.LsMap) window.LsMap.refresh(false); }, lv.sigMs));
+  state.nextRefreshAt = Date.now() + lv.sigMs;   // 以较快的那个为准做倒计时
   renderRefreshCtl();
 }
 

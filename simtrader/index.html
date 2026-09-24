@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260923g">
+<link rel="stylesheet" href="style.css?v=20260924a">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -33,10 +33,10 @@
         <span class="rf-ico" id="rfIco">⟳</span><span>刷新</span>
       </button>
       <div class="rf-seg" id="rfSeg">
-        <button data-rf="realtime" class="active" title="K线/信号/涨跌矩阵 每 60 秒 · 成交热力图 每 15 秒">实时</button>
-        <button data-rf="m5" title="K线/信号/涨跌矩阵 每 5 分钟 · 成交热力图 每 5 分钟">5分钟</button>
-        <button data-rf="m10" title="K线/信号/涨跌矩阵 每 10 分钟 · 成交热力图 每 10 分钟">10分钟</button>
-        <button data-rf="m30" title="K线/信号/涨跌矩阵 每 30 分钟 · 成交热力图 每 30 分钟">30分钟</button>
+        <button data-rf="realtime" class="active" title="K线/信号/多空热力图 每 60 秒（多空热力图窗口为「实时」时每 10 秒）">实时</button>
+        <button data-rf="m5" title="K线/信号/多空热力图 每 5 分钟">5分钟</button>
+        <button data-rf="m10" title="K线/信号/多空热力图 每 10 分钟">10分钟</button>
+        <button data-rf="m30" title="K线/信号/多空热力图 每 30 分钟">30分钟</button>
       </div>
       <span class="rf-cd" id="rfCountdown">—</span>
     </div>
@@ -168,33 +168,40 @@
   </aside>
 </main>
 
-<!-- 热力图区：方向判断与交易区间 -->
+<!-- 热力图区：多空分布与交易区间 -->
 <section class="heat-wrap">
   <div class="heat-grid">
-    <section class="panel heat-panel">
+    <section class="panel ls-panel">
       <div class="heat-head">
-        <h3>多品种 · 多周期实时热力图</h3>
-        <div class="heat-legend">
-          <span class="lg-txt">跌</span>
-          <span class="lg lg-dn3"></span><span class="lg lg-dn1"></span>
-          <span class="lg lg-0"></span>
-          <span class="lg lg-up1"></span><span class="lg lg-up3"></span>
-          <span class="lg-txt">涨</span>
-          <span class="heat-tip">左侧四列=该周期最近一根K线涨跌 · 最右列=近24小时涨跌</span>
+        <h3>多空热力图 · <span id="lsSym">—</span></h3>
+        <div class="ls-ctrl">
+          <span class="liq-tag">窗口</span>
+          <span class="ls-seg" id="lsIv">
+            <button data-lsiv="live" title="滚动最近 60 秒的真实强平，每 10 秒刷新">实时</button>
+            <button data-lsiv="5m">5m</button>
+            <button data-lsiv="15m">15m</button>
+            <button data-lsiv="1h">1h</button>
+            <button data-lsiv="4h">4h</button>
+          </span>
+          <span class="liq-tag">图层</span>
+          <span class="ls-seg" id="lsLayer">
+            <button data-lslayer="real" title="只用 Gate 平台真实发生的强平订单">真实爆仓</button>
+            <button data-lslayer="model" title="按杠杆档位与未平仓量推算的潜在强平密集区（估算）">潜在推算</button>
+            <button data-lslayer="both" title="真实 + 推算叠加显示">叠加</button>
+          </span>
+          <button id="lsReset" class="liq-sw" title="恢复自动价格范围（也可在图上双击）">复位视图</button>
         </div>
       </div>
-      <div class="heat-matrix" id="heatMatrix"></div>
-      <div class="heat-note" id="heatNote">加载中…</div>
-    </section>
-
-    <section class="panel vp-panel">
-      <div class="heat-head">
-        <h3>成交热力图 · 当下真实逐笔（近 15 分钟）</h3>
-        <span class="heat-tip" id="vpMeta"></span>
+      <div class="ls-body">
+        <div class="ls-chart" id="lsChart"></div>
+        <div class="range-cards" id="lsCards"></div>
       </div>
-      <div class="vp-body">
-        <div class="vp-chart" id="vpChart"></div>
-        <div class="range-cards" id="rangeCards"></div>
+      <div class="heat-tip ls-meta" id="lsMeta">加载中…</div>
+      <div class="ls-legend">
+        <span><i class="ls-dot" style="background:#0a8f4e"></i>多头被强平（条向左）</span>
+        <span><i class="ls-dot" style="background:#d92c2c"></i>空头被强平（条向右）</span>
+        <span><i class="ls-dot" style="background:#2563eb"></i>现价</span>
+        <span>实心柱 = 真实爆仓成交价 · 半透明柱 = 按杠杆档推算的潜在强平区（其金额是按未平仓量折算的理论规模，与真实爆仓金额不同量级，只看价位分布）</span>
       </div>
     </section>
   </div>
@@ -260,11 +267,11 @@
       </ul>
       <h4>数据刷新（页面右上角刷新控件）</h4>
       <ul>
-        <li><b>立即刷新</b>：点击按钮或按 <b>R</b> 键，强制重新拉取 K线、四周期信号、涨跌热力矩阵、成交热力图与实时价格。</li>
+        <li><b>立即刷新</b>：点击按钮或按 <b>R</b> 键，强制重新拉取 K线、四周期信号、多空热力图、左侧清算图与实时价格。</li>
         <li><b>刷新档位</b>：实时 / 5分钟 / 10分钟 / 30分钟，选择后会记住（下次打开沿用），右侧显示到下次自动刷新的倒计时。</li>
-        <li>档位只作用于<b>行情与分析数据</b>（K线、信号、止盈止损区间、两张热力图）。</li>
+        <li>档位只作用于<b>行情与分析数据</b>（K线、信号、止盈止损区间、多空热力图、左侧清算图）。</li>
         <li><b>实时价格与挂单撮合、强平检查固定为 5 秒</b>，不随档位变慢 —— 否则限价单触发与风控会失效。</li>
-        <li>各档位的实际节奏：实时 = 信号/矩阵 60 秒、成交热力图 15 秒；5 / 10 / 30 分钟 = 两者同为 5 / 10 / 30 分钟。</li>
+        <li>各档位的实际节奏：实时 = 信号与多空热力图 60 秒（多空热力图窗口选「实时」时自身每 10 秒刷新一次，不受档位影响）；5 / 10 / 30 分钟 = 同为 5 / 10 / 30 分钟。</li>
       </ul>
       <h4>信号模型（多因子打分，-1 ~ +1）</h4>
       <ul>
@@ -274,13 +281,23 @@
         <li>波动通道（权重15%）：布林带(20,2) %B 位置，触及上下轨提示回归</li>
         <li>综合分 ≥0.5 强烈买入 · 0.2~0.5 买入 · -0.2~0.2 观望 · -0.5~-0.2 卖出 · ≤-0.5 强烈卖出</li>
       </ul>
-      <h4>热力图（方向与交易区间判断）</h4>
+      <h4>多空热力图（原成交热力图已替换）</h4>
       <ul>
-        <li>多品种多周期热力图：每个品种在 15m/30m/1h/4h 四列显示<b>该周期最近一根K线</b>的涨跌，最右列显示<b>近 24 小时</b>涨跌，绿涨红跌，颜色深浅=幅度大小（±3% 以上满色）</li>
-        <li><b>成交热力图（当下逐笔口径）</b>：直接取该品种<b>最近 15 分钟的真实逐笔成交</b>（Gate.io 永续成交流），按成交价分档累计成交量后再堆积成柱。颜色越亮=当下该价位成交越密集；<b>POC</b>=当下成交最密集价（价格磁吸位），<b>VA70</b>=覆盖当下 70% 成交量的价值区间。每 15 秒自动重取一次，并显示笔数、总量与主动买/卖占比</li>
-        <li><b>取数规则</b>：从<b>最新一笔成交向前回溯</b>，最多翻 8 页×1000 笔；成交极活跃（如 BTC）时优先保证最新成交完整，并在标题栏标注实际覆盖时长。逐笔不足 20 笔时自动降级</li>
-        <li>口径说明：成交热力图<b>不再是长周期K线统计</b>，只反映「现在」在哪成交得最多；美债无逐笔成交数据，自动降级为日线K线口径并在标题栏标注</li>
-        <li>交易区间卡片：结合 近20根高低点 / ATR(14) / 布林带 推导支撑位与压力位，并用「现价 vs 当下POC」判断方向偏向</li>
+        <li><b>看什么</b>：按价格分档画出的多空分布图 —— <b>横条向左 = 多头被强平</b>（强平单卖出成交，形成下杀压力），<b>横条向右 = 空头被强平</b>（强平单买入成交，形成上冲压力）；条越长=该价位累计爆仓名义金额越大，中间虚线是多空分界</li>
+        <li><b>数据来源（Gate.io USDT 永续公开接口）</b>：<code>/futures/usdt/liq_orders</code> 真实强平订单（按小时切片并发回溯，接口单次窗口上限 1 小时）；<code>/futures/usdt/contract_stats</code> 多空指标；<code>/futures/usdt/contracts/&#123;合约&#125;</code> 最新价/标记价/24h 高低/资金费率。<b>金额 = |张数| × 合约面值 × 成交价</b>（名义 USDT）</li>
+        <li><b>窗口切换</b>：实时（滚动最近 60 秒，每 10 秒刷新）/ 5m / 15m / 1h / 4h —— 切换的是「统计多长时间内的强平」，右侧卡片同步切到对应周期的多空比。<b>默认 1 小时</b>（5 分钟窗口里真实强平常常只有 0~2 笔，1 小时更有信息量）</li>
+        <li><b>两个图层</b>：<b>真实爆仓</b>（实心柱）= 窗口内真实发生的强平成交价分布；<b>潜在推算</b>（半透明描边柱）= 以标记价为锚，按 10/20/25/50/75/100 倍杠杆档 + 当前未平仓量推算的潜在强平密集区（与主流清算热力图同原理，<b>假设多空各占一半持仓，属于估算、不是真实爆仓</b>）；窗口内没有真实强平时自动显示推算层，避免面板空白</li>
+        <li><b>标注线</b>：真实爆仓最密价位（虚线 + 金额）、潜在强平区、24h 最高/最低、现价；标签按位置自动下推避免压字</li>
+        <li><b>右侧卡片</b>：账户多空比、大户持仓多空比、主动买卖比、窗口内多空爆仓额、未平仓合约、资金费率、现价/标记价、24h 高低，以及综合多空力量评分（账户比 30% + 大户比 30% + 主动买卖 20% + 本窗口爆仓结构 20%）</li>
+        <li><b>关于 CoinGlass</b>：CoinGlass 官方 API 需要付费 Key（实测返回 <code>API key missing</code>），网页端数据走签名接口，无法免密直连，因此本面板改用 Gate 平台自身公开的真实多空/强平数据；口径同样是平台真实数据，未使用合成价</li>
+        <li>交易区间卡片：结合 近20根高低点 / ATR(14) / 布林带 推导支撑位与压力位</li>
+      </ul>
+      <h4>K线交互（看得更清楚）</h4>
+      <ul>
+        <li><b>鼠标滚轮上下滚动</b> = 以光标位置为锚点缩放K线；<b>按住左键左右拖动</b> = 平移；<b>Shift+滚轮</b> = 横向平移；拖动时间轴/价格轴 = 缩放；双击轴 = 复位</li>
+        <li>图表头部 <b>－ / ＋ / 复位</b> 按钮；键盘 <b>↑↓</b> 缩放、<b>←→</b> 左右平移</li>
+        <li>刷新不会再重置你的缩放位置：只有换品种或换周期才会自动铺满</li>
+        <li>多空热力图同样支持滚轮缩放价格窗口、按住拖动平移、双击复位（缩放后看清局部爆仓密集价位）</li>
       </ul>
       <h4>止盈 / 止损价格区间（信号栏内提示）</h4>
       <ul>
@@ -312,7 +329,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260923g · Gate.io 永续单一数据源 · 多空清算图（历史可保留） · K线缩放拖动</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260924a · Gate.io 永续单一数据源 · 多空热力图（5m/15m/1h/4h/实时） · K线缩放拖动</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -332,7 +349,8 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260923g"></script>
-<script src="app.js?v=20260923g"></script>
+<script src="liq-map.js?v=20260924a"></script>
+<script src="lsmap.js?v=20260924a"></script>
+<script src="app.js?v=20260924a"></script>
 </body>
 </html>

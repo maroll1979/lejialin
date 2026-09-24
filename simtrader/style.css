@@ -36,7 +36,7 @@ body {
 b, strong { font-weight: 600; }
 button { font-family: inherit; }
 .num, .big-price, .sc-score, .vn-px, .vn-cg, .vn-df,
-.tbl td, .rc .v, .hm-cell { font-variant-numeric: tabular-nums; }
+.tbl td, .rc .v, .rc .k { font-variant-numeric: tabular-nums; }
 
 /* ---------- 顶栏 ---------- */
 .topbar {
@@ -446,50 +446,34 @@ button { font-family: inherit; }
 
 /* ---------- 热力图 ---------- */
 .heat-wrap { max-width: 1560px; margin: 0 auto; padding: 0 18px 12px; }
-.heat-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 12px; }
-@media (max-width: 1100px) { .heat-grid { grid-template-columns: 1fr; } }
+.heat-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
 .heat-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 9px; }
 .heat-head h3 { font-size: 13px; }
-.heat-legend { display: flex; align-items: center; gap: 3px; font-size: 10px; color: var(--muted); }
-.lg { width: 15px; height: 11px; border-radius: 2px; display: inline-block; }
-.lg-txt { margin: 0 3px; }
-.lg-dn3 { background: #d92c2c; } .lg-dn1 { background: #f0b3b3; }
-.lg-0 { background: #f1f3f6; }
-.lg-up1 { background: #a8dcc2; } .lg-up3 { background: #0a8f4e; }
 .heat-tip { color: var(--muted-2); margin-left: 6px; line-height: 1.5; }
 
-.heat-matrix { display: grid; grid-template-columns: 112px repeat(5, 1fr); gap: 3px; }
-.hm-hcell { font-size: 10px; color: var(--muted); text-align: center; padding: 2px 0; }
-.hm-name { font-size: 11px; display: flex; align-items: center; gap: 4px; padding: 5px 4px; cursor: pointer; border-radius: 6px; }
-.hm-name:hover { background: #f5f7fa; }
-.hm-name .tag { font-size: 9px; color: var(--muted-2); }
-.hm-cell { border-radius: 5px; padding: 6px 2px; text-align: center; font-size: 11px; font-weight: 600; transition: .2s; }
-.hm-cell.dim { color: var(--muted-2); background: #f8fafc; font-weight: 400; }
-.heat-note { font-size: 10px; color: var(--muted-2); margin-top: 7px; line-height: 1.5; }
-
-.vp-body { display: grid; grid-template-columns: 1fr 148px; gap: 11px; }
-@media (max-width: 620px) { .vp-body { grid-template-columns: 1fr; } }
-.vp-chart { display: flex; flex-direction: column; gap: 2px; max-height: 330px; overflow: hidden; }
-.vp-row { display: grid; grid-template-columns: 66px 1fr 42px; align-items: center; gap: 6px; font-size: 10px; }
-.vp-price { color: var(--muted); text-align: right; }
-.vp-bar-wrap { background: #f6f8fb; border-radius: 3px; height: 12px; position: relative; overflow: hidden; }
-.vp-bar { height: 100%; border-radius: 3px; }
-.vp-pct { color: var(--muted); }
-.vp-row.poc .vp-price, .vp-row.poc .vp-pct { color: #4338ca; font-weight: 700; }
-.vp-row.va .vp-bar-wrap { box-shadow: inset 0 0 0 1px #c7d2fe; }
-.vp-now { display: grid; grid-template-columns: 66px 1fr 42px; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; margin: 2px 0; }
-.vp-now .lbl { text-align: right; }
-.vp-now .line { border-top: 2px dashed var(--up); height: 0; }
+/* ---------- 多空热力图（替代原成交热力图） ---------- */
+.ls-panel .heat-head { flex-direction: column; align-items: flex-start; gap: 8px; }
+.ls-ctrl { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.liq-tag { font-size: 10px; color: var(--muted-2); }
+.ls-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.ls-seg button { border: 0; background: #fff; font-size: 11px; padding: 3px 9px; cursor: pointer; color: var(--muted); font-family: inherit; }
+.ls-seg button + button { border-left: 1px solid var(--line); }
+.ls-seg button:hover { background: #f5f7fa; }
+.ls-seg button.active { background: #eef2ff; color: #3730a3; font-weight: 700; }
+.ls-body { display: grid; grid-template-columns: 1fr 272px; gap: 12px; align-items: start; }
+@media (max-width: 900px) { .ls-body { grid-template-columns: 1fr; } }
+.ls-chart { min-width: 0; }
+.ls-empty { padding: 44px 0; text-align: center; color: var(--muted-2); font-size: 12px; }
+.ls-meta { margin-top: 7px; font-size: 10px; line-height: 1.6; }
+#lsMeta.rt { color: #4338ca; }
+.ls-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 5px; font-size: 10.5px; color: var(--muted-2); }
+.ls-legend .ls-dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; }
 
 .range-cards { display: grid; gap: 7px; align-content: start; }
 .rc { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 9px; }
 .rc .k { font-size: 10px; color: var(--muted); }
 .rc .v { font-size: 14px; font-weight: 700; margin-top: 2px; }
 .rc .v small { font-size: 10px; font-weight: 400; color: var(--muted); }
-
-.vp-panel .heat-head { flex-direction: column; align-items: flex-start; gap: 4px; }
-#vpMeta { margin-left: 0; font-size: 10px; line-height: 1.6; }
-#vpMeta.rt { color: #4338ca; }
 
 /* ---------- 止盈止损区间提示 ---------- */
 .tpsl-block { font-size: 11px; margin-top: 11px; }
