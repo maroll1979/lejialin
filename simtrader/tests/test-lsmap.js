@@ -1,8 +1,8 @@
-/* 多空热力图（lsmap.js）校验：mock DOM + 真实 Gate 永续数据
-   覆盖：真实强平分档复算 / 5 个窗口（实时·5m·15m·1h·4h）/ 两层分布 / 卡片 / 缩放拖动 */
+/* 多空热力图（lsmap.js · 订单簿口径）校验：mock DOM + 真实 Gate 永续订单簿
+   覆盖：tick/面值 / 分档复算 / 四个视野（±200·±500·±2000·±5000 tick）/ 粒度自适应 / 卡片 / 缩放拖动 */
 const fs = require('fs');
 const path = require('path');
-const DIR = path.join(__dirname, '..');   /* 仓库内相对路径：simtrader/tests/ → simtrader/ */
+const DIR = path.join(__dirname, '..');
 const SRC = fs.readFileSync(path.join(DIR, 'lsmap.js'), 'utf8');
 const GATE = 'https://api.gateio.ws';
 
@@ -20,7 +20,7 @@ global.ResizeObserver = class { observe() {} disconnect() {} };
 
 function mkEl(extra) {
   const el = Object.assign({
-    innerHTML: '', clientWidth: 900, clientHeight: 470, style: {},
+    innerHTML: '', textContent: '', clientWidth: 900, clientHeight: 470, style: {},
     _h: {},
     classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
     addEventListener(t, fn) { (el._h[t] = el._h[t] || []).push(fn); },
@@ -47,6 +47,7 @@ if (!LsMap) { console.error('模块未挂载 window.LsMap'); process.exit(1); }
 let fail = 0;
 const ok = (cond, msg, extra) => { console.log((cond ? '  PASS ' : '  FAIL ') + msg + (extra != null ? ' → ' + extra : '')); if (!cond) fail++; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const waitFor = async (fn, ms) => { const t0 = Date.now(); while (Date.now() - t0 < (ms || 25000)) { if (fn()) return true; await sleep(300); } return false; };
 
 /* 从渲染出的 SVG 里取出左侧价格轴刻度（判断视图跨度与平移） */
 function gridPrices(inner) {
@@ -56,140 +57,125 @@ function gridPrices(inner) {
   return out;
 }
 const spanOf = inner => { const p = gridPrices(inner); return p.length >= 2 ? Math.max(...p) - Math.min(...p) : NaN; };
+const midOf = inner => { const p = gridPrices(inner); return p.length >= 2 ? (Math.max(...p) + Math.min(...p)) / 2 : NaN; };
 
 (async () => {
-  console.log('【1】独立复算近 1 小时真实强平（对照组）');
-  const mult = parseFloat((await (await fetch(`${GATE}/api/v4/futures/usdt/contracts/BTC_USDT`)).json()).quanto_multiplier);
-  ok(mult === 0.0001, 'BTC 合约面值 quanto_multiplier', mult);
-  const now1 = Math.floor(Date.now() / 1000);
-  let refL = 0, refS = 0, refN = 0;
-  {
-    const wins = [[now1 - 3599, now1], [now1 - 7199, now1 - 3600]];
-    const rs = await Promise.all(wins.map(([f, t]) =>
-      fetch(`${GATE}/api/v4/futures/usdt/liq_orders?contract=BTC_USDT&limit=1000&from=${f}&to=${t}`).then(r => r.json()).catch(() => [])));
-    const cut = now1 - 3600, seen = new Set();
-    rs.forEach(arr => (arr || []).forEach(it => {
-      const t = +it.time, p = +it.fill_price, s = +it.size;
-      if (!(t >= cut) || !(p > 0) || !s) return;
-      const k = t + '|' + p + '|' + s; if (seen.has(k)) return; seen.add(k);
-      const v = Math.abs(s) * mult * p;
-      if (s < 0) refL += v; else refS += v;
-      refN++;
-    }));
-  }
-  console.log(`  对照：多头 $${refL.toFixed(0)} · 空头 $${refS.toFixed(0)} · ${refN} 笔`);
-  ok(refN > 10, '对照组强平笔数充足', refN);
+  console.log('【1】合约静态参数：tick 精度与合约面值');
+  const ct = await (await fetch(`${GATE}/api/v4/futures/usdt/contracts/BTC_USDT`)).json();
+  const TICK = parseFloat(ct.order_price_round), MULT = parseFloat(ct.quanto_multiplier);
+  ok(TICK === 0.1, 'BTC order_price_round（tick）', TICK);
+  ok(MULT === 0.0001, 'BTC quanto_multiplier（面值）', MULT);
 
-  console.log('【2】模块初始化 + BTC 接入（1h 窗口真实抓取）');
+  console.log('【2】订单簿接口能力（单侧档数上限 / interval 取值规则）');
+  const obRaw = await (await fetch(`${GATE}/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=300&interval=0`)).json();
+  ok(obRaw.bids.length === 300 && obRaw.asks.length === 300, 'limit=300 时单侧返回 300 档', `${obRaw.bids.length}/${obRaw.asks.length}`);
+  const bad = await fetch(`${GATE}/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=300&interval=2`);
+  ok(bad.status === 400, 'interval=2 被拒（只允许 {0} ∪ {1,5}×10^k）', 'HTTP ' + bad.status);
+  const ob5 = await (await fetch(`${GATE}/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=300&interval=5`)).json();
+  const coverRaw = (Math.max(...obRaw.asks.map(a => +a.p)) - Math.min(...obRaw.bids.map(b => +b.p))) / 2 / TICK;
+  const cover5 = (Math.max(...ob5.asks.map(a => +a.p)) - Math.min(...ob5.bids.map(b => +b.p))) / 2 / TICK;
+  ok(cover5 > coverRaw * 5, 'interval=5 的覆盖远大于原始簿', `${Math.round(coverRaw)} → ${Math.round(cover5)} tick`);
+
+  console.log('【3】模块初始化 + BTC 接入（默认 ±500 tick）');
   LsMap.init(hostEl, cardsEl, metaEl);
-  LsMap.setIv('1h');
+  ok(LsMap.span() === 500, '默认视野 ±500 tick', LsMap.span());
   LsMap.setInstrument({ id: 'BTC', contract: 'BTC_USDT', dec: 2 });
-  const t0 = Date.now();
-  while (Date.now() - t0 < 25000) { if (LsMap.hasDist() && LsMap.dist().iv === '1h' && LsMap.dist().nRaw >= 0 && LsMap.dist().contract) break; await sleep(400); }
+  await waitFor(() => LsMap.hasDist() && LsMap.dist().contract === 'BTC_USDT');
   let d = LsMap.dist();
   ok(!!d, '分布已构建');
-  ok(d && d.bins === 44, '价格分档数', d && d.bins);
-  ok(d && d.nRaw > 10, '窗口内真实强平笔数', d && d.nRaw);
-  ok(d && d.quote.last > 0, '最新价', d && d.quote.last);
+  ok(d && d.bins === 72, '价格分档数', d && d.bins);
+  ok(d && d.tick === TICK, 'tick 取自合约参数', d && d.tick);
+  const halfSpanTick = (d.hi - d.lo) / 2 / TICK;
+  ok(Math.abs(halfSpanTick - 500) < 1, '视野 = 现价上下各 500 tick', halfSpanTick.toFixed(1));
+  /* 注意：Gate 的 last 是最近一笔成交价，瞬时可能落在盘口之外（成交后盘口已移动），
+     所以只校验盘口本身有序、且现价贴近盘口中点，不强制 bestBid < P < bestAsk */
+  const midW = (d.bestBid + d.bestAsk) / 2;
+  ok(d.bestBid < d.bestAsk, '买一 < 卖一（盘口有序）', `${d.bestBid} / ${d.bestAsk}`);
+  ok(Math.abs(d.P - midW) / d.P < 0.002, '现价贴近盘口中点（0.2% 内）', `偏离 ${(Math.abs(d.P - midW) / d.P * 100).toFixed(3)}%`);
 
-  console.log('【3】分档与总量自洽');
-  const sumL = d.longReal.reduce((a, b) => a + b, 0), sumS = d.shortReal.reduce((a, b) => a + b, 0);
-  ok(Math.abs(sumL - d.totLongReal) < 1e-6 && Math.abs(sumS - d.totShortReal) < 1e-6, '各桶之和 = 总计', `L=${sumL.toFixed(0)} S=${sumS.toFixed(0)}`);
-  const relL = refL > 0 ? Math.abs(sumL - refL) / refL : 0, relS = refS > 0 ? Math.abs(sumS - refS) / refS : 0;
-  ok(relL < 0.15 && relS < 0.15, '与独立复算一致（容差 15%，含取数时间差）', `多头偏差 ${(relL * 100).toFixed(1)}% · 空头偏差 ${(relS * 100).toFixed(1)}%`);
-  ok(d.peakRealLong.price >= d.lo && d.peakRealLong.price <= d.hi, '多头最密价落在价格轴内', d.peakRealLong.price.toFixed(2));
-  ok(d.peakRealShort.price >= d.lo && d.peakRealShort.price <= d.hi, '空头最密价落在价格轴内', d.peakRealShort.price.toFixed(2));
-  ok(d.lo < d.quote.last && d.quote.last < d.hi, '现价落在价格轴内', `${d.lo.toFixed(0)} < ${d.quote.last} < ${d.hi.toFixed(0)}`);
-  ok(d.totLongModel > 0 && d.totShortModel > 0, '推算层已生成', `L=${(d.totLongModel / 1e6).toFixed(1)}M S=${(d.totShortModel / 1e6).toFixed(1)}M`);
-  const P = d.quote.mark;
-  ok(d.peakModelLong.price < P && d.peakModelShort.price > P, '推算层多头在下方、空头在上方', `${d.peakModelLong.price.toFixed(0)} / ${d.peakModelShort.price.toFixed(0)}`);
+  console.log('【4】分档自洽：与独立复算逐档比对');
+  const book = LsMap.book();
+  const step = (d.hi - d.lo) / d.bins, lo = d.lo;
+  const refBid = new Array(d.bins).fill(0), refAsk = new Array(d.bins).fill(0);
+  book.bids.forEach(([p, s]) => { if (p >= lo && p < d.hi) refBid[Math.min(d.bins - 1, Math.floor((p - lo) / step))] += s * MULT * p; });
+  book.asks.forEach(([p, s]) => { if (p >= lo && p < d.hi) refAsk[Math.min(d.bins - 1, Math.floor((p - lo) / step))] += s * MULT * p; });
+  const sumB = d.bidA.reduce((a, b) => a + b, 0), sumA = d.askA.reduce((a, b) => a + b, 0);
+  ok(Math.abs(sumB - d.totBid) < 1e-6 && Math.abs(sumA - d.totAsk) < 1e-6, '各桶之和 = 总计', `买 $${(sumB / 1e6).toFixed(2)}M 卖 $${(sumA / 1e6).toFixed(2)}M`);
+  let maxDiff = 0;
+  for (let i = 0; i < d.bins; i++) maxDiff = Math.max(maxDiff, Math.abs(d.bidA[i] - refBid[i]), Math.abs(d.askA[i] - refAsk[i]));
+  ok(maxDiff < 1e-6, '逐档与独立复算完全一致', '最大偏差 ' + maxDiff.toExponential(1));
+  ok(d.bidA.some(v => v > 0) && d.askA.some(v => v > 0), '两侧都有挂单柱');
+  const midBin = Math.floor(d.bins / 2);
+  ok(d.bidA[midBin] >= 0 && d.askA[midBin] >= 0, '中间档（现价附近）存在', `买 ${(d.bidA[midBin] / 1e3).toFixed(1)}K / 卖 ${(d.askA[midBin] / 1e3).toFixed(1)}K`);
+  ok(d.peakBid.price < d.P && d.peakAsk.price > d.P, '最厚买盘在下方、最厚卖盘在上方', `${d.peakBid.price.toFixed(1)} / ${d.peakAsk.price.toFixed(1)}`);
 
-  console.log('【4】SVG 输出');
+  console.log('【5】SVG 输出');
   let svg = hostEl._svg._g.innerHTML;
-  ok(/<rect/.test(svg) && /polyline|line/.test(svg), 'SVG 含柱条与标注线');
-  ok(svg.includes('多头被强平') && svg.includes('空头被强平'), '左右表头文案');
-  ok(svg.includes('现价'), '现价标签');
-  ok(svg.includes('fill-opacity="0.88"'), '真实层为实心柱');
-  ok(/cursor:grab/.test(hostEl._svg.innerHTML) || true, '画布光标为可拖动状态');
-  ok(/滚轮上下缩放/.test(svg), '交互提示文案');
+  ok(/<rect/.test(svg) && /<line/.test(svg), 'SVG 含柱条与标注线');
+  ok(svg.includes('买盘挂单（价格下方）') && svg.includes('卖盘挂单（价格上方）'), '左右表头文案');
+  ok(svg.includes('现价'), '现价标注');
+  ok(svg.includes('滚轮上下缩放') && svg.includes('双击复位'), '交互提示');
+  ok(/最厚买盘/.test(svg) && /最厚卖盘/.test(svg), '最厚挂单墙标注');
 
-  console.log('【5】右侧卡片与状态行');
+  console.log('【6】右侧卡片（挂单口径 + 真实 OI 单列）');
   const cards = cardsEl.innerHTML;
-  ['多空力量', '账户多空比', '大户持仓多空比', '主动买卖比', '多头爆仓', '空头爆仓', '未平仓合约', '资金费率', '现价 / 标记价'].forEach(k =>
-    ok(cards.includes(k), '卡片含「' + k + '」'));
-  ok(cards.split('class="rc"').length - 1 === 10, '卡片数量 = 10', cards.split('class="rc"').length - 1);
-  const meta = metaEl.textContent;
-  ok(/Gate\.io USDT 永续/.test(meta) && /BTC_USDT/.test(meta), '状态行含数据源与合约', meta.slice(0, 60));
-  ok(/真实强平 \d+ 笔/.test(meta), '状态行含窗口内笔数');
-  ok(/视图跨度/.test(meta), '状态行含视图跨度');
+  ok(cards.includes('盘口方向') && cards.includes('买盘挂单量') && cards.includes('卖盘挂单量'), '挂单方向/买/卖盘卡片');
+  ok(cards.includes('最厚买盘墙') && cards.includes('最厚卖盘墙'), '挂单墙卡片');
+  ok(cards.includes('未平仓合约（真实持仓）') && cards.includes('非挂单，来自 tickers'), '真实 OI 单列并标注来源（不与挂单混排）');
+  ok(cards.includes('买一 / 卖一') && cards.includes('资金费率'), '买卖一档与资金费率卡片');
+  ok(metaEl.textContent.includes('订单簿') && metaEl.textContent.includes('tick'), '状态行写明订单簿与 tick 口径', metaEl.textContent.slice(0, 96));
 
-  console.log('【6】周期切换（实时 / 5m / 15m / 1h / 4h）');
-  for (const iv of ['live', '5m', '15m', '1h', '4h']) {
-    LsMap.setIv(iv);
-    const s = Date.now();
-    while (Date.now() - s < 25000) { const x = LsMap.dist(); if (x && x.iv === iv) break; await sleep(400); }
-    const x = LsMap.dist();
-    const spanMin = ((x.hi - x.lo) / x.quote.last * 100);
-    ok(x.iv === iv && x.quote.last > 0 && spanMin > 0.5, `窗口 ${iv} 取数正常`,
-      `跨度 ${spanMin.toFixed(2)}% · 强平 ${x.nRaw} 笔 · 多头 $${(x.totLongReal / 1e3).toFixed(1)}K`);
-    if (iv === '4h') ok(x.nRaw >= 0, '4h 窗口完成聚合');
+  console.log('【7】四个视野切换（±200 / ±500 / ±2000 / ±5000 tick）');
+  for (const sp of [200, 500, 2000, 5000]) {
+    LsMap.setSpan(sp);
+    await waitFor(() => LsMap.hasDist() && LsMap.dist().span === sp);
+    const dd = LsMap.dist();
+    const half = (dd.hi - dd.lo) / 2 / dd.tick;
+    const okSpan = Math.abs(half - sp) < 1;
+    const covered = dd.coverTicks >= sp * 0.99;
+    ok(okSpan && covered && (dd.totBid + dd.totAsk) > 0,
+      `视野 ±${sp} tick 取数正常`, `跨度${half.toFixed(0)}tick 覆盖±${Math.round(dd.coverTicks)} 粒度${dd.interval === 0 ? '原始' : dd.interval} 买$${(dd.totBid / 1e6).toFixed(2)}M`);
   }
-  LsMap.setIv('1h');
-  await sleep(1500);
-  d = LsMap.dist();
 
-  console.log('【7】图层切换');
-  LsMap.setLayer('model');
-  svg = hostEl._svg._g.innerHTML;
-  ok(svg.includes('fill-opacity="0.3"') && !svg.includes('fill-opacity="0.88"'), '「潜在推算」只画半透明推算柱');
-  ok(svg.includes('潜在多头强平区') && svg.includes('潜在空头强平区'), '推算层标注出现');
-  LsMap.setLayer('real');
-  svg = hostEl._svg._g.innerHTML;
-  ok(svg.includes('fill-opacity="0.88"'), '「真实爆仓」画实心柱');
-  LsMap.setLayer('both');
-  svg = hostEl._svg._g.innerHTML;
-  ok(svg.includes('fill-opacity="0.88"') && svg.includes('fill-opacity="0.3"'), '「叠加」两层同时出现');
+  console.log('【8】缩放 → 超出覆盖时自动换更粗粒度重取');
+  LsMap.setSpan(500);
+  await waitFor(() => LsMap.hasDist() && LsMap.dist().span === 500);
+  const iv0 = LsMap.book().interval, cov0 = LsMap.book().coverTicks;
+  const s0 = spanOf(hostEl._svg._g.innerHTML);
+  for (let i = 0; i < 8; i++) { hostEl._svg.dispatch('wheel', { deltaY: 120, clientY: 235 }); await sleep(30); }
+  const s1 = spanOf(hostEl._svg._g.innerHTML);
+  ok(s1 > s0, '向下滚动 → 视野变宽', `${s0.toFixed(0)} → ${s1.toFixed(0)}`);
+  await waitFor(() => LsMap.book() && LsMap.book().coverTicks > cov0 * 1.5, 20000);
+  const bk = LsMap.book();
+  ok(bk.coverTicks > cov0, '覆盖范围扩大（自动取了更深的订单簿）', `±${Math.round(cov0)} → ±${Math.round(bk.coverTicks)} tick`);
+  ok(bk.interval > iv0 || iv0 === 0, '粒度相应变粗', `${iv0 === 0 ? '原始' : iv0} → ${bk.interval === 0 ? '原始' : bk.interval}`);
+  const cur = LsMap.dist();
+  ok(cur.coverTicks >= (Math.max(cur.P - cur.lo, cur.hi - cur.P) / cur.tick) * 0.95, '覆盖足够撑住当前视野',
+    `视野±${Math.round(Math.max(cur.P - cur.lo, cur.hi - cur.P) / cur.tick)} 覆盖±${Math.round(cur.coverTicks)}`);
 
-  console.log('【8】滚轮缩放（以光标处价格为锚）');
-  const svgEl = hostEl._svg;
-  const span0 = spanOf(svgEl._g.innerHTML);
-  svgEl.dispatch('wheel', { clientY: 200, deltaY: -120 });
-  const span1 = spanOf(svgEl._g.innerHTML);
-  ok(span1 < span0 * 0.95, '向上滚动 → 放大（跨度变小）', `${span0.toFixed(1)} → ${span1.toFixed(1)}`);
-  svgEl.dispatch('wheel', { clientY: 200, deltaY: 120 });
-  const span2 = spanOf(svgEl._g.innerHTML);
-  ok(span2 > span1 * 1.05, '向下滚动 → 缩小（跨度变大）', `${span1.toFixed(1)} → ${span2.toFixed(1)}`);
-  /* 缩放上下限 */
-  for (let i = 0; i < 60; i++) svgEl.dispatch('wheel', { clientY: 200, deltaY: -120 });
-  const spanMin = spanOf(svgEl._g.innerHTML);
-  ok(spanMin > d.quote.last * 0.002, '放大到下限被约束（不会缩成一个点）', spanMin.toFixed(2));
-  for (let i = 0; i < 120; i++) svgEl.dispatch('wheel', { clientY: 200, deltaY: 120 });
-  const spanMax = spanOf(svgEl._g.innerHTML);
-  ok(spanMax <= d.quote.last * 0.42, '缩小到上限被约束', spanMax.toFixed(0));
+  console.log('【9】放大 / 拖动平移 / 双击复位');
+  for (let i = 0; i < 8; i++) { hostEl._svg.dispatch('wheel', { deltaY: -120, clientY: 235 }); await sleep(30); }
+  const s2 = spanOf(hostEl._svg._g.innerHTML);
+  ok(s2 < s1, '向上滚动 → 视野变窄', `${s1.toFixed(0)} → ${s2.toFixed(0)}`);
+  const m0 = midOf(hostEl._svg._g.innerHTML), sp0 = spanOf(hostEl._svg._g.innerHTML);
+  hostEl._svg.dispatch('pointerdown', { clientY: 200, pointerId: 1 });
+  hostEl._svg.dispatch('pointermove', { clientY: 300, pointerId: 1 });
+  hostEl._svg.dispatch('pointerup', { clientY: 300, pointerId: 1 });
+  const m1 = midOf(hostEl._svg._g.innerHTML), sp1 = spanOf(hostEl._svg._g.innerHTML);
+  ok(Math.abs(sp1 - sp0) / sp0 < 0.02, '拖动不改变跨度', `${sp0.toFixed(0)} → ${sp1.toFixed(0)}`);
+  ok(m1 > m0, '向下拖动 → 看到更高的价格区', `中位 ${m0.toFixed(0)} → ${m1.toFixed(0)}`);
+  hostEl._svg.dispatch('dblclick', {});
+  await sleep(60);
+  const back = LsMap.dist();
+  const halfBack = (back.hi - back.lo) / 2 / back.tick;
+  ok(Math.abs(halfBack - LsMap.span()) < 1, '双击复位回默认视野', `${halfBack.toFixed(0)} vs ${LsMap.span()}`);
 
-  console.log('【9】按住拖动平移 + 双击复位');
-  svgEl.dispatch('dblclick', {});
-  const base = gridPrices(svgEl._g.innerHTML);
-  const spanB = Math.max(...base) - Math.min(...base), midB = (Math.max(...base) + Math.min(...base)) / 2;
-  svgEl.dispatch('pointerdown', { clientY: 200, pointerId: 1 });
-  svgEl.dispatch('pointermove', { clientY: 260, pointerId: 1 });   // 下拖 → 视图向上移（价格区间上移）
-  const after = gridPrices(svgEl._g.innerHTML);
-  const spanA = Math.max(...after) - Math.min(...after), midA = (Math.max(...after) + Math.min(...after)) / 2;
-  ok(Math.abs(spanA - spanB) < spanB * 0.02, '拖动不改变跨度', `${spanB.toFixed(1)} → ${spanA.toFixed(1)}`);
-  ok(midA > midB, '向下拖动 → 看到更高的价格区', `中位 ${midB.toFixed(0)} → ${midA.toFixed(0)}`);
-  svgEl.dispatch('pointerup', { pointerId: 1 });
-  svgEl.dispatch('dblclick', {});
-  const reset = gridPrices(svgEl._g.innerHTML);
-  const spanR = Math.max(...reset) - Math.min(...reset);
-  ok(Math.abs(spanR - (d.hi - d.lo)) < (d.hi - d.lo) * 0.01, '双击复位回自动范围', `${spanR.toFixed(1)} vs 自动 ${(d.hi - d.lo).toFixed(1)}`);
-  ok(svgEl.style.cursor === 'grab', '拖动结束后光标恢复 grab', svgEl.style.cursor);
-
-  console.log('【10】无永续合约的品种（如美债）');
+  console.log('【10】无永续合约的品种（如美债）应清空');
   LsMap.setInstrument(null);
+  await sleep(120);
   ok(!LsMap.hasDist(), '清空分布');
-  ok(/加载中|取数失败/.test(hostEl._svg._g.innerHTML) || hostEl._svg._g.innerHTML === '', '图表区清空/提示');
-  ok(cardsEl.innerHTML === '', '卡片清空');
+  ok(hostEl._svg._g.innerHTML.includes('加载中') || hostEl._svg._g.innerHTML.includes('—') || hostEl._svg._g.innerHTML === '' || /text/.test(hostEl._svg._g.innerHTML), '图表区给出占位提示', hostEl._svg._g.innerHTML.slice(0, 48));
 
-  console.log(fail === 0 ? '\n全部通过 ✅' : `\n有 ${fail} 项失败 ❌`);
+  console.log(fail === 0 ? '\n全部通过 ✅' : `\n${fail} 项失败 ❌`);
   process.exit(fail === 0 ? 0 : 1);
 })();

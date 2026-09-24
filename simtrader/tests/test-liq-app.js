@@ -2,7 +2,7 @@
    验证新增的清算图钩子不破坏启动，且接入点齐全 */
 const fs = require('fs');
 const path = require('path');
-const DIR = path.join(__dirname, '..');   /* 仓库内相对路径：simtrader/tests/ → simtrader/ */
+const DIR = path.join(__dirname, '..');
 const appSrc = fs.readFileSync(path.join(DIR, 'app.js'), 'utf8');
 const liqSrc = fs.readFileSync(path.join(DIR, 'liq-map.js'), 'utf8');
 const lsSrc = fs.readFileSync(path.join(DIR, 'lsmap.js'), 'utf8');
@@ -16,13 +16,13 @@ console.log('【接入点静态检查】');
 ok(/lsmap\.js\?v=\d+/.test(html), 'index.html 引入 lsmap.js 且带版本号');
 ok(html.indexOf('liq-map.js') < html.indexOf('lsmap.js') && html.indexOf('lsmap.js') < html.indexOf('app.js?v='), '加载顺序 liq-map → lsmap → app');
 ok(/id="lsChart"/.test(html) && /id="lsCards"/.test(html) && /id="lsMeta"/.test(html), '页面含多空热力图容器/卡片/状态行');
-ok(/data-lsiv="live"/.test(html) && /data-lsiv="5m"/.test(html) && /data-lsiv="15m"/.test(html) && /data-lsiv="1h"/.test(html) && /data-lsiv="4h"/.test(html), '页面含 实时/5m/15m/1h/4h 五个窗口按钮');
-ok(/data-lslayer="real"/.test(html) && /data-lslayer="model"/.test(html) && /data-lslayer="both"/.test(html), '页面含 真实/推算/叠加 三个图层按钮');
+ok(/data-lsspan="200"/.test(html) && /data-lsspan="500"/.test(html) && /data-lsspan="2000"/.test(html) && /data-lsspan="5000"/.test(html), '页面含 ±200/±500/±2000/±5000 四个视野按钮');
+ok(!/lsiv|lslayer|data-lsiv|data-lslayer/.test(html + css + appSrc), '已无旧的 5m/15m/1h/4h 窗口与图层按钮残留');
 ok(!/heat-matrix|vpChart|vpMeta|heatMatrix/.test(html + css + appSrc), '已无「多品种多周期热力图 / 成交热力图」残留');
 ok(/window\.LsMap\.init\(\$\('#lsChart'\)/.test(appSrc), 'initChart 中初始化多空热力图');
 ok(/window\.LsMap\.setInstrument\(/.test(appSrc), '切换品种时切换多空热力图合约');
-ok(/window\.LsMap\.setIv\(b\.dataset\.lsiv\)/.test(appSrc), '窗口按钮绑定 setIv');
-ok(/window\.LsMap\.setLayer\(b\.dataset\.lslayer\)/.test(appSrc), '图层按钮绑定 setLayer');
+ok(/window\.LsMap\.setSpan\(\+b\.dataset\.lsspan\)/.test(appSrc), '视野按钮绑定 setSpan');
+ok(/window\.LsMap\.span\(\)/.test(appSrc), '按钮高亮读取当前视野');
 ok(/window\.LsMap\.refresh\(true\)/.test(appSrc) && /window\.LsMap\.refresh\(false\)/.test(appSrc), '全量刷新与定时刷新都已接入');
 ok(/handleScale/.test(appSrc) && /handleScroll/.test(appSrc) && /minBarSpacing/.test(appSrc), 'K线缩放/拖动配置齐全（含最大缩放范围）');
 ok(/bindChartHotkeys/.test(appSrc), 'K线键盘微调已绑定');
@@ -85,7 +85,7 @@ ok(!!win.LiqMap, 'liq-map.js 挂载 window.LiqMap');
 ok(typeof win.LiqMap.init === 'function' && typeof win.LiqMap.setInstrument === 'function', '清算图对外接口齐全');
 new Function('window', 'document', 'localStorage', 'requestAnimationFrame', 'cancelAnimationFrame', 'ResizeObserver', 'AbortController', 'fetch', lsSrc)(win, doc, LS, win.requestAnimationFrame, () => {}, win.ResizeObserver, AbortController, async () => ({ json: async () => [], ok: true }));
 ok(!!win.LsMap, 'lsmap.js 挂载 window.LsMap');
-ok(typeof win.LsMap.init === 'function' && typeof win.LsMap.setIv === 'function' && typeof win.LsMap.setLayer === 'function', '多空热力图对外接口齐全');
+ok(typeof win.LsMap.init === 'function' && typeof win.LsMap.setSpan === 'function' && typeof win.LsMap.span === 'function' && typeof win.LsMap.book === 'function', '多空热力图对外接口齐全');
 
 let bootErr = null;
 try {

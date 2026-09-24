@@ -1113,26 +1113,16 @@ function initChart() {
       });
     });
   }
-  /* 多空热力图：初始化 + 周期按钮（5m/15m/1h/4h/实时）+ 图层按钮（真实/推算/叠加） */
+  /* 多空热力图（订单簿口径）：初始化 + 视野按钮（±200/±500/±2000/±5000 tick） */
   if (window.LsMap) {
     window.LsMap.init($('#lsChart'), $('#lsCards'), $('#lsMeta'));
-    const ivBox = $('#lsIv');
-    if (ivBox) {
-      ivBox.querySelectorAll('[data-lsiv]').forEach(b => {
-        b.classList.toggle('active', b.dataset.lsiv === window.LsMap.interval());
+    const spBox = $('#lsSpan');
+    if (spBox) {
+      spBox.querySelectorAll('[data-lsspan]').forEach(b => {
+        b.classList.toggle('active', +b.dataset.lsspan === window.LsMap.span());
         b.addEventListener('click', () => {
-          ivBox.querySelectorAll('[data-lsiv]').forEach(x => x.classList.toggle('active', x === b));
-          window.LsMap.setIv(b.dataset.lsiv);
-        });
-      });
-    }
-    const lyBox = $('#lsLayer');
-    if (lyBox) {
-      lyBox.querySelectorAll('[data-lslayer]').forEach(b => {
-        b.classList.toggle('active', b.dataset.lslayer === window.LsMap.layer());
-        b.addEventListener('click', () => {
-          lyBox.querySelectorAll('[data-lslayer]').forEach(x => x.classList.toggle('active', x === b));
-          window.LsMap.setLayer(b.dataset.lslayer);
+          spBox.querySelectorAll('[data-lsspan]').forEach(x => x.classList.toggle('active', x === b));
+          window.LsMap.setSpan(+b.dataset.lsspan);
         });
       });
     }

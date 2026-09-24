@@ -451,10 +451,11 @@ button { font-family: inherit; }
 .heat-head h3 { font-size: 13px; }
 .heat-tip { color: var(--muted-2); margin-left: 6px; line-height: 1.5; }
 
-/* ---------- 多空热力图（替代原成交热力图） ---------- */
+/* ---------- 多空热力图（订单簿口径） ---------- */
 .ls-panel .heat-head { flex-direction: column; align-items: flex-start; gap: 8px; }
 .ls-ctrl { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .liq-tag { font-size: 10px; color: var(--muted-2); }
+.liq-unit { font-size: 10px; color: var(--muted-2); margin-left: 1px; }
 .ls-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .ls-seg button { border: 0; background: #fff; font-size: 11px; padding: 3px 9px; cursor: pointer; color: var(--muted); font-family: inherit; }
 .ls-seg button + button { border-left: 1px solid var(--line); }

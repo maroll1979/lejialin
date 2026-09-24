@@ -1,7 +1,7 @@
 /* 历史爆仓持久化校验：模拟「第一次打开」与「关掉后重新打开」两次会话，
    验证第二次打开时无需联网就能立刻看到已累积的历史强平数据 */
 const fs = require('fs');
-const MOD = require('path').join(__dirname, '..', 'liq-map.js');   /* 仓库内相对路径 */
+const MOD = require('path').join(__dirname, 'simtrader', 'liq-map.js');
 
 /* ---- mock 浏览器环境（localStorage 跨「两次会话」保留） ---- */
 const store = {};

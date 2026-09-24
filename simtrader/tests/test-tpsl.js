@@ -5,7 +5,7 @@
    数据用真实 Gate 永续 K 线。 */
 const fs = require('fs');
 const path = require('path');
-const DIR = path.join(__dirname, '..');   /* 仓库内相对路径：simtrader/tests/ → simtrader/ */
+const DIR = path.join(__dirname, '..');
 
 /* ---- mock 浏览器环境（同 test-liq-app.js） ---- */
 const store = {};
