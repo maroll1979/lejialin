@@ -253,7 +253,7 @@ button { font-family: inherit; }
 .ind-title b { color: var(--accent); }
 .ind-sub { font-size: 9px; color: var(--muted-2); }
 
-.ind-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; }
+.ind-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .ind-card {
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 8px 8px;
   background: #fff; display: flex; flex-direction: column; gap: 5px; min-width: 0;

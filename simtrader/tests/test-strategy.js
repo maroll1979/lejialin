@@ -56,27 +56,42 @@ function loadAppSignalCore() {
   head('3. 流式引擎 vs computeSignal 逐根对照（实盘语义 = 最近 200 根窗口）');
   const s = S.toSeries(candles);
   const st = new S.SignalStream();
-  const streamDir = [], streamScore = [];
+  const streamDir = [], streamScore = [], streamFac = [];
   for (let i = 0; i < s.n; i++) {
     const r = st.push(s.o[i], s.h[i], s.l[i], s.c[i], s.v[i]);
-    streamDir.push(r.dir); streamScore.push(r.score);
+    streamDir.push(r.dir); streamScore.push(r.score); streamFac.push(r.f);
   }
-  /* 对照窗口：只取最后 600 根逐点重算（每点一次 O(200) 计算，全量太慢） */
+  /* 对照窗口：只取最后 600 根逐点重算（每点一次 O(200) 重算，全量太慢） */
   const CHECK = 600;
   const start = s.n - CHECK;
-  let same = 0, diff = 0, scoreMaxDev = 0;
-  const dirMap = { 'wait': 0, 'long': 1, 'short': 2 };
+  const FAC = ['trend', 'macd', 'adx', 'rsi', 'kdj', 'boll', 'obv', 'vol'];
+  const maxDev = {}; FAC.forEach(k => { maxDev[k] = 0; });
+  let same = 0, diff = 0, scoreMaxDev = 0, signFlip = 0;
   for (let i = start; i < s.n; i++) {
     const win = candles.slice(Math.max(0, i - 199), i + 1);
     const ref = core.computeSignal(win);
     const rd = ref ? ref.dir : 'wait';
     if (rd === streamDir[i]) same++; else diff++;
-    if (ref) scoreMaxDev = Math.max(scoreMaxDev, Math.abs(ref.score - streamScore[i]));
+    if (ref) {
+      scoreMaxDev = Math.max(scoreMaxDev, Math.abs(ref.score - streamScore[i]));
+      FAC.forEach(k => {
+        const d = Math.abs(ref.fac[k] - streamFac[i][k]);
+        if (d > maxDev[k]) maxDev[k] = d;
+        /* 因子数值接近零时不追究符号，其余情况符号必须一致 */
+        if (Math.abs(ref.fac[k]) > 0.05 && Math.sign(ref.fac[k]) !== Math.sign(streamFac[i][k])) signFlip++;
+      });
+    }
   }
   const rate = same / (same + diff);
-  console.log(`     一致 ${same} / 不一致 ${diff} → 一致率 ${(rate * 100).toFixed(2)}% · 分数最大偏差 ${scoreMaxDev.toFixed(4)}`);
-  ok(rate >= 0.97, '方向一致率 ≥ 97%', (rate * 100).toFixed(2) + '%');
-  ok(scoreMaxDev < 0.06, '六因子分数最大偏差 < 0.06', scoreMaxDev.toFixed(4));
+  const worst = FAC.map(k => [k, maxDev[k]]).sort((a, b) => b[1] - a[1])[0];
+  console.log(`     方向一致 ${same} / 不一致 ${diff} → 一致率 ${(rate * 100).toFixed(2)}% · 分数最大偏差 ${scoreMaxDev.toFixed(4)}`);
+  console.log('     各因子最大偏差：' + FAC.map(k => `${k} ${maxDev[k].toFixed(4)}`).join(' · '));
+  ok(rate >= 0.97, '方向一致率 ≥ 97%（回测口径 = 实盘口径）', (rate * 100).toFixed(2) + '%');
+  ok(scoreMaxDev < 0.06, '八因子综合分数最大偏差 < 0.06', scoreMaxDev.toFixed(4));
+  ok(worst[1] < 0.02, '逐因子最大偏差 < 0.02（八因子与实盘逐字同式）', `最差 ${worst[0]} ${worst[1].toFixed(4)}`);
+  ok(signFlip === 0, '八因子符号全部一致（方向不发生翻转）', signFlip + ' 处翻转');
+  ok(FAC.every(k => typeof core.computeSignal(candles.slice(-200)).fac[k] === 'number'),
+    'app.js computeSignal 暴露八因子原值（fac）供对照');
 
   head('4. OBV 窗口化生效（不随样本长度漂移）');
   /* 同一段末尾，用「短样本」与「长样本」分别跑流式，末尾方向必须一致 ——

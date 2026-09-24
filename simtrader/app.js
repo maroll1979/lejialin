@@ -115,14 +115,14 @@ function macd(closes, f = 12, s = 26, sig = 9) {
 }
 function boll(closes, p = 20, m = 2) {
   const mid = sma(closes, p);
-  const up = [], lo = [];
+  const up = [], lo = [], sd = [];
   for (let i = 0; i < closes.length; i++) {
-    if (mid[i] == null) { up.push(null); lo.push(null); continue; }
+    if (mid[i] == null) { up.push(null); lo.push(null); sd.push(null); continue; }
     let s = 0; for (let j = i - p + 1; j <= i; j++) s += Math.pow(closes[j] - mid[i], 2);
-    const sd = Math.sqrt(s / p);
-    up.push(mid[i] + m * sd); lo.push(mid[i] - m * sd);
+    const d = Math.sqrt(s / p);
+    sd.push(d); up.push(mid[i] + m * d); lo.push(mid[i] - m * d);
   }
-  return { mid, up, lo };
+  return { mid, up, lo, sd };
 }
 
 /* KDJ(9,3,3)：RSV → K（2/3 前值 + 1/3 新值）→ D（对 K 同样平滑）→ J = 3K − 2D */
@@ -216,81 +216,254 @@ function atrRank(candles, p = 14, look = 120) {
   return hist.filter(v => v <= cur).length / hist.length;
 }
 
+/* Wilder 波动/趋向序列：ATR(14) + DI± + ADX(14)
+   递推式（与流式引擎逐字一致，勿改）：
+     前 p 根累加 → i=p 起  S = S − S/p + x
+     ATR = TR14/p ；DI± = 100×DM±14/TR14 ；DX = 100×|DI+−DI−|/(DI++DI−)
+     ADX 首值 = 前 p 个 DX 的均值，之后  ADX = (ADX×(p−1) + DX)/p
+   ATR 是后面所有因子的量纲基准（把价格差统一成「几个 ATR」，跨周期跨品种可比）。 */
+function wilderSeries(candles, p = 14) {
+  const n = candles.length;
+  const atr = [], diP = [], diM = [], adx = [];
+  let tSum = 0, pSum = 0, mSum = 0, adxV = null, dxSum = 0, dxCnt = 0;
+  for (let i = 0; i < n; i++) {
+    const c = candles[i], pv = i > 0 ? candles[i - 1] : null;
+    let tr, dp, dm;
+    if (!pv) { tr = c.high - c.low; dp = 0; dm = 0; }
+    else {
+      const upM = c.high - pv.high, dnM = pv.low - c.low;
+      dp = (upM > dnM && upM > 0) ? upM : 0;
+      dm = (dnM > upM && dnM > 0) ? dnM : 0;
+      tr = Math.max(c.high - c.low, Math.abs(c.high - pv.close), Math.abs(c.low - pv.close));
+    }
+    if (i < p) { tSum += tr; pSum += dp; mSum += dm; atr.push(null); diP.push(null); diM.push(null); adx.push(null); continue; }
+    if (i === p) { tSum += tr; pSum += dp; mSum += dm; }
+    else { tSum = tSum - tSum / p + tr; pSum = pSum - pSum / p + dp; mSum = mSum - mSum / p + dm; }
+    atr.push(tSum / p);
+    const dpv = tSum > 0 ? 100 * pSum / tSum : 0;
+    const dmv = tSum > 0 ? 100 * mSum / tSum : 0;
+    diP.push(dpv); diM.push(dmv);
+    const sum = dpv + dmv;
+    const dx = sum > 0 ? 100 * Math.abs(dpv - dmv) / sum : 0;
+    if (adxV == null) { dxSum += dx; dxCnt++; if (dxCnt >= p) { adxV = dxSum / p; adx.push(adxV); } else adx.push(null); }
+    else { adxV = (adxV * (p - 1) + dx) / p; adx.push(adxV); }
+  }
+  return { atr, diP, diM, adx };
+}
+
+/* 通用背离判定（表里：MACD 看背离、RSI 看背离、OBV 看是否确认价格新高/新低）
+   窗口 = 截至 i 的前 look 根（不含 i 自身）；价新高而指标未新高 → −1（顶背离），
+   价新低而指标未新低 → +1（底背离），否则 0。 */
+function divergenceAt(prices, inds, i, look) {
+  const from = Math.max(0, i - look);
+  let hiC = -Infinity, hiO = -Infinity, loC = Infinity, loO = Infinity;
+  for (let x = from; x < i; x++) {
+    if (inds[x] == null || prices[x] == null) continue;
+    if (prices[x] > hiC) hiC = prices[x];
+    if (inds[x] > hiO) hiO = inds[x];
+    if (prices[x] < loC) loC = prices[x];
+    if (inds[x] < loO) loO = inds[x];
+  }
+  const c = prices[i], o = inds[i];
+  if (c == null || o == null || !isFinite(hiC)) return 0;
+  if (c > hiC && o < hiO) return -1;
+  if (c < loC && o > loO) return 1;
+  return 0;
+}
+
+/* KDJ 钝化状态机（表里：不要看金叉/死叉，要看「钝化持续时间 + 脱离极端区」）
+   钝化（D 连续停在 >75 或 <25）= 强趋势特征，顺势；脱离极端区 = 原方向动能耗尽，反向。
+   把这段抽成纯函数，是为了让 app.js 与 strategy.js 的流式状态机逐字对齐。 */
+const KDJ_HI = 75, KDJ_LO = 25;
+function kdjReplay(kd, i) {
+  let dun = 0, dunDir = 0, wasExtreme = false, runLen = 0, runDir = 0;
+  const from = Math.max(0, i - 400);
+  for (let x = from; x <= i; x++) {
+    const D = kd.d[x];
+    const inZone = D != null && (D > KDJ_HI || D < KDJ_LO);
+    const d0 = (D != null && D > KDJ_HI) ? 1 : -1;
+    if (x === i) {
+      /* 当前根：dun/dunDir 需含当前根；runLen/runDir 在「刚脱离」时取上一段的长度 */
+      if (inZone) {
+        const same = dunDir === d0;
+        return { inZone: true, dun: same ? dun + 1 : 1, dunDir: d0, wasExtreme: wasExtreme, runLen: runLen, runDir: runDir, k: kd.k[x], d: D, j: kd.j[x] };
+      }
+      return {
+        inZone: false, dun: 0, dunDir: 0, wasExtreme: wasExtreme,
+        runLen: wasExtreme ? dun : runLen, runDir: wasExtreme ? dunDir : runDir,
+        k: kd.k[x], d: D, j: kd.j[x],
+      };
+    }
+    if (inZone) { if (dunDir === d0) dun++; else { dunDir = d0; dun = 1; } }
+    else { if (dunDir !== 0) { runLen = dun; runDir = dunDir; } dun = 0; dunDir = 0; }
+    wasExtreme = inZone;
+  }
+  return null;
+}
+/* 钝化 → 顺势分；刚脱离极端区 → 反向分（单根事件） */
+function kdjScore(st) {
+  if (st == null) return { v: 0, txt: '—' };
+  if (st.inZone && st.dun >= 5) {
+    return { v: st.dunDir * Math.min(1, 0.15 + (st.dun - 4) / 8) * 0.85, txt: (st.dunDir > 0 ? '超买' : '超卖') + '钝化 ' + st.dun + ' 根（趋势未竭）' };
+  }
+  if (!st.inZone && st.wasExtreme && st.runLen >= 3) {
+    return { v: -st.runDir * Math.min(0.9, 0.45 + st.runLen * 0.05), txt: '脱离' + (st.runDir > 0 ? '超买' : '超卖') + '区（钝化 ' + st.runLen + ' 根后衰竭）' };
+  }
+  if (st.inZone) return { v: 0, txt: (st.dunDir > 0 ? '超买' : '超卖') + '钝化 ' + st.dun + ' 根（未成势）' };
+  return { v: 0, txt: '常态区' };
+}
+
 function clampN(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-/* ---------- 信号引擎（六因子打分） ----------
-   因子与权重：趋势 EMA9/21 30% · MACD 动能 22% · KDJ 15% · RSI 13% · 布林 %B 10% · OBV 量能 10%
-   KDJ 与 RSI 同属摆动指标但算法不同（KDJ 含最高最低价位置），OBV 补充量价配合验证。 */
-const SIG_W = { trend: 0.30, macd: 0.22, kdj: 0.15, rsi: 0.13, boll: 0.10, obv: 0.10 };
+/* ---------- 信号引擎（八因子打分 · 按「指标推荐关注方式」重构） ----------
+   设计原则 —— 逐条落实「不要只看」那一栏：
+     · EMA   → 不看单次金叉/死叉，改看 斜率 + 快慢线距离及其变化 + 价格与 EMA 偏离
+     · MACD  → 不看是否大于/小于 0，改看 Histogram 值 + 一阶变化 + 二阶加速度 + 背离
+     · ADX   → 不看单个阈值，改看 绝对强度（连续映射）+ 连续上升/下降速度
+     · RSI   → 不看超买超卖本身，改看 区域 + 斜率 + 背离 + 脱离极端区
+     · KDJ   → 不看金叉/死叉，改看 钝化持续时间 + 脱离极端区
+     · BOLL  → 不看触碰上下轨，改看 Band Width 分位 + z-score + 假突破后回归
+     · OBV   → 不看绝对数值，改看 是否确认价格新高/新低（确认 or 背离）
+     · Volume→ 不看简单放量，改看 RVOL + climax + 结构位放量
+   量纲统一：价格差一律除以 Wilder ATR(14)，变成「几个 ATR」，
+   这样 5m / 15m / 1h 与 BTC / ETH / 黄金可以共用同一套阈值。 */
+const SIG_W = { trend: 0.15, macd: 0.14, adx: 0.13, rsi: 0.11, kdj: 0.10, boll: 0.10, obv: 0.13, vol: 0.14 };
+const SIG_LOOK = { div: 30, struct: 20, rvol: 120 };
+
 function computeSignal(candles) {
+  const n = candles.length;
+  if (n < 60) return null;
   const closes = candles.map(c => c.close);
-  if (closes.length < 40) return null;
-  const last = closes[closes.length - 1];
+  const i = n - 1, last = closes[i];
+
   const e9 = ema(closes, 9), e21 = ema(closes, 21);
   const m = macd(closes), r = rsi(closes), bx = bollExt(closes);
   const kd = kdj(candles);
-  const i = closes.length - 1;
+  const ws = wilderSeries(candles);
+  const A = ws.atr[i];                                  // 量纲基准
+  const okA = A != null && A > 0;
+  const ov = obv(candles), oma = ema(ov, 20);
+  const k5 = Math.max(0, i - 5);
 
-  // ① 趋势因子：EMA9/21 乖离归一
-  const dev = (e9[i] - e21[i]) / last;
-  const trend = clampN(dev * 120, -1, 1);
+  // ① 趋势因子 · EMA —— 斜率 + 快慢线距离变化 + 价格与 EMA 偏离
+  const devA = okA ? (e9[i] - e21[i]) / A : 0;          // 快慢线距离（单位：ATR）
+  const devA5 = okA ? (e9[k5] - e21[k5]) / A : 0;
+  const slopeA = okA ? (e9[i] - e9[k5]) / A : 0;        // EMA9 斜率（5 根，单位：ATR）
+  const pDevA = okA ? (last - e21[i]) / A : 0;          // 价格与 EMA21 偏离（单位：ATR）
+  const trend = clampN(0.34 * clampN(slopeA / 1.6, -1, 1)
+    + 0.24 * clampN(devA / 2.0, -1, 1)
+    + 0.18 * clampN((devA - devA5) / 0.8, -1, 1)
+    + 0.24 * clampN(pDevA / 2.0, -1, 1), -1, 1);
 
-  // ② 动能因子：MACD 柱方向 + 增强/衰减 + 零轴位置
-  let macdV = 0;
-  if (m.hist[i] > 0) macdV = m.hist[i] > m.hist[i - 1] ? 1 : 0.45;
-  else macdV = m.hist[i] < m.hist[i - 1] ? -1 : -0.45;
-  // 零轴位置只做「同向放大」，不单独制造方向（否则横盘微涨会被误判为明确多头）
-  if (m.dif[i] > 0 && m.dea[i] > 0 && macdV > 0) macdV = Math.min(1, macdV + 0.12);
-  else if (m.dif[i] < 0 && m.dea[i] < 0 && macdV < 0) macdV = Math.max(-1, macdV - 0.12);
-  macdV = clampN(macdV, -1, 1);
+  // ② 动能因子 · MACD —— Histogram 值 + 一阶变化 + 二阶加速度 + 背离
+  const h0 = m.hist[i], h1 = m.hist[i - 1], h2 = m.hist[i - 2];
+  const hvN = okA ? h0 / A : 0;
+  const h1N = okA ? (h0 - h1) / A : 0;
+  const h2N = okA ? (h0 - 2 * h1 + h2) / A : 0;         // 二阶差分 = 加速度
+  const mdvg = divergenceAt(closes, m.dif, i, SIG_LOOK.div);
+  const macdV = clampN(0.45 * clampN(hvN / 0.6, -1, 1)
+    + 0.22 * clampN(h1N / 0.12, -1, 1)
+    + 0.15 * clampN(h2N / 0.10, -1, 1)
+    + 0.30 * mdvg, -1, 1);
   const macdCross = (m.dif[i] > m.dea[i] && m.dif[i - 1] <= m.dea[i - 1]) ? 1
     : (m.dif[i] < m.dea[i] && m.dif[i - 1] >= m.dea[i - 1]) ? -1 : 0;
 
-  // ③ KDJ 因子：金叉/死叉（55%）+ 超买超卖区（45%）
-  // KDJ 金叉权重按位置衰减：低位金叉（K<30）信号强，高位金叉（K>70）易失效
-  const K = kd.k[i], D = kd.d[i], J = kd.j[i];
-  let kdjV = 0, kdjTxt = '—';
-  if (K != null && D != null && kd.k[i - 1] != null) {
-    const cross = (K > D && kd.k[i - 1] <= kd.d[i - 1]) ? 1 : (K < D && kd.k[i - 1] >= kd.d[i - 1]) ? -1 : 0;
-    let zone = 0;
-    if (J > 100) zone = -0.7; else if (J > 80) zone = -0.3;
-    else if (J < 0) zone = 0.7; else if (J < 20) zone = 0.3;
-    const posW = K < 30 ? 1 : K > 70 ? 0.6 : 0.8;      // 低位金叉/死叉更可信
-    kdjV = clampN(0.55 * cross * posW + 0.45 * zone, -1, 1);
-    kdjTxt = cross === 1 ? '金叉 ↑' : cross === -1 ? '死叉 ↓' : (K > D ? 'K 在 D 上' : 'K 在 D 下');
-  }
+  // ③ 趋向因子 · ADX —— 绝对强度（连续映射，非阈值）+ 连续上升/下降速度
+  const adx0 = ws.adx[i], adx6 = ws.adx[Math.max(0, i - 6)];
+  const diP = ws.diP[i], diM = ws.diM[i];
+  const adxStr = adx0 == null ? 0 : clampN((adx0 - 12) / 28, 0, 1);
+  const adxSpd = (adx0 == null || adx6 == null) ? 0 : clampN((adx0 - adx6) / 6, -1, 1);
+  const adxDir = diP == null ? 0 : (diP > diM ? 1 : diP < diM ? -1 : 0);
+  /* ADX 连续走强 → 趋势可信度放大到 1.0；连续走弱 → 衰减到 0.62 */
+  const adxV = clampN(adxDir * adxStr * (0.62 + 0.19 * (adxSpd + 1)), -1, 1);
 
-  // ④ RSI（顺势动量，极端区衰减避免追高杀低）
+  // ④ 摆动因子 · RSI —— 区域 + 斜率 + 背离 + 脱离极端区（不看超买超卖本身）
   const rv = r[i] ?? 50;
-  const rsiV = clampN((rv - 50) / 50, -0.8, 0.8);
+  const rvPrev = r[Math.max(0, i - 4)] ?? 50;
+  const rsiZone = clampN((rv - 50) / 28, -1, 1);
+  const rsiSlope = clampN((rv - rvPrev) / 4 / 2.5, -1, 1);
+  const rdvg = divergenceAt(closes, r, i, SIG_LOOK.div);
+  let rMin = Infinity, rMax = -Infinity;
+  for (let x = Math.max(0, i - 6); x < i; x++) {
+    const v = r[x]; if (v == null) continue;
+    if (v < rMin) rMin = v;
+    if (v > rMax) rMax = v;
+  }
+  const rsiExit = (rMin < 30 && rv >= 32) ? 1 : (rMax > 70 && rv <= 68) ? -1 : 0;   // 脱离极端区
+  const rsiV = clampN(0.25 * rsiZone + 0.25 * rsiSlope + 0.25 * rdvg + 0.25 * rsiExit, -1, 1);
 
-  // ⑤ 布林 %B（均值回归倾向：贴上轨偏空、贴下轨偏多）
-  let bollV = 0;
-  const pb = bx.pb;
-  if (pb != null) {
-    if (pb < 0.05) bollV = 0.8; else if (pb > 0.95) bollV = -0.8;
-    else if (pb < 0.2) bollV = 0.35; else if (pb > 0.8) bollV = -0.35;
+  // ⑤ 摆动因子 · KDJ —— 钝化持续时间 + 脱离极端区（完全不看金叉/死叉）
+  const st = kdjReplay(kd, i);
+  const kSc = kdjScore(st);
+  const kdjV = kSc.v, kdjTxt = kSc.txt;
+  const K = st ? st.k : null, D = st ? st.d : null, J = st ? st.j : null;
+
+  // ⑥ 通道因子 · BOLL —— Band Width 分位 + z-score + 假突破后回归（不看触碰上下轨）
+  const mid = bx.mid[i], sdv = bx.sd[i], up = bx.up[i], lo = bx.lo[i];
+  const z = (sdv != null && sdv > 0) ? (last - mid) / sdv : null;
+  let bollV = 0, fbrk = 0;
+  if (z != null) {
+    let v = -clampN(z / 2.4, -1, 1) * 0.55;                 // z-score 均值回归倾向
+    // 带宽分位调制：极度收口时回归不可靠（变盘临近），开口扩张时回归更可靠
+    if (bx.bwRank != null) v *= (bx.bwRank < 0.2 ? 0.70 : bx.bwRank > 0.8 ? 1.12 : 1);
+    // 假突破后回归：当根上影破上轨收回，或上一根收在轨外而本根收回 → 强反向
+    const pUp = i > 0 ? bx.up[i - 1] : null, pLo = i > 0 ? bx.lo[i - 1] : null;
+    const falseUp = (candles[i].high > up && last < up) || (pUp != null && closes[i - 1] > pUp && last < up);
+    const falseDn = (candles[i].low < lo && last > lo) || (pLo != null && closes[i - 1] < pLo && last > lo);
+    if (falseUp) { v = -0.9; fbrk = -1; }
+    else if (falseDn) { v = 0.9; fbrk = 1; }
+    bollV = clampN(v, -1, 1);
   }
 
-  // ⑥ OBV 量能：OBV 与自身 20 期均线的偏离（60%）+ 量价背离（40%）
-  const ov = obv(candles), oma = ema(ov, 20);
-  const rel = (ov[i] - oma[i]) / (Math.abs(oma[i]) + 1e-9);
-  const obvBase = clampN(rel * 2, -0.9, 0.9);      // 系数收敛，避免横盘里 OBV 随机游走打满
-  const dvg = obvDivergence(candles);
-  const obvV = clampN(obvBase * 0.6 + dvg * 0.4, -1, 1);
-  const obvTxt = dvg === -1 ? '顶背离（价涨量缩）' : dvg === 1 ? '底背离（价跌量缩）'
-    : (ov[i] >= oma[i] ? '量能偏多' : '量能偏空');
+  // ⑦ 量价因子 · OBV —— 是否确认价格新高/新低（不看绝对数值）
+  let hiC = -Infinity, hiO = -Infinity, loC = Infinity, loO = Infinity;
+  for (let x = Math.max(0, i - SIG_LOOK.div); x < i; x++) {
+    if (closes[x] > hiC) hiC = closes[x];
+    if (ov[x] > hiO) hiO = ov[x];
+    if (closes[x] < loC) loC = closes[x];
+    if (ov[x] < loO) loO = ov[x];
+  }
+  const newHi = last > hiC, newLo = last < loC;
+  let obvV = 0, obvTxt = '无新高/新低（弱参考）', obvState = 0;
+  if (newHi && ov[i] >= hiO) { obvV = 1; obvState = 1; obvTxt = '量价同步新高（确认）'; }
+  else if (newHi && ov[i] < hiO) { obvV = -0.8; obvState = 1; obvTxt = '价新高但 OBV 未确认（顶背离）'; }
+  else if (newLo && ov[i] <= loO) { obvV = -1; obvState = -1; obvTxt = '量价同步新低（确认）'; }
+  else if (newLo && ov[i] > loO) { obvV = 0.8; obvState = -1; obvTxt = '价新低但 OBV 未确认（底背离）'; }
+  else obvV = clampN((ov[i] - oma[i]) / (Math.abs(oma[i]) + 1e-9) * 2, -0.35, 0.35);
+  const dvg = (newHi && ov[i] < hiO) ? -1 : (newLo && ov[i] > loO) ? 1 : 0;
 
-  const raw = trend * SIG_W.trend + macdV * SIG_W.macd + kdjV * SIG_W.kdj
-    + rsiV * SIG_W.rsi + bollV * SIG_W.boll + obvV * SIG_W.obv;
+  // ⑧ 量能因子 · Volume —— RVOL + climax + 结构位放量（不看简单放量）
+  const cVol = candles[i].volume || 0;
+  let vSum = 0, vCnt = 0;
+  for (let x = Math.max(0, i - SIG_LOOK.rvol); x < i; x++) { vSum += candles[x].volume || 0; vCnt++; }
+  const rvol = (vCnt > 0 && vSum > 0) ? cVol / (vSum / vCnt) : 1;
+  let hi20 = -Infinity, lo20 = Infinity;
+  for (let x = Math.max(0, i - SIG_LOOK.struct); x < i; x++) {
+    if (candles[x].high > hi20) hi20 = candles[x].high;
+    if (candles[x].low < lo20) lo20 = candles[x].low;
+  }
+  const rng = candles[i].high - candles[i].low;
+  const barPos = rng > 0 ? (last - candles[i].low) / rng : 0.5;
+  const nearHi = isFinite(hi20) && candles[i].high >= hi20;
+  const nearLo = isFinite(lo20) && candles[i].low <= lo20;
+  let volV = 0, volTxt = '常态量';
+  if (rvol >= 1.4 && nearHi) { volV = 0.85; volTxt = '结构位放量向上突破'; }
+  else if (rvol >= 1.4 && nearLo) { volV = -0.85; volTxt = '结构位放量向下破位'; }
+  else if (rvol >= 3 && barPos < 0.34) { volV = 0.60; volTxt = '抛售高潮（量能尖峰＋收在下沿）'; }
+  else if (rvol >= 3 && barPos > 0.66) { volV = -0.60; volTxt = '买入高潮（量能尖峰＋收在上沿）'; }
+  else if (rvol >= 1.4) volTxt = '放量但不在结构位（不给方向）';
+  else if (rvol < 0.6) volTxt = '缩量';
 
-  /* 方向判定的两道闸门：
-     ① 主导因子：至少有一个因子明确表态，否则六因子各给一点同向分也能凑过阈值；
-     ② 趋势门槛：EMA9/21 粘合（|trend| < 0.15）说明处于震荡，此时摆动指标噪音大，
-        需更强的分数才认定方向成立（阈值 0.20 → 0.32）。 */
-  const strength = Math.max(Math.abs(trend), Math.abs(macdV), Math.abs(kdjV),
-    Math.abs(rsiV), Math.abs(bollV), Math.abs(obvV));
-  const trendLocked = Math.abs(trend) >= 0.15;
+  const raw = trend * SIG_W.trend + macdV * SIG_W.macd + adxV * SIG_W.adx + rsiV * SIG_W.rsi
+    + kdjV * SIG_W.kdj + bollV * SIG_W.boll + obvV * SIG_W.obv + volV * SIG_W.vol;
+
+  /* 方向判定两道闸门（与上一版同构，阈值不变以保证前后可比）：
+     ① 主导因子：八因子各给一点同向分也能凑过阈值，故要求至少一个因子明确表态；
+     ② 趋势门槛：EMA9/21 距离 < 0.30 ATR 视为震荡，此时摆动指标噪音大，
+        需更强分数才认定方向成立（阈值 0.20 → 0.32）。 */
+  const strength = Math.max(Math.abs(trend), Math.abs(macdV), Math.abs(adxV), Math.abs(rsiV),
+    Math.abs(kdjV), Math.abs(bollV), Math.abs(obvV), Math.abs(volV));
+  const trendLocked = Math.abs(devA) >= 0.30;
   const th = trendLocked ? 0.20 : 0.32;
   const clear = strength >= 0.5 && Math.abs(raw) >= th;
   const score = clear ? raw : raw * 0.5;      // 方向不成立 → 分数向中性收敛
@@ -299,24 +472,32 @@ function computeSignal(candles) {
     : score >= 0.5 ? '强烈买入' : score >= th ? '买入'
       : score > -th ? '观望' : score > -0.5 ? '卖出' : '强烈卖出';
   const kind = !clear ? 'neutral' : score >= th ? 'buy' : score > -th ? 'neutral' : 'sell';
+  const sgn = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(2);
   return {
     score, label, kind, dir, clear, raw, th, trendLocked,
+    // 因子原值（供测试逐因子对照，也给"为什么是这个方向"留痕）
+    fac: { trend, macd: macdV, adx: adxV, rsi: rsiV, kdj: kdjV, boll: bollV, obv: obvV, vol: volV },
     detail: [
-      ['趋势 EMA9/21', e9[i] > e21[i] ? '多头排列' : '空头排列', trend],
-      ['动能 MACD柱', (m.hist[i] > 0 ? '多方' : '空方') + (macdCross ? (macdCross > 0 ? ' · 金叉' : ' · 死叉') : ''), macdV],
-      ['KDJ 随机指标', K == null ? '—' : `${kdjTxt} · J ${J.toFixed(0)}`, kdjV],
-      ['超买超卖 RSI', rv.toFixed(1), rsiV],
-      ['通道 布林%B', pb != null ? (pb * 100).toFixed(0) + '%' : '—', bollV],
-      ['量能 OBV', obvTxt, obvV],
+      ['趋势 EMA9/21', `斜率 ${sgn(slopeA)}ATR · 距离 ${sgn(devA)}ATR`, trend],
+      ['动能 MACD柱', `值 ${sgn(hvN)}ATR · 加速度 ${h2N >= 0 ? '+' : '−'}${Math.abs(h2N).toFixed(3)}${mdvg ? (mdvg < 0 ? ' · 顶背离' : ' · 底背离') : ''}`, macdV],
+      ['趋向 ADX(14)', adx0 == null ? '—' : `${adx0.toFixed(0)} · ${adxSpd > 0.05 ? '走强' : adxSpd < -0.05 ? '走弱' : '走平'} · ${adxDir > 0 ? 'DI+ 占优' : adxDir < 0 ? 'DI− 占优' : '多空均衡'}`, adxV],
+      ['摆动 RSI(14)', `${rv.toFixed(0)} · 斜率 ${sgn(rsiSlope * 2.5)}${rdvg ? (rdvg < 0 ? ' · 顶背离' : ' · 底背离') : ''}${rsiExit ? (rsiExit > 0 ? ' · 脱离超卖' : ' · 脱离超买') : ''}`, rsiV],
+      ['摆动 KDJ(9,3,3)', kdjTxt, kdjV],
+      ['通道 BOLL(20)', `z ${z == null ? '—' : z.toFixed(2)} · 带宽分位 ${bx.bwRank == null ? '—' : (bx.bwRank * 100).toFixed(0) + '%'}${fbrk ? (fbrk < 0 ? ' · 上轨假突破' : ' · 下轨假突破') : ''}`, bollV],
+      ['量价 OBV', obvTxt, obvV],
+      ['量能 VOL', `RVOL ${rvol.toFixed(2)} · ${volTxt}`, volV],
     ],
     // 指标快照（供指标面板与止盈止损优化使用）
     ind: {
-      k: K, d: D, j: J, kdjTxt,
-      dif: m.dif[i], dea: m.dea[i], hist: m.hist[i], macdCross,
-      rsi: rv,
-      pb, bw: bx.bw[i], bwRank: bx.bwRank, squeeze: bx.squeeze, expand: bx.expand,
-      bUp: bx.up[i], bMid: bx.mid[i], bLo: bx.lo[i],
-      obv: ov[i], obvMa: oma[i], dvg, obvTxt,
+      k: K, d: D, j: J, kdjTxt, kdjDun: st ? st.dun : 0, kdjInZone: st ? st.inZone : false,
+      dif: m.dif[i], dea: m.dea[i], hist: h0, hist1: h1N, hist2: h2N, macdCross, mdvg,
+      rsi: rv, rsiZone, rsiSlope, rdvg, rsiExit,
+      adx: adx0, adxStr, adxSpeed: adxSpd, diP, diM,
+      pb: bx.pb, bw: bx.bw[i], bwRank: bx.bwRank, squeeze: bx.squeeze, expand: bx.expand,
+      sd: sdv, z, fbrk,
+      bUp: up, bMid: mid, bLo: lo,
+      obv: ov[i], obvMa: oma[i], dvg, obvTxt, obvState,
+      rvol, volTxt, atr: A, devA, slopeA, pDevA,
     },
   };
 }
@@ -2352,9 +2533,10 @@ function atr(candles, p = 14) {
    止盈止损区间引擎
    输入：某周期的真实K线（真实成交数据），输出该周期的
         止损价 / 止盈1 / 止盈2 / 盈亏比 / 参考入场区
-   依据（六类指标共同定价）：
-        ATR(14) 波动 + 近N根结构高低点 + 布林带（%B/带宽分位）
-        + KDJ 超买超卖 + OBV 量价背离 + MACD 动能增强/衰减 + 信号方向
+   依据（八因子信号 + ATR/结构共同定价）：
+        ATR(14) 波动 + 近N根结构高低点 + 布林带宽分位（极收/扩张）
+        + KDJ 钝化与脱离极端区 + OBV 确认新高新低/背离
+        + MACD 二阶加速度与背离 + ADX 强度与升降速度 + RVOL climax + 信号方向
    ============================================================ */
 
 /* 指标驱动的止损/止盈调整系数：
@@ -2369,25 +2551,45 @@ function indAdjust(sig, candles, dir) {
     if (ar > 0.72) { atrKMul *= 1.15; reasons.push(`ATR 处于历史高位分位(${(ar * 100) | 0}%)，止损放宽 15%`); }
     else if (ar < 0.28) { atrKMul *= 0.90; reasons.push(`ATR 处于历史低位分位(${(ar * 100) | 0}%)，止损收紧 10%`); }
   }
-  if (ind.squeeze) { stopBuf = 0.25; reasons.push('布林带收口（波动压缩），止损附加 0.25×ATR 缓冲防扫损'); }
-  else if (ind.expand) { atrKMul *= 1.08; reasons.push('布林带开口扩张，止损随波动上浮 8%'); }
+  if (ind.squeeze) { stopBuf = 0.25; reasons.push('布林带宽处历史低分位（波动压缩），止损附加 0.25×ATR 缓冲防扫损'); }
+  else if (ind.expand) { atrKMul *= 1.08; reasons.push('布林带宽处历史高分位（波动扩张），止损随波动上浮 8%'); }
 
-  const J = ind.j;
-  if (J != null) {
-    if (J > 100) { tp1Mul *= 0.80; tp2Mul *= 0.88; reasons.push('KDJ 超买（J>100），止盈位提前锁定'); }
-    else if (J < 0) { tp1Mul *= 0.80; tp2Mul *= 0.88; reasons.push('KDJ 超卖（J<0），止盈位提前锁定'); }
+  /* KDJ：不看超买超卖本身，看「钝化是否持续」——
+     钝化中 = 趋势未竭（止盈可看远）；刚脱离极端区 = 动能衰竭（止盈提前锁定） */
+  if (ind.kdjInZone && ind.kdjDun >= 5) {
+    tp2Mul *= 1.10;
+    reasons.push(`KDJ ${ind.d > 75 ? '超买' : '超卖'}钝化已持续 ${ind.kdjDun} 根（趋势未竭），止盈二看远 10%`);
+  } else if (ind.kdjTxt && ind.kdjTxt.indexOf('脱离') === 0) {
+    tp1Mul *= 0.82; tp2Mul *= 0.80;
+    reasons.push('KDJ 脱离极端区（钝化后动能衰竭），止盈一/二各提前 18% / 20%');
   }
 
+  /* OBV：不看绝对数值，看是否确认价格新高 / 新低 */
   const dvg = ind.dvg || 0;
-  if (dvg === -1) { tp1Mul *= 0.80; tp2Mul *= 0.75; atrKMul *= 0.92; reasons.push('OBV 顶背离（价涨量缩），止盈收紧 20%、止损上移'); }
-  else if (dvg === 1) { tp1Mul *= 0.80; tp2Mul *= 0.75; atrKMul *= 0.92; reasons.push('OBV 底背离（价跌量缩），止盈收紧 20%、止损下移'); }
-  else if (ind.obv != null && ind.obvMa != null && ind.obv > ind.obvMa) { tp2Mul *= 1.10; reasons.push('OBV 量能配合（量增价涨），止盈二可看更远'); }
+  if (dvg === -1) { tp1Mul *= 0.80; tp2Mul *= 0.75; atrKMul *= 0.92; reasons.push('OBV 顶背离（价创新高而量能未确认），止盈收紧 20%、止损上移'); }
+  else if (dvg === 1) { tp1Mul *= 0.80; tp2Mul *= 0.75; atrKMul *= 0.92; reasons.push('OBV 底背离（价创新低而量能未确认），止盈收紧 20%、止损下移'); }
+  else if (ind.obvState === 1 || ind.obvState === -1) { tp2Mul *= 1.10; reasons.push('OBV 量价同步' + (ind.obvState === 1 ? '新高' : '新低') + '（确认），止盈二可看更远'); }
 
-  const h = ind.hist;
-  if (h != null) {
-    const strong = (dir === 'long' && h > 0) || (dir === 'short' && h < 0);
-    if (strong) { tp2Mul *= 1.08; reasons.push('MACD 动能同向增强，止盈二适度看远'); }
-    else { tp2Mul *= 0.88; reasons.push('MACD 动能反向/衰减，止盈二下修'); }
+  /* MACD：不看柱的正负，看二阶加速度与背离 */
+  const A = ind.atr;
+  if (A != null && A > 0) {
+    const acc = ind.hist2 / A;
+    const revDvg = ind.mdvg && ((dir === 'long' && ind.mdvg < 0) || (dir === 'short' && ind.mdvg > 0));
+    if (revDvg) { tp2Mul *= 0.85; reasons.push('MACD 出现反向背离，止盈二下修 15%'); }
+    else if (acc > 0.02) { tp2Mul *= 1.10; reasons.push(`MACD 柱二阶加速 (+${acc.toFixed(3)}ATR/根²)，动能增强，止盈二看远 10%`); }
+    else if (acc < -0.02) { tp2Mul *= 0.92; reasons.push(`MACD 柱二阶减速 (${acc.toFixed(3)}ATR/根²)，止盈二下修 8%`); }
+  }
+
+  /* ADX：不看单个阈值，看绝对强度与升降速度 */
+  if (ind.adx != null) {
+    if (ind.adx >= 25 && ind.adxSpeed > 0) { atrKMul *= 1.05; tp2Mul *= 1.10; reasons.push(`ADX ${ind.adx.toFixed(0)} 且仍在走强，趋势可信度高，止盈二看远 10%`); }
+    else if (ind.adx < 15) { atrKMul *= 0.92; tp2Mul *= 0.90; reasons.push(`ADX ${ind.adx.toFixed(0)} 无趋势（噪音区），止损收紧 8%、止盈二下修 10%`); }
+  }
+
+  /* 量能：climax 尖峰后反转风险高 */
+  if (ind.rvol != null && ind.rvol >= 3) {
+    tp1Mul *= 0.82; tp2Mul *= 0.85;
+    reasons.push(`成交量 RVOL ${ind.rvol.toFixed(1)}（climax 尖峰），情绪高潮后易反转，止盈提前锁定`);
   }
   return { atrKMul, tp1Mul, tp2Mul, stopBuf, reasons, atrRank: ar, ind };
 }
@@ -2427,7 +2629,7 @@ function tpSlPlan(candles, tf, price) {
   const score = sig && !isNaN(sig.score) ? sig.score : 0;
   const label = sig ? sig.label : '—';
 
-  // 方向：由六因子信号引擎判定（含主导因子与趋势门槛两道闸门）
+  // 方向：由八因子信号引擎判定（含主导因子与趋势门槛两道闸门）
   const dir = (sig && sig.dir) ? sig.dir : 'wait';
   const adj = indAdjust(sig, candles, dir);
   /* maxAtrK 是最终风险的硬上限：指标系数叠加后（如 2.4×1.15×1.08=2.98 > 2.8）不允许突破，
@@ -2566,7 +2768,7 @@ function tpSlSummary(plans, px, inst) {
 function FEE_MARKET_RATE() { return state.orderType === 'limit' ? FEE_MAKER : FEE_TAKER; }
 
 /* ---------- 止盈止损手动微调 ----------
-   自动方案基于六类指标生成；允许对任一周期手工覆盖 止损 / 止盈一 / 止盈二，
+   自动方案基于八因子信号生成；允许对任一周期手工覆盖 止损 / 止盈一 / 止盈二，
    覆盖后盈亏比、风险预算与建议数量全部按手填价联动重算，可一键恢复自动。 */
 const TPOV_KEY = 'simtrader_tpov_v1';
 function loadTpOv() {
@@ -2722,14 +2924,14 @@ function renderTpSl() {
   const manTfs = t.plans.filter(p => p.manual).map(p => TF_NAME[p.tf]);
   box.innerHTML = head + posHtml + `
     ${manTfs.length ? `<div class="tpsl-manual">✎ 已手动微调：${manTfs.join(' / ')}（黄框为手填价，盈亏比与建议数量已按手填价重算）</div>` : ''}
-    <div class="tpsl-note">${inst.type === 'ust' ? '⚠ 美债为日频官方数据，四个周期共用同一日线序列，各周期差异仅来自风险倍数设定 · ' : ''}定价格局：<b>六因子信号</b>（趋势30% / MACD22% / KDJ15% / RSI13% / 布林10% / OBV10%）判方向 · <b>止损</b> = 近N根结构高低点 与 ATR(14) 波动取优，并按 ATR 分位、布林带宽（收口加缓冲）修正 · <b>止盈</b> = 结构压力/布林轨 与 风险回报倍数取优，并按 KDJ 极值、OBV 量价背离、MACD 动能再修正 · 综合结论按周期权重（15m 20% / 30m 24% / 1h 26% / 4h 30%）加权 · 更新于 ${ts(t.ts)}</div>`;
+    <div class="tpsl-note">${inst.type === 'ust' ? '⚠ 美债为日频官方数据，三周期共用同一日线序列，各周期差异仅来自风险倍数设定 · ' : ''}定价格局：<b>八因子信号</b>（EMA15% / MACD14% / ADX13% / OBV13% / VOL14% / RSI11% / KDJ10% / BOLL10%）判方向 · <b>止损</b> = 近N根结构高低点 与 ATR(14) 波动取优，并按 ATR 分位、布林带宽分位（极收加缓冲 / 扩张上浮）修正 · <b>止盈</b> = 结构压力/布林轨 与 风险回报倍数取优，再按 KDJ 钝化与脱离极端区、OBV 确认新高新低/背离、MACD 二阶加速度、ADX 强度与升降速度、RVOL climax 修正 · 综合结论按周期权重（5m 26% / 15m 30% / 1h 44%）加权 · 更新于 ${ts(t.ts)}</div>`;
 
   box.querySelectorAll('[data-use]').forEach(b => b.addEventListener('click', () => applyTpSlPlan(b.dataset.use)));
   renderTpOvPanel();     // 同步微调面板的联动数值（不重建输入框，避免焦点丢失）
 }
 
 /* ---------- 指标全景面板 ----------
-   展示当前所选周期的六类指标原值与多空判定，便于人工复核止盈止损的生成依据。 */
+   展示当前所选周期的八因子原值与多空判定，便于人工复核止盈止损的生成依据。 */
 const IND_TONE = { up: 'up', down: 'down', wait: 'wait' };
 function indTag(txt, tone) {
   return `<span class="ind-tag ${tone || 'wait'}">${txt}</span>`;
@@ -2750,24 +2952,48 @@ function renderIndPanel() {
   const n2 = v => (v == null || isNaN(v)) ? '—' : v.toFixed(2);
   const n0 = v => (v == null || isNaN(v)) ? '—' : v.toFixed(0);
 
-  /* KDJ */
-  const jTone = ind.j == null ? 'wait' : (ind.j > 100 || ind.j > 80 ? 'down' : ind.j < 0 || ind.j < 20 ? 'up' : 'wait');
-  const jTag = ind.j == null ? '—' : ind.j > 100 ? '超买区' : ind.j > 80 ? '偏超买' : ind.j < 0 ? '超卖区' : ind.j < 20 ? '偏超卖' : '中性区';
-  /* MACD */
-  const mTone = ind.hist == null ? 'wait' : (ind.hist > 0 ? 'up' : 'down');
-  const mTag = ind.macdCross ? (ind.macdCross > 0 ? '金叉' : '死叉') : (ind.hist > 0 ? '红柱 · 多头' : '绿柱 · 空头');
-  /* BOLL */
-  const bTone = ind.pb == null ? 'wait' : (ind.pb > 0.8 ? 'down' : ind.pb < 0.2 ? 'up' : 'wait');
-  const bTag = ind.squeeze ? '收口（变盘临近）' : ind.expand ? '开口扩张' : (ind.pb == null ? '—' : ind.pb > 0.8 ? '贴上轨' : ind.pb < 0.2 ? '贴下轨' : '通道中部');
-  /* OBV */
-  const oTone = ind.dvg === -1 ? 'down' : ind.dvg === 1 ? 'up' : (ind.obv != null && ind.obvMa != null ? (ind.obv > ind.obvMa ? 'up' : 'down') : 'wait');
-  const oTag = ind.dvg === -1 ? '⚠ 顶背离' : ind.dvg === 1 ? '⚠ 底背离' : (ind.obv != null && ind.obvMa != null ? (ind.obv > ind.obvMa ? '量能偏多' : '量能偏空') : '—');
-  /* RSI */
-  const rTone = ind.rsi == null ? 'wait' : (ind.rsi > 70 ? 'down' : ind.rsi < 30 ? 'up' : 'wait');
-  const rTag = ind.rsi == null ? '—' : ind.rsi > 70 ? '超买' : ind.rsi < 30 ? '超卖' : '中性';
-  /* ATR */
-  const aTone = p.atrRank == null ? 'wait' : (p.atrRank > 0.72 ? 'down' : p.atrRank < 0.28 ? 'wait' : 'wait');
-  const aTag = p.atrRank == null ? '—' : p.atrRank > 0.72 ? '高波动' : p.atrRank < 0.28 ? '低波动' : '常态波动';
+  /* 每个指标的显示口径都对应表里「推荐关注方式」那一栏：
+     不再显示金叉/死叉、不再显示「是否大于 0」、不再显示超买超卖本身、
+     不再显示触碰上下轨、不再显示绝对数值。 */
+  const sg = (v, d) => (v == null || isNaN(v)) ? '—' : (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(d == null ? 2 : d);
+  /* ① EMA —— 斜率 / 快慢线距离 / 价格偏离 */
+  const eTone = ind.devA == null ? 'wait' : (ind.devA > 0.3 ? 'up' : ind.devA < -0.3 ? 'down' : 'wait');
+  const eTag = ind.devA == null ? '—' : Math.abs(ind.devA) < 0.3 ? '快慢线粘合（震荡）'
+    : (ind.devA > 0 ? '多头排列' : '空头排列') + (Math.sign(ind.slopeA) === Math.sign(ind.devA) ? ' · 斜率配合' : ' · 斜率背离');
+  /* ② MACD —— Histogram 值 / 一阶 / 二阶加速度 / 背离 */
+  const mTone = ind.hist2 == null || ind.atr == null ? 'wait'
+    : (ind.hist2 / ind.atr > 0.02 ? 'up' : ind.hist2 / ind.atr < -0.02 ? 'down' : 'wait');
+  const mTag = ind.mdvg ? (ind.mdvg < 0 ? '⚠ 顶背离' : '⚠ 底背离')
+    : ind.atr == null ? '—' : (ind.hist2 / ind.atr > 0.02 ? '动能二阶加速' : ind.hist2 / ind.atr < -0.02 ? '动能二阶减速' : '动能平稳');
+  /* ③ ADX —— 绝对强度 + 连续上升/下降速度 */
+  const aTone = ind.adx == null ? 'wait' : (ind.adx >= 25 ? (ind.adxSpeed > 0 ? 'up' : 'down') : 'wait');
+  const aTag = ind.adx == null ? '—' : ind.adx < 15 ? '无趋势（噪音区）' : ind.adx < 25 ? '弱趋势'
+    : ind.adx < 40 ? (ind.adxSpeed > 0 ? '趋势成型 · 走强' : '趋势成型 · 走弱') : '强趋势';
+  /* ④ RSI —— 区域 / 斜率 / 背离 / 脱离极端区 */
+  const rTone = ind.rsiSlope == null ? 'wait' : (ind.rsiSlope > 0.05 ? 'up' : ind.rsiSlope < -0.05 ? 'down' : 'wait');
+  const rTag = ind.rsiExit ? (ind.rsiExit > 0 ? '脱离超卖区' : '脱离超买区')
+    : ind.rdvg ? (ind.rdvg < 0 ? '⚠ 顶背离' : '⚠ 底背离')
+      : ind.rsiZone == null ? '—' : ind.rsiZone > 0.35 ? '强势区' : ind.rsiZone < -0.35 ? '弱势区' : '中枢区';
+  /* ⑤ KDJ —— 钝化持续时间 + 脱离极端区 */
+  const jTone = ind.kdjInZone ? (ind.d > 75 ? 'up' : 'down') : 'wait';
+  const jTag = ind.kdjTxt || '—';
+  /* ⑥ BOLL —— Band Width 分位 / z-score / 假突破后回归 */
+  const bTone = ind.fbrk ? (ind.fbrk < 0 ? 'down' : 'up')
+    : ind.z == null ? 'wait' : (ind.z > 1 ? 'down' : ind.z < -1 ? 'up' : 'wait');
+  const bTag = ind.fbrk ? (ind.fbrk < 0 ? '⚠ 上轨假突破' : '⚠ 下轨假突破')
+    : ind.squeeze ? '带宽极收（变盘临近）' : ind.expand ? '带宽扩张'
+      : ind.z == null ? '—' : Math.abs(ind.z) > 2 ? 'z 值极端' : 'z 值常态';
+  /* ⑦ OBV —— 是否确认价格新高新低 */
+  const oTone = ind.dvg < 0 ? 'down' : ind.dvg > 0 ? 'up'
+    : ind.obvState === 1 ? 'up' : ind.obvState === -1 ? 'down' : 'wait';
+  const oTag = ind.dvg < 0 ? '⚠ 顶背离' : ind.dvg > 0 ? '⚠ 底背离'
+    : ind.obvState === 1 ? '新高确认' : ind.obvState === -1 ? '新低确认' : '无新高新低';
+  /* ⑧ Volume —— RVOL / climax / 结构位 */
+  const vTone = ind.rvol == null ? 'wait' : (ind.rvol >= 3 ? 'down' : ind.rvol >= 1.4 ? 'up' : 'wait');
+  const vTag = ind.rvol == null ? '—' : ind.rvol >= 3 ? 'climax 尖峰' : ind.rvol >= 1.4 ? '放量' : ind.rvol < 0.6 ? '缩量' : '常态量';
+  /* ⑨ ATR */
+  const wTone = p.atrRank == null ? 'wait' : (p.atrRank > 0.72 ? 'down' : 'wait');
+  const wTag = p.atrRank == null ? '—' : p.atrRank > 0.72 ? '高波动' : p.atrRank < 0.28 ? '低波动' : '常态波动';
 
   const card = (title, main, rows, tag, tone) => `<div class="ind-card">
     <div class="ind-k">${title}</div>
@@ -2779,23 +3005,29 @@ function renderIndPanel() {
   box.innerHTML = `
     <div class="ind-head">
       <span class="ind-title">指标全景 · <b>${TF_NAME[state.tf]}</b></span>
-      <span class="ind-sub">KDJ · MACD · 布林 · OBV · RSI · ATR 共同决定止盈止损</span>
+      <span class="ind-sub">EMA · MACD · ADX · RSI · KDJ · BOLL · OBV · VOL —— 一律看状态量（斜率/加速度/带宽分位/z-score/钝化/RVOL），不看金叉死叉与绝对数值</span>
     </div>
     <div class="ind-grid">
-      ${card('KDJ(9,3,3)', `K ${n2(ind.k)} / D ${n2(ind.d)}`,
-        `<div class="ind-r"><span>J 值</span><b>${n0(ind.j)}</b></div><div class="ind-r"><span>形态</span><b>${ind.kdjTxt || '—'}</b></div>`, jTag, jTone)}
-      ${card('MACD(12,26,9)', `DIF ${P(ind.dif)}`,
-        `<div class="ind-r"><span>DEA</span><b>${P(ind.dea)}</b></div><div class="ind-r"><span>柱</span><b class="${ind.hist >= 0 ? 'txt-up' : 'txt-down'}">${P(ind.hist)}</b></div>`, mTag, mTone)}
-      ${card('布林带(20,2)', `%B ${ind.pb == null ? '—' : (ind.pb * 100).toFixed(0) + '%'}`,
-        `<div class="ind-r"><span>上/中轨</span><b>${P(ind.bUp)} / ${P(ind.bMid)}</b></div><div class="ind-r"><span>下轨</span><b>${P(ind.bLo)}</b></div>`, bTag, bTone)}
-      ${card('OBV 能量潮', ind.obv == null ? '—' : (ind.obv >= 0 ? '+' : '') + fmt(ind.obv, 0),
-        `<div class="ind-r"><span>20期均线</span><b>${ind.obvMa == null ? '—' : fmt(ind.obvMa, 0)}</b></div><div class="ind-r"><span>量价</span><b>${ind.dvg ? (ind.dvg > 0 ? '底背离' : '顶背离') : '同步'}</b></div>`, oTag, oTone)}
+      ${card('EMA(9,21)', `距离 ${sg(ind.devA)}ATR`,
+        `<div class="ind-r"><span>斜率(5)</span><b>${sg(ind.slopeA)}ATR</b></div><div class="ind-r"><span>价偏离</span><b>${sg(ind.pDevA)}ATR</b></div>`, eTag, eTone)}
+      ${card('MACD(12,26,9)', `柱 ${ind.atr ? sg(ind.hist / ind.atr) : '—'}ATR`,
+        `<div class="ind-r"><span>一阶变化</span><b>${sg(ind.hist1)}</b></div><div class="ind-r"><span>二阶加速度</span><b>${sg(ind.hist2, 4)}</b></div>`, mTag, mTone)}
+      ${card('ADX(14)', `${ind.adx == null ? '—' : ind.adx.toFixed(1)}`,
+        `<div class="ind-r"><span>速度(6根)</span><b>${sg(ind.adxSpeed)}</b></div><div class="ind-r"><span>DI+/DI−</span><b>${n0(ind.diP)} / ${n0(ind.diM)}</b></div>`, aTag, aTone)}
       ${card('RSI(14)', n2(ind.rsi),
-        `<div class="ind-r"><span>超买线</span><b>70</b></div><div class="ind-r"><span>超卖线</span><b>30</b></div>`, rTag, rTone)}
+        `<div class="ind-r"><span>斜率(4根)</span><b>${sg(ind.rsiSlope)}</b></div><div class="ind-r"><span>区域</span><b>${sg(ind.rsiZone)}</b></div>`, rTag, rTone)}
+      ${card('KDJ(9,3,3)', `K ${n2(ind.k)} / D ${n2(ind.d)}`,
+        `<div class="ind-r"><span>J 值</span><b>${n0(ind.j)}</b></div><div class="ind-r"><span>钝化</span><b>${ind.kdjInZone ? ind.kdjDun + ' 根' : '无'}</b></div>`, jTag, jTone)}
+      ${card('BOLL(20,2)', `z ${ind.z == null ? '—' : ind.z.toFixed(2)}`,
+        `<div class="ind-r"><span>带宽分位</span><b>${ind.bwRank == null ? '—' : (ind.bwRank * 100).toFixed(0) + '%'}</b></div><div class="ind-r"><span>上/下轨</span><b>${P(ind.bUp)} / ${P(ind.bLo)}</b></div>`, bTag, bTone)}
+      ${card('OBV 量价', ind.obvState === 1 ? '确认新高' : ind.obvState === -1 ? '确认新低' : '无新高低',
+        `<div class="ind-r"><span>偏离均线</span><b>${sg(ind.obvMa ? (ind.obv - ind.obvMa) / (Math.abs(ind.obvMa) + 1e-9) * 100 : null, 1)}%</b></div><div class="ind-r"><span>量价</span><b>${ind.dvg ? (ind.dvg > 0 ? '底背离' : '顶背离') : '同步'}</b></div>`, oTag, oTone)}
+      ${card('VOL 相对量', `RVOL ${ind.rvol == null ? '—' : ind.rvol.toFixed(2)}`,
+        `<div class="ind-r"><span>量能状态</span><b>${ind.rvol >= 3 ? 'climax' : ind.rvol >= 1.4 ? '放量' : ind.rvol < 0.6 ? '缩量' : '常态'}</b></div><div class="ind-r"><span>基准</span><b>前 120 根均量</b></div>`, vTag, vTone)}
       ${card('ATR(14)', P(p.atr),
-        `<div class="ind-r"><span>占现价</span><b>${(p.atrPct * 100).toFixed(2)}%</b></div><div class="ind-r"><span>分位</span><b>${p.atrRank == null ? '—' : (p.atrRank * 100).toFixed(0) + '%'}</b></div>`, aTag, aTone)}
+        `<div class="ind-r"><span>占现价</span><b>${(p.atrPct * 100).toFixed(2)}%</b></div><div class="ind-r"><span>分位</span><b>${p.atrRank == null ? '—' : (p.atrRank * 100).toFixed(0) + '%'}</b></div>`, wTag, wTone)}
     </div>
-    ${p.adj && p.adj.reasons && p.adj.reasons.length ? `<div class="ind-why"><b>${TF_NAME[state.tf]}方案优化依据：</b>${p.adj.reasons.map(r => '· ' + r).join(' ')}</div>` : '<div class="ind-why">当前周期内指标无极端信号，止盈止损按结构与 ATR 基准生成</div>'}`;
+    ${p.adj && p.adj.reasons && p.adj.reasons.length ? `<div class="ind-why"><b>${TF_NAME[state.tf]}方案优化依据：</b>${p.adj.reasons.map(r => '· ' + r).join(' ')}</div>` : '<div class="ind-why">当前周期内指标无极端状态，止盈止损按结构与 ATR 基准生成</div>'}`;
 }
 
 /* ---------- 止盈止损手动微调面板 ----------

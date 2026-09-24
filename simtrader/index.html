@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260924d">
+<link rel="stylesheet" href="style.css?v=20260924e">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -282,12 +282,18 @@
         <li><b>实时价格与挂单撮合、强平检查固定为 5 秒</b>，不随档位变慢 —— 否则限价单触发与风控会失效。</li>
         <li>各档位的实际节奏：实时 = 信号与订单簿热力图 60 秒（订单簿快照自身每 5 秒刷新一次，不受档位影响）；5 / 10 / 30 分钟 = 同为 5 / 10 / 30 分钟。</li>
       </ul>
-      <h4>信号模型（多因子打分，-1 ~ +1）</h4>
+      <h4>信号模型（八因子打分，-1 ~ +1）</h4>
       <ul>
-        <li>趋势因子（权重40%）：EMA9 / EMA21 多空排列与乖离</li>
-        <li>动能因子（权重25%）：MACD(12,26,9) 柱状线方向与金叉死叉</li>
-        <li>超买超卖（权重20%）：RSI(14)，&lt;30 超卖偏多，&gt;70 超买偏空</li>
-        <li>波动通道（权重15%）：布林带(20,2) %B 位置，触及上下轨提示回归</li>
+        <li><b>六个「不要只看」</b>：不看金叉/死叉、不看「是否大于 0」、不看超买超卖本身、不看触碰上下轨、不看绝对数值、不看简单放量。每个指标都改看<b>状态量</b>：</li>
+        <li>趋势 <b>EMA(9,21)</b>（15%）：EMA9 斜率 + 快慢线距离及其 5 根变化 + 价格与 EMA21 偏离（全部以 ATR 归一，跨周期跨品种可比）</li>
+        <li>动能 <b>MACD(12,26,9)</b>（14%）：Histogram <b>值</b> + 一阶变化 + <b>二阶加速度</b> + DIF 背离</li>
+        <li>趋向 <b>ADX(14)</b>（13%）：DI± 定多空，ADX 绝对强度用<b>连续映射</b>（不用单个阈值）× 连续上升/下降速度</li>
+        <li>摆动 <b>RSI(14)</b>（11%）：区域 + <b>斜率</b> + 背离 + <b>脱离极端区</b></li>
+        <li>摆动 <b>KDJ(9,3,3)</b>（10%）：<b>钝化持续时间</b>（钝化 = 趋势未竭 → 顺势）与<b>脱离极端区</b>（动能衰竭 → 反向）</li>
+        <li>通道 <b>BOLL(20,2)</b>（10%）：Band Width 历史分位 + <b>z-score</b> 均值回归 + <b>假突破后回归</b></li>
+        <li>量价 <b>OBV</b>（13%）：是否<b>确认</b>价格新高 / 新低（确认 → 顺势；价新高而量能未确认 → 顶背离）</li>
+        <li>量能 <b>VOL</b>（14%）：RVOL 相对量 + climax 尖峰 + 结构位放量；<b>单纯放量不给方向</b></li>
+        <li>方向两道闸门：至少一个因子 |值| ≥ 0.5；且综合分 ≥ 0.20（EMA 快慢线距离 ≥ 0.3 ATR 视为有趋势），否则门槛抬到 0.32</li>
         <li>综合分 ≥0.5 强烈买入 · 0.2~0.5 买入 · -0.2~0.2 观望 · -0.5~-0.2 卖出 · ≤-0.5 强烈卖出</li>
       </ul>
       <h4>多空热力图（订单簿口径）</h4>
@@ -345,7 +351,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260924d · 实盘 Gate.io 永续 · 回测 币安现货 5m 5年（无未来函数） · 1h定方向/15m·5m共振沿开单 · 信号画在K线 · 盈亏拆解 · K线缩放拖动</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260924e · 八因子状态量信号（斜率/二阶加速度/ADX强度/带宽分位/z-score/钝化/RVOL，不看金叉死叉与绝对数值） · 1h定方向/15m·5m共振沿开单 · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -365,9 +371,9 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260924d"></script>
-<script src="lsmap.js?v=20260924d"></script>
-<script src="strategy.js?v=20260924d"></script>
-<script src="app.js?v=20260924d"></script>
+<script src="liq-map.js?v=20260924e"></script>
+<script src="lsmap.js?v=20260924e"></script>
+<script src="strategy.js?v=20260924e"></script>
+<script src="app.js?v=20260924e"></script>
 </body>
 </html>
