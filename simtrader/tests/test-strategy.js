@@ -4,7 +4,7 @@
    需联网（拉真实 Gate K线）。若只走代理：NODE_USE_ENV_PROXY=1 node test-strategy.js */
 const fs = require('fs');
 const path = require('path');
-const DIR = path.join(__dirname, '..');
+const DIR = path.join(__dirname, 'simtrader');
 
 let pass = 0, fail = 0;
 function ok(cond, name, extra) {
@@ -210,6 +210,107 @@ function loadAppSignalCore() {
   head('10. 时间对齐');
   ok(S.alignTime(1790258700, '5m') === 1790258700 - 1790258700 % 300, '对齐到 5m');
   ok(S.alignTime(1790258700, '1h') % 3600 === 0, '对齐到 1h');
+
+  /* ============================================================
+     11. 第 6 节 · 5m 市场结构触发（0–25 分）
+     ============================================================ */
+  head('11. 市场结构触发：构造用例（多空对称）');
+  function mk(seq) {                     // seq: [[方向, 根数, 每根幅度], ...]
+    const out = []; let t = 0, p = seq.start;
+    for (const it of seq.legs) {
+      for (let i = 0; i < it[1]; i++) {
+        const o = p, cl = p + it[2];
+        out.push({ time: t, open: o, high: Math.max(o, cl) + 0.25, low: Math.min(o, cl) - 0.25, close: cl, volume: 1 });
+        p = cl; t += 300;
+      }
+    }
+    return out;
+  }
+  /* 上涨到顶 → 下跌 → 反弹(LH1) → 再跌 → 反弹(LH2 更低) → 再跌 → 突破 LH2 → 回踩 → 破新高 */
+  const bull = mk({ start: 60, legs: [[0, 20, 1.0], [0, 10, -1.0], [0, 8, 1.0], [0, 10, -1.0], [0, 7, 1.0], [0, 8, -1.0], [0, 5, 1.0], [0, 4, -0.9], [0, 6, 1.0]] });
+  const rb = S.msReplay(bull);
+  const evB = [], evLB = [];
+  for (let i = 0; i < rb.n; i++) { if (rb.ev[i]) evB.push(i); if (rb.evL[i]) evLB.push(i); }
+  ok(evB.length >= 1, '多头构造序列出现严格档触发（CHOCH+回踩+BOS）', `第 ${evB.join(',')} 根`);
+  ok(evLB.length >= 1, '多头构造序列出现宽松档触发（核心≥2，即回踩成立那根）', `第 ${evLB.join(',')} 根`);
+  ok(evLB.length && evB.length && evLB[0] < evB[0], '宽松档早于严格档（回踩 → BOS）', `${evLB[0]} < ${evB[0]}`);
+
+  /* 空头：把价格沿常数镜像（x → 200 − x），事件方向应互换 */
+  const bear = bull.map(c => ({ time: c.time, open: 200 - c.open, high: 200 - c.low, low: 200 - c.high, close: 200 - c.close, volume: 1 }));
+  const rs = S.msReplay(bear);
+  let mirrorBad = 0, mirrorN = 0;
+  for (let i = 0; i < rb.n; i++) {
+    const a = rb.ev[i] ? (rb.ev[i] === 1 ? 1 : 2) : 0;
+    const b = rs.ev[i] ? (rs.ev[i] === 1 ? 2 : 1) : 0;   // 镜像后多空互换
+    if (a || b) mirrorN++;
+    if (a !== b) mirrorBad++;
+  }
+  ok(mirrorN > 0 && mirrorBad === 0, '多空完全对称（价格镜像后触发方向互换）', `${mirrorN} 个事件，${mirrorBad} 个不对称`);
+
+  head('12. 结构分值范围与核心条件蕴含关系（真实 6000 根）');
+  const ms = S.msSeries(s);
+  let rangeBad = 0, coreBad = 0, looseBad = 0, maxSeen = 0;
+  for (let i = 0; i < ms.n; i++) {
+    const L = ms.lsc[i], Sh = ms.ssc[i];
+    maxSeen = Math.max(maxSeen, L, Sh);
+    if (!(L >= 0 && L <= S.MS_SCORE_MAX) || !(Sh >= 0 && Sh <= S.MS_SCORE_MAX)) rangeBad++;
+    if (ms.ev[i]) {
+      const c = ms.ev[i] === 1 ? ms.lcore[i] : ms.score_side[i];
+      if (c < 3) coreBad++;
+    }
+    const c2 = ms.evL[i] === 1 ? ms.lcore[i] : ms.evL[i] === 2 ? ms.score_side[i] : 0;
+    if (ms.evL[i] && c2 < 2) looseBad++;
+  }
+  ok(rangeBad === 0, `结构总分恒在 0–${S.MS_SCORE_MAX} 之间`, `最大 ${maxSeen.toFixed(1)}`);
+  ok(coreBad === 0, '严格档触发 ⇒ 三个核心条件齐备（CHOCH+Retest+BOS）', `${coreBad} 个例外`);
+  ok(looseBad === 0, '宽松档触发 ⇒ 核心条件 ≥ 2', `${looseBad} 个例外`);
+
+  head('13. 无未来函数：改动第 m 根之后的数据，第 m 根之前必须完全不变');
+  const m = Math.floor(s.n * 0.7);
+  const s2 = { n: s.n, t: s.t, o: Float64Array.from(s.o), h: Float64Array.from(s.h), l: Float64Array.from(s.l), c: Float64Array.from(s.c), v: s.v };
+  for (let i = m; i < s2.n; i++) { s2.o[i] *= 1.37; s2.h[i] *= 1.37; s2.l[i] *= 1.37; s2.c[i] *= 1.37; }
+  const ms2 = S.msSeries(s2);
+  let leak = 0, leakSc = 0;
+  for (let i = 0; i < m; i++) {
+    if (ms.ev[i] !== ms2.ev[i] || ms.evL[i] !== ms2.evL[i]) leak++;
+    if (Math.abs(ms.lsc[i] - ms2.lsc[i]) > 1e-9 || Math.abs(ms.ssc[i] - ms2.ssc[i]) > 1e-9) leakSc++;
+  }
+  ok(leak === 0 && leakSc === 0, '前 70% 的结构事件与分值不受后 30% 数据影响',
+    `事件泄漏 ${leak} · 分值泄漏 ${leakSc}`);
+
+  head('14. 实盘口径一致：窗口重放 vs 全量流式');
+  /* 看板拿到的是最近 200 根 5m，用 msReplay 冷启动重放；回测是全程连续流式。
+     两者必须收敛到同一状态，否则「回测结论」和「实盘报警」不是一回事。 */
+  const WIN = 200, WARM = 60;
+  const win = [];
+  for (let i = Math.max(0, s.n - WIN); i < s.n; i++) win.push({ time: s.t[i], open: s.o[i], high: s.h[i], low: s.l[i], close: s.c[i], volume: s.v[i] });
+  const rw = S.msReplay(win);
+  const off = s.n - win.length;
+  let evDiff = 0, scDiff = 0, cmpN = 0, maxSc = 0;
+  for (let k = WARM; k < rw.n; k++) {
+    const i = off + k;
+    cmpN++;
+    if (rw.ev[k] !== ms.ev[i] || rw.evL[k] !== ms.evL[i]) evDiff++;
+    const d = Math.max(Math.abs(rw.lsc[k] - ms.lsc[i]), Math.abs(rw.ssc[k] - ms.ssc[i]));
+    if (d > maxSc) maxSc = d;
+    if (d > 1) scDiff++;
+  }
+  const agree = (1 - evDiff / cmpN) * 100;
+  ok(agree >= 99.5, `窗口重放与全量流式的方向一致率 ≥ 99.5%`, agree.toFixed(2) + '%');
+  ok(maxSc < 0.5, `结构分最大偏差 < 0.5（预热 ${WARM} 根后）`, maxSc.toFixed(2));
+
+  head('15. app.js 接入点（第 6 节）');
+  const appSrc2 = fs.readFileSync(path.join(DIR, 'app.js'), 'utf8');
+  const htmlSrc = fs.readFileSync(path.join(DIR, 'index.html'), 'utf8');
+  ok(/function renderMsPanel\(\)/.test(appSrc2), '看板含 5m 市场结构面板渲染函数');
+  ok(/id="msPanel"/.test(htmlSrc), 'index.html 含结构面板容器');
+  ok(/st\.msReplay\(c5\)/.test(appSrc2), '状态条用真实 5m K线重放结构');
+  ok(/st\.findTriggersMs\(/.test(appSrc2), '触发点来自 findTriggersMs（结构扳机）');
+  ok(/msOpts\(\)/.test(appSrc2) && /msMode|msMin|msAnd/.test(appSrc2), '档位 / 最低结构分 / AND 叠加可调');
+  ok(!/15m 与 5m 共振同向/.test(appSrc2), '已无「15m 与 5m 共振同向」旧口径报警文案');
+  ok(/ms: msOpts\(\)/.test(appSrc2), '回测按钮把结构参数传给回测引擎');
+  ok(/严格档/.test(htmlSrc) && /宽松档/.test(htmlSrc) && /CHOCH/.test(htmlSrc) && /Retest/.test(htmlSrc),
+    'index.html 已写明严格档 / 宽松档 / CHOCH / Retest 口径');
 
   console.log('\n' + '='.repeat(64));
   console.log(fail === 0 ? `✅ 全部通过（${pass} 项）` : `❌ ${fail} 项失败 / ${pass} 项通过`);

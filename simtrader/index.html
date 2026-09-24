@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260924e">
+<link rel="stylesheet" href="style.css?v=20260925a">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -86,6 +86,7 @@
       <div class="sig-cards" id="sigMatrix"></div>
       <div class="sig-hint" id="sigHint"></div>
       <div class="sig-detail" id="sigDetail"></div>
+      <div class="ms-panel" id="msPanel"></div>
       <div class="ind-panel" id="indPanel"></div>
       <div class="tpov-panel" id="tpOvPanel">
         <div class="tpov-head">
@@ -296,6 +297,29 @@
         <li>方向两道闸门：至少一个因子 |值| ≥ 0.5；且综合分 ≥ 0.20（EMA 快慢线距离 ≥ 0.3 ATR 视为有趋势），否则门槛抬到 0.32</li>
         <li>综合分 ≥0.5 强烈买入 · 0.2~0.5 买入 · -0.2~0.2 观望 · -0.5~-0.2 卖出 · ≤-0.5 强烈卖出</li>
       </ul>
+      <h4>市场结构触发（5m · 0–25 分）</h4>
+      <ul>
+        <li><b>为什么单独一层</b>：5m <b>不负责判断大趋势</b>，只负责「现在能不能扣扳机」。
+          结构定义全部<b>程序化</b>（固定 fractal 窗口找 pivot），不含主观画线</li>
+        <li><b>五个触发模块</b>（多头侧；空头侧完全对称）：
+          <b>Swing Low 成立</b> 0–3（已确认 pivot low 的新鲜度）·
+          <b>Higher Low</b> 0–5（新回踩低点高于上一个有效 Swing Low）·
+          <b>Bullish CHOCH</b> 0–7（收盘突破最近一个有效 Lower High）·
+          <b>Retest Hold</b> 0–4（回踩突破位未失守）·
+          <b>Bullish BOS</b> 0–6（回踩后再破结构高点）</li>
+        <li><b>触发条件</b>：<code>setup_valid AND bullish_choch AND retest_hold AND bullish_bos</code>（严格档）；
+          也可切到<b>宽松档</b>「核心条件满足 ≥ 2 个」—— 即「避免假信号」的下限。
+          <b>绝不用单次 5m 金叉或单根阳线当反转</b></li>
+        <li><b>结构位的有效性</b>：Lower High 只在「新 pivot high 低于上一个 pivot high」时刷新，Higher Low 同理；
+          突破必须超过 <b>0.10 × ATR</b> 才算有效，防止噪音假突破</li>
+        <li><b>不会偷看未来</b>：pivot 中心根要等它<b>右侧 2 根 K 线走完</b>之后才被确认，
+          因此历史触发点在当时是真实可知的（回测同口径）</li>
+        <li><b>面板可调</b>：严格 / 宽松、最低结构分（不限 / ≥13 / ≥16 / ≥19 / ≥22）、
+          以及「是否附加要求 5m 方向也同向」，改完立刻重算 K 线标记与报警</li>
+        <li><b>⚠ 实测提醒</b>：历史回测里<b>结构分越高并不会越赚</b>（高分往往意味着价格已经走完一段才确认），
+          所以「最低结构分」不适合当作过滤器；这层的主要价值是<b>大幅降低开单频率</b>（BTC 5 年从 3712 笔降到约 450 笔），
+          而不是提高期望</li>
+      </ul>
       <h4>多空热力图（订单簿口径）</h4>
       <ul>
         <li><b>看什么</b>：现价上下各 N 个 tick 内的<b>挂单分布</b> —— <b>横条向左 = 价格下方的买盘挂单</b>（多头阵营，承接下跌），<b>横条向右 = 价格上方的卖盘挂单</b>（空头阵营，压制上涨）；条越长=该价位区间挂单名义金额越大，中间虚线是多空分界，蓝线是现价</li>
@@ -315,13 +339,17 @@
       </ul>
       <h4>止盈 / 止损价格区间（信号栏内提示）</h4>
       <ul>
-        <li><b>开单逻辑（核心）</b>：<b>1h 判定大方向</b>（多 / 空 / 观望）；只有当 <b>15m 与 5m 同时与 1h 同向</b>，
-          且其中<b>至少一个刚刚从「观望 / 反向」翻转过来</b>时，才在翻转那一刻触发一次<b>买入 / 卖出</b>报警 —— 这就是「严格共振沿」，
-          三者早已同向时不会重复报警。触发点会画成 K 线上的 <b>▲买入（绿）</b> / <b>▼卖出（红）</b> 标记；
-          K 线下方的标题栏实时显示 <code>1h 多（方向） · 15m 多 · 5m 多 → 三周期共振中</code> 这类状态</li>
-        <li><b>回测</b>：对当前品种跑 <b>5 年真实 5m K线</b>（约 26 万根，分段并发拉取，首次约 1～4 分钟）→ 聚合出 15m / 1h →
-          三周期信号序列 → 共振沿入场 → <b>看板同款止盈止损</b>出场。入场用<b>下一根 5m 开盘价</b>（不用触发那根的收盘价，避免未来函数）；
+        <li><b>开单逻辑（核心 · 三层分工）</b>：
+          <b>1h 定大方向</b>（多 / 空 / 观望）→ <b>15m 必须与 1h 同向</b>（共振确认）→
+          <b>5m 出现同向的市场结构触发</b>（CHOCH + 回踩守住 + BOS，见下节）时才报警。
+          <b>5m 不再参与方向投票</b> —— 它只回答「现在能不能扣扳机」。
+          触发点画成 K 线上的 <b>▲买入（绿）</b> / <b>▼卖出（红）</b> 标记；
+          K 线下方标题栏实时显示 <code>1h 多（定方向） · 15m 多（共振） · 5m 已回踩守住 · 等 BOS → 方向已共振 · 结构分 多18 / 空4</code> 这类状态</li>
+        <li><b>回测</b>：对当前品种跑 <b>5 年真实 5m K线</b>（约 52.6 万根，分段并发拉取，首次约 1～4 分钟）→ 聚合出 15m / 1h →
+          结构序列与三周期信号 → 按「1h 方向 + 15m 共振 + 5m 结构触发」入场 → <b>看板同款止盈止损</b>出场。
+          入场用<b>下一根 5m 开盘价</b>（不用触发那根的收盘价，避免未来函数）；
           同一根 K 线内同时触及止盈与止损时<b>保守按止损计</b>；已扣 0.10% 市价手续费。
+          结果里额外给出<b>结构总分分档表</b>（各分数段的笔数 / 胜率 / 毛利），用来检验「分越高是否越值得开」。
           <b>回测是历史统计，不代表未来收益</b>，滑点与资金费率未计入</li>
         <li><b>数据依据</b>：对 5分钟 / 15分钟 / 1小时 三个周期的<b>真实K线</b>分别计算 ATR(14) 波动、近 N 根结构高低点（5m 取16根、15m 20根、1h 30根）、布林带(20,2) 与多因子信号方向</li>
         <li><b>止损价</b>：优先取「结构止损」（做多 = 近期最低点再让 0.15×ATR，做空 = 近期最高点再让 0.15×ATR）；若该止损距离超过单笔风险上限（5m 1.6×ATR、15m 2.0、1h 2.4），则改用 ATR 止损（0.90/1.20/1.80 × ATR），避免单笔风险过大</li>
@@ -351,7 +379,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260924e · 八因子状态量信号（斜率/二阶加速度/ADX强度/带宽分位/z-score/钝化/RVOL，不看金叉死叉与绝对数值） · 1h定方向/15m·5m共振沿开单 · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260925a · 八因子状态量信号（不看金叉死叉与绝对数值） · 1h定方向 / 15m共振 / 5m市场结构触发（pivot·CHOCH·Retest·BOS，0-25分） · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -371,9 +399,9 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260924e"></script>
-<script src="lsmap.js?v=20260924e"></script>
-<script src="strategy.js?v=20260924e"></script>
-<script src="app.js?v=20260924e"></script>
+<script src="liq-map.js?v=20260925a"></script>
+<script src="lsmap.js?v=20260925a"></script>
+<script src="strategy.js?v=20260925a"></script>
+<script src="app.js?v=20260925a"></script>
 </body>
 </html>

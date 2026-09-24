@@ -246,6 +246,45 @@ button { font-family: inherit; }
 .sig-detail .row b { color: var(--text); font-weight: 600; }
 
 /* ---------- 指标全景 ---------- */
+/* ---------- 5m 市场结构触发面板（第 6 节 · 0–25 分） ---------- */
+.ms-panel { margin-top: 12px; }
+.ms-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 7px; }
+.ms-title { font-size: 11px; font-weight: 600; color: var(--text); }
+.ms-title b { font-variant-numeric: tabular-nums; }
+.ms-title b.up, .ms-s.up, .ms-kv b.up { color: var(--up); }
+.ms-title b.down, .ms-s.down, .ms-kv b.down { color: var(--down); }
+.ms-dir { font-style: normal; font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 20px; background: #f4f6f9; color: var(--muted); margin-left: 6px; }
+.ms-dir.up { background: rgba(217, 44, 44, .1); color: var(--up); }
+.ms-dir.down { background: rgba(10, 143, 78, .1); color: var(--down); }
+.ms-ctrl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 9px; color: var(--muted-2); }
+.ms-ctrl label { display: inline-flex; align-items: center; gap: 4px; }
+.ms-ctrl select { font-size: 10px; padding: 2px 4px; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: var(--text); }
+.ms-ctrl .ms-chk { cursor: pointer; }
+.ms-empty { font-size: 11px; color: var(--muted-2); padding: 6px 0; }
+.ms-body { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 10px; align-items: start; }
+.ms-rows { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 9px; background: #fff; display: flex; flex-direction: column; gap: 6px; }
+.ms-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) 56px minmax(0, 1.3fr); align-items: center; gap: 8px; }
+.ms-n { font-size: 10px; color: var(--text); font-weight: 600; white-space: nowrap; }
+.ms-bar { height: 6px; border-radius: 6px; background: #f0f3f7; overflow: hidden; }
+.ms-bar > i { display: block; height: 100%; border-radius: 6px; transition: width .25s; }
+.ms-bar > i.up { background: var(--up); }
+.ms-bar > i.down { background: var(--down); }
+.ms-s { font-size: 10px; font-weight: 700; text-align: right; color: var(--muted-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ms-s em { font-style: normal; font-size: 8px; color: var(--muted-2); font-weight: 500; }
+.ms-t { font-size: 9px; color: var(--muted-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ms-side { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 9px; background: #fff; display: flex; flex-direction: column; gap: 5px; }
+.ms-kv { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--muted-2); }
+.ms-kv > b { color: var(--text); font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ms-kv em { font-style: normal; font-size: 8px; }
+.ms-verdict { font-size: 10px; font-weight: 600; padding: 4px 7px; border-radius: var(--r-sm); text-align: center; }
+.ms-verdict.on { background: rgba(217, 44, 44, .08); color: var(--up); }
+.ms-verdict.off { background: #f4f6f9; color: var(--muted-2); }
+.ms-note { font-size: 9px; color: var(--muted-2); line-height: 1.55; }
+/* 回测面板：结构总分分档表 */
+.msb-head, .msb-row { display: grid; grid-template-columns: 62px 56px 56px 84px 84px; gap: 6px; font-size: 10px; }
+.msb-head { color: var(--muted-2); font-size: 9px; margin-top: 4px; }
+.msb-row > span { font-variant-numeric: tabular-nums; }
+
 .ind-panel { margin-top: 12px; }
 .ind-empty { font-size: 11px; color: var(--muted-2); padding: 6px 0; }
 .ind-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 7px; }

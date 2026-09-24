@@ -31,8 +31,8 @@ const INSTRUMENTS = [
 ];
 const TFS = ['5m', '15m', '1h'];
 const TF_NAME = { '5m': '5分钟', '15m': '15分钟', '1h': '1小时' };
-/* 角色分工：1h 定大方向，15m 与 5m 做共振入场（见 strategy.js 的共振沿逻辑） */
-const TF_ROLE = { '5m': '入场共振', '15m': '入场共振', '1h': '方向' };
+/* 角色分工（第 6 节）：1h 定大方向，15m 共振确认，5m 只做市场结构扳机（不参与方向投票） */
+const TF_ROLE = { '5m': '结构扳机', '15m': '共振确认', '1h': '方向' };
 
 const FEE = 0.001;            // 兼容旧引用（=市价 Taker 费率）
 const FEE_TAKER = 0.001;      // 市价单手续费 0.10%
@@ -1032,6 +1032,11 @@ async function fetchUstKlines(inst, tf) {
 }
 
 /* ---------- 状态 ---------- */
+/* 5m 市场结构参数（第 6 节）：档位 / 最低结构分 / 是否要求 5m 方向同向 —— 持久化 */
+function msCfg(k, dflt) {
+  try { return localStorage.getItem('simtrader_ms_' + k) || dflt; } catch (e) { return dflt; }
+}
+
 const state = {
   current: 'BTC',
   tf: '15m',
@@ -1044,7 +1049,11 @@ const state = {
   venueTs: {},         // 品种 -> 比价缓存时间戳
   tfCandles: null,     // { _inst, 5m:[], 15m:[], 1h:[] } 各周期真实K线
   tpsl: null,          // 当前品种的多周期止盈止损方案
-  triggers: [],        // 开单逻辑触发点 [{time, dir}]，画在 K 线上
+  triggers: [],        // 开单逻辑触发点 [{time, dir, sc}]，画在 K 线上
+  ms: null,            // { res, snap } 5m 市场结构快照（第 6 节）
+  msMode: msCfg('mode', 'strict'),   // strict=CHOCH+回踩+BOS 全满足 / loose=核心≥2
+  msMin: +msCfg('min', '0') || 0,    // 最低结构分（0 = 不限）
+  msAnd: msCfg('and', '0') === '1',  // true 时附加要求 5m 方向也同向
   _lastAlert: '',      // 已报警的触发点 key（避免同一触发反复弹窗）
   _btRunning: false, _btResult: null,   // 回测运行状态
   tpOv: loadTpOv(),    // "品种:周期" -> { stop?, tp1?, tp2? } 手动微调覆盖值（持久化）
@@ -1406,20 +1415,36 @@ function paintChart(candles) {
 }
 
 /* ============================================================
-   开单逻辑：1h 定方向 + 15m / 5m 共振沿入场
+   第 6 节 · 5m 市场结构触发（0–25 分）
    ------------------------------------------------------------
-   严格共振沿（用户口径）：
-     ① 1h 必须有方向（long / short）
-     ② 15m 与 5m 必须同时与 1h 同向
-     ③ 且至少一个「刚刚」从 观望 / 反向 翻转过来
-   → 满足则在翻转那一刻触发一次买入 / 卖出，之后不再重复报警。
-   历史触发点画成 K 线上的 ▲买入 / ▼卖出 标记。
+   5m 不再参与方向投票，只回答「现在能不能扣扳机」：
+     Swing Low 0-3 · Higher Low 0-5 · CHOCH 0-7 · Retest Hold 0-4 · BOS 0-6
+   触发口径：setup_valid AND choch AND retest_hold AND bos（严格档）
+             核心条件 ≥2（宽松档，即图中「避免假信号」的下限）
+   结构算法全部在 strategy.js 的 MsStream，本文件只做展示与参数下发，
+   因此实盘与回测用的是**同一份实现**（不存在两套公式各自跑偏的问题）。
    ============================================================ */
+function msOpts() {
+  return { loose: state.msMode === 'loose', minScore: +state.msMin || 0, andDir: !!state.msAnd };
+}
+/* 结构当前处于哪一步（状态条与面板共用） */
+function msStageText(s) {
+  if (!s) return '数据不足';
+  const long = s.lScore >= s.sScore;
+  const stg = long ? s.lStage : s.sStage;
+  const core = long ? s.lCore : s.sCore;
+  if (stg >= 3) return '结构确认（BOS 完成）';
+  if (stg === 2) return '已回踩守住 · 等 BOS';
+  if (stg === 1) return '已 CHOCH · 等回踩';
+  return core > 0 ? '结构建设中' : '等结构（无有效 CHOCH）';
+}
+
+/* 开单逻辑：1h 定方向 + 15m 共振 + 5m 市场结构触发 */
 function updateResonance() {
   const st = window.Strategy;
-  const inst = instOf(state.current);
   const sub = $('#sigSub');
   state.triggers = [];
+  state.ms = null;
   if (!st) { if (sub) sub.textContent = '三周期独立计算 · 依据真实K线 · 绿涨红跌'; return; }
 
   const c5 = state.candles[state.current + '_5m'];
@@ -1427,29 +1452,162 @@ function updateResonance() {
   const c1h = state.candles[state.current + '_1h'];
   const s1 = state.signals || {};
 
-  /* 顶部状态条：三个周期各自方向 + 是否共振 */
-  if (sub) {
-    const dTxt = d => (d === 'long' ? '多' : d === 'short' ? '空' : '观望');
-    const d1h = s1['1h'] ? s1['1h'].dir : 'wait';
-    const d15 = s1['15m'] ? s1['15m'].dir : 'wait';
-    const d5 = s1['5m'] ? s1['5m'].dir : 'wait';
-    const aligned = d1h !== 'wait' && d15 === d1h && d5 === d1h;
-    sub.textContent = `1h ${dTxt(d1h)}（方向） · 15m ${dTxt(d15)} · 5m ${dTxt(d5)} → `
-      + (aligned ? '三周期共振中' : '未共振')
-      + (state.triggers && state.triggers.length ? '' : '');
-  }
+  /* 5m 市场结构：喂入真实 5m K 线逐根重放（与回测同式） */
+  let ms = null, snap = null;
+  try {
+    if (c5 && c5.length >= 60 && typeof st.msReplay === 'function') {
+      ms = st.msReplay(c5);
+      snap = ms.last ? st.msCopy(ms.last) : null;
+    }
+  } catch (e) { ms = null; snap = null; }
+  state.ms = { res: ms, snap: snap };
 
-  if (!c5 || !c15 || !c1h || c5.length < 60 || c15.length < 60 || c1h.length < 60) return;
+  if (!c5 || !c15 || !c1h || c5.length < 60 || c15.length < 60 || c1h.length < 60) {
+    if (sub) sub.textContent = 'K线不足，等待加载…';
+    renderMsPanel();
+    return;
+  }
   try {
     const S5 = st.toSeries(c5), S15 = st.toSeries(c15), S1h = st.toSeries(c1h);
     const r5 = st.dirSeries(S5), r15 = st.dirSeries(S15), r1h = st.dirSeries(S1h);
     const m15 = st.buildMap(S5.t, S15.t), m1h = st.buildMap(S5.t, S1h.t);
-    state.triggers = st.findTriggers(r5.dirs, r15.dirs, r1h.dirs, m15, m1h)
-      .map(t => ({ time: S5.t[t.i], dir: t.dir }));
+    const list = ms
+      ? st.findTriggersMs(r5.dirs, r15.dirs, r1h.dirs, m15, m1h, ms, msOpts())
+      : st.findTriggers(r5.dirs, r15.dirs, r1h.dirs, m15, m1h);
+    state.triggers = list.map(t => ({ time: S5.t[t.i], dir: t.dir, sc: t.sc || 0 }));
   } catch (e) { state.triggers = []; }
 
+  /* 顶部状态条：1h 方向 / 15m 共振 / 5m 结构扳机 */
+  if (sub) {
+    const dTxt = d => (d === 'long' ? '多' : d === 'short' ? '空' : '观望');
+    const d1h = s1['1h'] ? s1['1h'].dir : 'wait';
+    const d15 = s1['15m'] ? s1['15m'].dir : 'wait';
+    const evLast = ms ? (ms.ev[ms.n - 1] || ms.evL[ms.n - 1]) : 0;
+    const msTxt = evLast ? (evLast === 1 ? '▲ 触发多头扳机' : '▼ 触发空头扳机') : msStageText(snap);
+    const aligned = d1h !== 'wait' && d15 === d1h;
+    sub.textContent = `1h ${dTxt(d1h)}（定方向） · 15m ${dTxt(d15)}（共振） · 5m ${msTxt}`
+      + ` → ${aligned ? '方向已共振' : '未共振'}`
+      + (snap ? ` · 结构分 多${snap.lScore.toFixed(0)} / 空${snap.sScore.toFixed(0)}` : '');
+  }
+
   paintTriggers();
+  renderMsPanel();
   alertResonance(c5);
+}
+
+/* ---------- 5m 市场结构面板（第 6 节 · 0–25 分） ---------- */
+function renderMsPanel() {
+  const box = $('#msPanel');
+  if (!box) return;
+  const ms = state.ms;
+  const s = ms && ms.snap;
+  const N = window.Strategy && window.Strategy.MS_SCORE_MAX ? window.Strategy.MS_SCORE_MAX : 25;
+  if (!s) {
+    box.innerHTML = `<div class="ms-head"><span class="ms-title">5m 市场结构触发 · <b>0 / ${N}</b></span></div>
+      <div class="ms-empty">结构计算中…（需 5m K线加载完成）</div>`;
+    return;
+  }
+  /* 取分数更高的一侧作为「当前结构」，并标出方向 */
+  const long = s.lScore >= s.sScore;
+  const tot = long ? s.lScore : s.sScore;
+  const stg = long ? s.lStage : s.sStage;
+  const core = long ? s.lCore : s.sCore;
+  const lvl = long ? s.lLvl : s.sLvl;
+  const dir = long ? '多头结构' : '空头结构';
+  const dirTone = long ? 'up' : 'down';
+  const items = long
+    ? [
+      ['Swing Low 成立', s.lSwing, 3, '已确认 pivot low 的新鲜度'],
+      ['Higher Low', s.lHL, 5, '新回踩低点高于上一个有效 Swing Low'],
+      ['Bullish CHOCH', s.lChoch, 7, '收盘突破最近一个有效 Lower High'],
+      ['Retest Hold', s.lRetest, 4, '回踩突破位未失守'],
+      ['Bullish BOS', s.lBos, 6, '再破结构高点，确认结构延续'],
+    ]
+    : [
+      ['Swing High 成立', s.sSwing, 3, '已确认 pivot high 的新鲜度'],
+      ['Lower High', s.sHL, 5, '新反弹高点低于上一个有效 Swing High'],
+      ['Bearish CHOCH', s.sChoch, 7, '收盘跌破最近一个有效 Higher Low'],
+      ['Retest Hold', s.sRetest, 4, '反抽结构位未失守'],
+      ['Bearish BOS', s.sBos, 6, '再破结构低点，确认结构延续'],
+    ];
+  const strict = (long ? s.lEv : s.sEv) > 0
+    || (stg >= 3);
+  const looseOk = core >= 2;
+  const pass = state.msMode === 'loose' ? looseOk : core >= 3;
+
+  const rows = items.map(it => {
+    const pct = Math.round(it[1] / it[2] * 100);
+    return `<div class="ms-row">
+      <span class="ms-n">${it[0]}</span>
+      <span class="ms-bar"><i style="width:${pct}%" class="${long ? 'up' : 'down'}"></i></span>
+      <span class="ms-s ${it[1] > 0 ? (long ? 'up' : 'down') : ''}">${it[1] ? '+' + it[1].toFixed(1) : '0'}<em>/${it[2]}</em></span>
+      <span class="ms-t">${it[3]}</span>
+    </div>`;
+  }).join('');
+
+  box.innerHTML = `
+    <div class="ms-head">
+      <span class="ms-title">5m 市场结构触发（第 6 节）· <b class="${dirTone}">${tot.toFixed(1)} / ${N}</b>
+        <em class="ms-dir ${dirTone}">${dir}</em></span>
+      <span class="ms-ctrl">
+        <label>档位
+          <select id="msMode">
+            <option value="strict"${state.msMode !== 'loose' ? ' selected' : ''}>严格（CHOCH+回踩+BOS）</option>
+            <option value="loose"${state.msMode === 'loose' ? ' selected' : ''}>宽松（核心≥2）</option>
+          </select>
+        </label>
+        <label>最低结构分
+          <select id="msMin">
+            ${[0, 13, 16, 19, 22].map(v => `<option value="${v}"${(+state.msMin || 0) === v ? ' selected' : ''}>${v ? '≥' + v : '不限'}</option>`).join('')}
+          </select>
+        </label>
+        <label class="ms-chk"><input type="checkbox" id="msAnd"${state.msAnd ? ' checked' : ''}> 5m 方向也要同向</label>
+      </span>
+    </div>
+    <div class="ms-body">
+      <div class="ms-rows">${rows}</div>
+      <div class="ms-side">
+        <div class="ms-kv"><span>当前阶段</span><b>${msStageText(s)}</b></div>
+        <div class="ms-kv"><span>核心条件</span><b class="${core >= 2 ? 'up' : ''}">${core} / 3</b></div>
+        <div class="ms-kv"><span>CHOCH 结构位</span><b>${lvl ? fmt(lvl, instOf(state.current).dec) : '—'}</b></div>
+        <div class="ms-kv"><span>5m ATR(14) <em>设单依据</em></span><b>${s.atr ? fmt(s.atr, instOf(state.current).type === 'ust' ? 3 : instOf(state.current).dec) : '—'}</b></div>
+        <div class="ms-verdict ${pass ? 'on' : 'off'}">${pass
+          ? (state.msMode === 'loose' ? '宽松档已满足（核心 ≥2）' : '严格档已满足 —— 允许扣扳机')
+          : (state.msMode === 'loose' ? '核心条件不足 2 个 · 不开仓' : '三核心未齐（缺 ' + (3 - core) + ' 项）· 不开仓')}</div>
+        <div class="ms-note">5m <b>不判断大趋势</b>，只负责扣扳机；方向由 1h 定、15m 共振确认。
+          结构全部程序化：pivot 用固定 fractal 窗口，且<b>只在右侧窗口走完后</b>才确认，避免偷看未来。</div>
+      </div>
+    </div>`;
+  bindMsCtrl();
+}
+
+/* 结构面板上的参数控件（模式 / 最低分 / AND 叠加） */
+function bindMsCtrl() {
+  const mode = $('#msMode'), min = $('#msMin'), and = $('#msAnd');
+  if (mode && !mode._b) {
+    mode._b = 1;
+    mode.addEventListener('change', () => {
+      state.msMode = mode.value;
+      try { localStorage.setItem('simtrader_ms_mode', mode.value); } catch (e) {}
+      updateResonance();
+    });
+  }
+  if (min && !min._b) {
+    min._b = 1;
+    min.addEventListener('change', () => {
+      state.msMin = +min.value || 0;
+      try { localStorage.setItem('simtrader_ms_min', String(state.msMin)); } catch (e) {}
+      updateResonance();
+    });
+  }
+  if (and && !and._b) {
+    and._b = 1;
+    and.addEventListener('change', () => {
+      state.msAnd = and.checked ? 1 : 0;
+      try { localStorage.setItem('simtrader_ms_and', state.msAnd ? '1' : '0'); } catch (e) {}
+      updateResonance();
+    });
+  }
 }
 
 /* 把触发点画成 K 线上的标记（同一根 K 线多次触发只保留最后一次） */
@@ -1498,7 +1656,8 @@ function alertResonance(c5) {
   const isLong = last.dir === 'long';
   const p1h = (state.tpsl && state.tpsl.plans) ? state.tpsl.plans.find(p => p.tf === '1h') : null;
   const side = p1h ? (isLong ? p1h.long : p1h.short) : null;
-  let msg = (isLong ? '🟢 买入信号' : '🔴 卖出信号') + ` · ${inst.short}：1h 定方向，15m 与 5m 共振同向`;
+  const sc = last.sc ? ` · 结构分 ${last.sc.toFixed(1)}/25` : '';
+  let msg = (isLong ? '🟢 买入信号' : '🔴 卖出信号') + ` · ${inst.short}：1h 定方向，15m 共振，5m 市场结构触发（${state.msMode === 'loose' ? '宽松·核心≥2' : '严格·CHOCH+回踩+BOS'}）` + sc;
   if (side) msg += ` · 参考止损 ${fmt(side.stop, inst.dec)} / 止盈一 ${fmt(side.tp1, inst.dec)} / 止盈二 ${fmt(side.tp2, inst.dec)}`;
   toast(msg);
 }
@@ -1520,6 +1679,7 @@ function bindBacktest() {
     try {
       const res = await window.Strategy.backtest(inst.sym, 5, {
         tpslFn: tpSlPlan,
+        ms: msOpts(),
         onPhase: (ph, p, txt) => {
           setBtProg(txt);
           if (bar) bar.style.width = Math.max(2, Math.round(p * 100)) + '%';
@@ -1551,7 +1711,10 @@ function renderBacktest(r, inst) {
     <div class="rc"><span class="k">盈亏因子</span><b>${pf}</b><small>毛利 ÷ 毛损</small></div>
     <div class="rc"><span class="k">年化</span><b class="${cls(r.annRet)}">${r.annRet >= 0 ? '+' : ''}${(r.annRet * 100).toFixed(1)}%</b><small>${r.years.toFixed(1)} 年</small></div>
     <div class="rc"><span class="k">平均持仓</span><b>${r.avgHoldHours.toFixed(1)} 小时</b><small>${r.avgHoldBars.toFixed(0)} 根 5m</small></div>
-    <div class="rc"><span class="k">样本区间</span><b>${r.spanDays.toFixed(0)} 天</b><small>${ts(r.from * 1000).slice(0, 10)} → ${ts(r.to * 1000).slice(0, 10)}</small></div>`;
+    <div class="rc"><span class="k">样本区间</span><b>${r.spanDays.toFixed(0)} 天</b><small>${ts(r.from * 1000).slice(0, 10)} → ${ts(r.to * 1000).slice(0, 10)}</small></div>
+    <div class="rc"><span class="k">5m 结构触发</span><b>${(r.msEvCount || 0).toLocaleString('en-US')}</b><small>${(r.msEvPerDay || 0).toFixed(2)} 次/天（未过 1h·15m 滤网）</small></div>
+    <div class="rc"><span class="k">入场时结构分</span><b>${(r.msAvgScore || 0).toFixed(1)} / 25</b><small>${r.msLoose ? '宽松档（核心≥2）' : '严格档（CHOCH+回踩+BOS）'}${r.msMinScore ? ' · 底线 ≥' + r.msMinScore : ''}</small></div>
+    <div class="rc"><span class="k">结构分底线</span><b>${r.msMinScore ? '≥' + r.msMinScore : '不限'}</b><small>${r.msAndDir ? '且 5m 方向须同向' : '不附加 5m 方向条件'}</small></div>`;
 
   const rows = (r.trades || []).slice(-24).reverse().map(t => {
     const howCls = t.how === '止损' || t.how === '止损（半仓）' ? 'txt-down' : 'txt-up';
@@ -1576,7 +1739,7 @@ function renderBacktest(r, inst) {
          做不了 5 年，故长周期回测改用币安现货；实盘信号仍走 Gate 永续，两者存在<b>基差</b>（通常 &lt;0.1%，对 ATR 百分比止损影响可忽略）。`
       : `K线来源 <b>Gate.io 永续 ${r.market} 5m</b>（分段 ${r.segTotal} 次，失败 ${r.segFailed}）${r.capped ? `，该源上限最近 10000 根 ≈ ${r.cappedDays.toFixed(0)} 天，已自动截断` : ''}。`;
     note.innerHTML = `<b>数据源</b>：${srcLine}
-      <br><b>口径</b>：入场 = 1h 定方向，且 15m 与 5m 同时同向、至少一个刚从观望/反向翻转（共振沿），
+      <br><b>口径</b>：入场 = 1h 定方向 + 15m 共振 + 5m 市场结构触发（CHOCH + 回踩守住 + BOS，严格档），
       一次共振只开一次仓；回测中 1h/15m 只取<b>已收线</b>的 K 线（避免未来函数），
       按<b>下一根 5m 开盘价</b>成交；出场 = 看板同款止盈止损（1h 方案：ATR 止损 + 止盈一/二分批），
       同一根 K 线内同时触及止盈与止损时<b>保守按止损计</b>；已扣 <b>0.10%</b> 市价手续费（开平各一次）。
@@ -1584,8 +1747,24 @@ function renderBacktest(r, inst) {
       <br><b>盈亏拆解</b>：毛利 <b class="${r.grossR >= 0 ? 'txt-up' : 'txt-down'}">${r.grossR >= 0 ? '+' : ''}${r.grossR.toFixed(1)}R</b>（${(r.grossR / Math.max(1, r.count)).toFixed(3)}R/笔）
       − 手续费 <b class="txt-down">${(-r.feeR).toFixed(1)}R</b>（${r.avgFeeR.toFixed(3)}R/笔）
       = 净 ${r.totalR.toFixed(1)}R；平均止损宽度约为入场价的 <b>${(r.avgRiskPct * 100).toFixed(2)}%</b>。
+      ${msBandHtml(r)}
       <br><b>提醒</b>：这是历史统计，<b>不代表未来收益</b>；滑点、资金费率与深度不足造成的成交偏差均未计入，实盘结果会更差。`;
   }
+}
+
+/* 结构总分分档表现（判断「分越高是否越值得开」） */
+function msBandHtml(r) {
+  const b = r.msBands || [];
+  const rows = b.filter(x => x.n).map(x => `<div class="msb-row">
+      <span>${x.lo}–${x.hi === 26 ? 25 : x.hi - 1}</span>
+      <span>${x.n}</span>
+      <span>${(x.winRate * 100).toFixed(1)}%</span>
+      <b class="${x.grossAvg >= 0 ? 'txt-up' : 'txt-down'}">${x.grossAvg >= 0 ? '+' : ''}${x.grossAvg.toFixed(4)}</b>
+      <b class="${x.avgR >= 0 ? 'txt-up' : 'txt-down'}">${x.avgR >= 0 ? '+' : ''}${x.avgR.toFixed(4)}</b>
+    </div>`).join('');
+  if (!rows) return '';
+  return `<br><b>结构总分分档</b>（看「分越高是否越值得开」）：
+    <div class="msb-head"><span>分数段</span><span>笔数</span><span>胜率</span><span>毛利/笔</span><span>净/笔</span></div>${rows}`;
 }
 
 /* ---------- 信号 ---------- */
@@ -1618,7 +1797,7 @@ async function runSignals(existingCandles, force) {
     state.signals = results;
     state.tfCandles = byTf;
     computeTpSl();       // 依据三周期真实K线推导止盈止损区间（先算，报警里要带止损止盈）
-    updateResonance();   // 开单逻辑：1h 定方向 + 15m/5m 共振沿 → K线标记 + 报警
+    updateResonance();   // 开单逻辑：1h 定方向 + 15m 共振 + 5m 结构触发 → K线标记 + 报警
     renderSigCards();    // K线图下方三格交易提示（信号 + 入场区 + 止损止盈 + 一键填入）
     renderIndPanel();    // 指标全景（KDJ / MACD / 布林 / OBV / RSI / ATR）
     renderTpOvPanel();   // 止盈止损手动微调面板
@@ -3228,7 +3407,7 @@ function boot() {
   $('#btnBuy').addEventListener('click', () => doOrder('buy'));
   $('#btnSell').addEventListener('click', () => doOrder('sell'));
   bindTpOvEvents();                    // 止盈止损手动微调（输入即联动，可一键恢复自动）
-  bindBacktest();                      // 开单逻辑回测（1h 定方向 + 15m/5m 共振沿）
+  bindBacktest();                      // 开单逻辑回测（1h 定方向 + 15m 共振 + 5m 结构触发）
   $('#btnBacktest').addEventListener('click', runBacktest);
   $('#btnReset').addEventListener('click', async () => {
     const ok = await confirmYes({

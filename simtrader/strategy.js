@@ -508,6 +508,281 @@
   function alignTime(t, tf) { const sec = TF_SEC[tf] || 300; return Math.floor(t / sec) * sec; }
 
   /* ============================================================
+     第 6 节 · 5m 市场结构触发（Market Structure Trigger，0–25 分）
+     ------------------------------------------------------------
+     5m 不判断大趋势，只回答「现在能不能扣扳机」。结构定义全部程序化，
+     不使用主观画线。五个触发模块（多头侧，空头侧完全对称）：
+
+       Swing Low 成立   0-3   最近已确认 pivot low 的新鲜度
+       Higher Low       0-5   新回踩低点高于上一个有效 pivot low（幅度越大分越高）
+       Bullish CHOCH    0-7   收盘突破最近一个有效 Lower High（幅度越大分越高）
+       Retest Hold      0-4   回踩到突破位附近且未失守（未触及突破位 / 收盘未破位 各 +1）
+       Bullish BOS      0-6   回踩后收盘再破结构高点（幅度越大分越高）
+                              ——— 合计 0-25
+
+     触发（与图中代码逐字一致）：
+       long_trigger = setup_valid AND bullish_choch AND retest_hold AND bullish_bos
+     宽松档（图中「避免假信号」的下限）：核心条件满足 ≥2 个即触发。
+
+     ⚠ 无未来函数：pivot 中心根在「其右侧 MS_PIV 根走完」之后才被确认
+       （第 i 根 push 时才判定第 i−MS_PIV 根），回测不会用到未走完的 K 线。
+     ⚠ 结构位「有效性」：Lower High 只在「新 pivot high 低于上一个 pivot high」
+       时刷新；Higher Low 同理。突破必须超过 MS_CHOCH_MIN 个 ATR，防噪音假突破。
+     ============================================================ */
+  const MS_PIV = 2;                 // pivot 左右窗口（fractal 2L+1 = 5 根）
+  const MS_WIN = MS_PIV * 2 + 1;
+  const MS_RETEST_MAX = 12;         // CHOCH 后多少根内必须完成回踩
+  const MS_CHOCH_MIN = 0.10;        // 突破有效 LH/HL 的最小幅度（ATR 倍数）
+  const MS_CHOCH_FRESH = 90;        // 有效 LH/HL 超过多少根未刷新即作废
+  const MS_RETEST_NEAR = 0.80;      // 最低价进入「突破位 ± 该 ATR 倍数」内算回踩到位
+  const MS_RETEST_TOL = 0.35;       // 收盘反向破「突破位 ∓ 该 ATR 倍数」算回踩失守
+  const MS_SWING_FRESH = 40;        // pivot 超过多少根未刷新不再计入 Swing 分
+  const MS_SCORE_MAX = 25;
+
+  function MsStream() { this.reset(); }
+
+  MsStream.prototype.reset = function () {
+    this.n = 0;
+    this.hw = new Ring(MS_WIN); this.lw = new Ring(MS_WIN);
+    this.pc = null; this.trSum = 0; this.atr = null;
+    this.phP = 0; this.phI = -1; this.phPrevP = 0;
+    this.plP = 0; this.plI = -1; this.plPrevP = 0;
+    this.lastLH = null; this.lastHL = null;
+    this._clrBull(false); this._clrBear(false);
+    this.out = null;
+  };
+  /* 结构机复位。
+     keepLock=true（BOS 已完成）→ 把本次突破位记进 lock，同一结构位不再重复触发；
+     要再次触发必须形成**新的** Lower High / Higher Low（lastLH.p / lastHL.p 变化）。
+     keepLock=false → 完全清零。 */
+  MsStream.prototype._clrBull = function (keepLock) {
+    if (keepLock) this.bLock = this.bLvl;
+    this.bStage = 0; this.bIdx = -1; this.bMar = 0; this.bMar2 = 0;
+    this.bPost = 0; this.bMin = 0; this.bStruct = 0; this.bWorst = 0;
+    this.bLooseDone = false;
+    if (!keepLock) { this.bLvl = 0; this.bLock = 0; }
+  };
+  MsStream.prototype._clrBear = function (keepLock) {
+    if (keepLock) this.sLock = this.sLvl;
+    this.sStage = 0; this.sIdx = -1; this.sMar = 0; this.sMar2 = 0;
+    this.sPost = 0; this.sMax = 0; this.sStruct = 0; this.sWorst = 0;
+    this.sLooseDone = false;
+    if (!keepLock) { this.sLvl = 0; this.sLock = 0; }
+  };
+  MsStream.prototype._onPH = function (p, idx) {
+    if (this.phI >= 0) {
+      this.phPrevP = this.phP;
+      if (p < this.phP) this.lastLH = { p: p, i: idx };                 // Lower High
+    }
+    this.phP = p; this.phI = idx;
+  };
+  MsStream.prototype._onPL = function (p, idx) {
+    if (this.plI >= 0) {
+      this.plPrevP = this.plP;
+      if (p > this.plP) this.lastHL = { p: p, i: idx };                 // Higher Low
+    }
+    this.plP = p; this.plI = idx;
+  };
+
+  /* 喂入一根 K 线，返回本根快照（对象就地复用，调用方需拷贝或立即读取） */
+  MsStream.prototype.push = function (open, high, low, close) {
+    const i = this.n++;
+    /* Wilder ATR(14)，与八因子同一支序列 */
+    const tr = this.pc == null ? (high - low)
+      : Math.max(high - low, Math.abs(high - this.pc), Math.abs(low - this.pc));
+    if (i < WS_P) { this.trSum += tr; if (i === WS_P - 1) this.atr = this.trSum / WS_P; }
+    else if (this.atr != null) this.atr = (this.atr * (WS_P - 1) + tr) / WS_P;
+    this.pc = close;
+    const atr = this.atr;
+
+    /* 上一根已完成 BOS → 收尾复位（保留 lock，防同一结构重复触发） */
+    if (this.bStage === 3) this._clrBull(true);
+    if (this.sStage === 3) this._clrBear(true);
+
+    /* ---- 已确认 pivot（中心根 = i − MS_PIV，只用已经走完的窗口） ---- */
+    this.hw.push(high); this.lw.push(low);
+    if (this.hw.len === MS_WIN) {
+      const h0 = this.hw.get(0), h1 = this.hw.get(1), h2 = this.hw.get(2), h3 = this.hw.get(3), h4 = this.hw.get(4);
+      const l0 = this.lw.get(0), l1 = this.lw.get(1), l2 = this.lw.get(2), l3 = this.lw.get(3), l4 = this.lw.get(4);
+      if (h2 > h3 && h2 > h4 && h2 >= h1 && h2 >= h0) this._onPH(h2, i - MS_PIV);
+      if (l2 < l3 && l2 < l4 && l2 <= l1 && l2 <= l0) this._onPL(l2, i - MS_PIV);
+    }
+
+    /* ---- 多头结构机 ---- */
+    let bEvS = 0, bEvL = 0;
+    if (atr > 0) {
+      const lhFresh = this.lastLH && (i - this.lastLH.i) <= MS_CHOCH_FRESH;
+      if (this.bStage === 0) {
+        if (lhFresh && this.lastLH.p !== this.bLock && close > this.lastLH.p + MS_CHOCH_MIN * atr) {
+          this.bStage = 1; this.bLvl = this.lastLH.p; this.bIdx = i;
+          this.bMar = (close - this.bLvl) / atr;
+          this.bPost = high; this.bMin = low; this.bWorst = close; this.bStruct = 0;
+        }
+      } else if (this.bStage === 1) {
+        if (high > this.bPost) this.bPost = high;
+        if (low < this.bMin) this.bMin = low;
+        if (close < this.bWorst) this.bWorst = close;
+        if (close < this.bLvl - MS_RETEST_TOL * atr) {                  // 收盘失守 → 回踩失败
+          this._clrBull(true);   // 回踩失败 / 超时 → 复位并锁住该结构位
+        } else if (low <= this.bLvl + MS_RETEST_NEAR * atr) {           // 回踩到位且未失守
+          this.bStage = 2; this.bStruct = this.bPost;
+          if (!this.bLooseDone) { bEvL = 1; this.bLooseDone = true; }   // 宽松档：核心 2 个
+        } else if ((i - this.bIdx) > MS_RETEST_MAX) {                   // 超时未回踩 → 作废
+          this._clrBull(true);   // 回踩失败 / 超时 → 复位并锁住该结构位
+        }
+      } else if (this.bStage === 2) {
+        if (close < this.bLvl - MS_RETEST_TOL * atr) this._clrBull(true);
+        else if (close > this.bStruct) {
+          this.bStage = 3; this.bMar2 = (close - this.bStruct) / atr;
+          bEvS = 1;                                                     // 严格档：核心 3 个齐备
+        }
+      }
+    }
+
+    /* ---- 空头结构机（与多头完全对称） ---- */
+    let sEvS = 0, sEvL = 0;
+    if (atr > 0) {
+      const hlFresh = this.lastHL && (i - this.lastHL.i) <= MS_CHOCH_FRESH;
+      if (this.sStage === 0) {
+        if (hlFresh && this.lastHL.p !== this.sLock && close < this.lastHL.p - MS_CHOCH_MIN * atr) {
+          this.sStage = 1; this.sLvl = this.lastHL.p; this.sIdx = i;
+          this.sMar = (this.sLvl - close) / atr;
+          this.sPost = low; this.sMax = high; this.sWorst = close; this.sStruct = 0;
+        }
+      } else if (this.sStage === 1) {
+        if (low < this.sPost) this.sPost = low;
+        if (high > this.sMax) this.sMax = high;
+        if (close > this.sWorst) this.sWorst = close;
+        if (close > this.sLvl + MS_RETEST_TOL * atr) {
+          this._clrBear(true);
+        } else if (high >= this.sLvl - MS_RETEST_NEAR * atr) {
+          this.sStage = 2; this.sStruct = this.sPost;
+          if (!this.sLooseDone) { sEvL = 2; this.sLooseDone = true; }
+        } else if ((i - this.sIdx) > MS_RETEST_MAX) {
+          this._clrBear(true);
+        }
+      } else if (this.sStage === 2) {
+        if (close > this.sLvl + MS_RETEST_TOL * atr) this._clrBear(true);
+        else if (close < this.sStruct) {
+          this.sStage = 3; this.sMar2 = (this.sStruct - close) / atr;
+          sEvS = 2;
+        }
+      }
+    }
+
+    /* ---- 打分（0–25，多头 / 空头各一套） ---- */
+    const o = this.out || (this.out = {});
+    o.i = i; o.atr = atr || 0;
+    o.lSetup = false; o.sSetup = false;
+    o.lSwing = 0; o.lHL = 0; o.lChoch = 0; o.lRetest = 0; o.lBos = 0;
+    o.sSwing = 0; o.sHL = 0; o.sChoch = 0; o.sRetest = 0; o.sBos = 0;
+    o.lScore = 0; o.sScore = 0; o.lCore = 0; o.sCore = 0;
+    o.lStage = this.bStage; o.sStage = this.sStage;
+    o.lLvl = this.bLvl; o.sLvl = this.sLvl;
+    o.lEv = 0; o.sEv = 0; o.lEvL = 0; o.sEvL = 0;
+    if (atr > 0) {
+      /* --- 多头 --- */
+      const plAge = this.plI >= 0 ? i - this.plI : 1e9;
+      if (plAge <= MS_SWING_FRESH && this.phI >= 0 && this.hw.len === MS_WIN) {
+        o.lSetup = true;
+        o.lSwing = plAge <= 10 ? 3 : plAge <= 22 ? 2 : 1;
+      }
+      if (this.lastHL && (i - this.lastHL.i) <= MS_SWING_FRESH
+        && this.plPrevP > 0 && this.plP > this.plPrevP) {
+        o.lHL = clampN(1.5 + (this.plP - this.plPrevP) / atr * 3.5, 1.5, 5);
+      }
+      if (this.bStage >= 1) {
+        o.lChoch = clampN(3 + this.bMar * 6, 3, 7);
+        if (this.bStage >= 2) {
+          o.lRetest = 2 + (this.bMin >= this.bLvl ? 1 : 0)
+            + (this.bWorst >= this.bLvl - 0.15 * atr ? 1 : 0);
+          if (this.bStage >= 3) o.lBos = clampN(3 + this.bMar2 * 5, 3, 6);
+        }
+      }
+      o.lCore = (o.lChoch > 0 ? 1 : 0) + (o.lRetest > 0 ? 1 : 0) + (o.lBos > 0 ? 1 : 0);
+      o.lScore = o.lSwing + o.lHL + o.lChoch + o.lRetest + o.lBos;
+      if (o.lSetup && bEvS) o.lEv = 1;
+      if (o.lSetup && bEvL) o.lEvL = 1;
+
+      /* --- 空头（完全对称） --- */
+      const phAge = this.phI >= 0 ? i - this.phI : 1e9;
+      if (phAge <= MS_SWING_FRESH && this.plI >= 0 && this.hw.len === MS_WIN) {
+        o.sSetup = true;
+        o.sSwing = phAge <= 10 ? 3 : phAge <= 22 ? 2 : 1;
+      }
+      if (this.lastLH && (i - this.lastLH.i) <= MS_SWING_FRESH
+        && this.phPrevP > 0 && this.phP < this.phPrevP) {
+        o.sHL = clampN(1.5 + (this.phPrevP - this.phP) / atr * 3.5, 1.5, 5);
+      }
+      if (this.sStage >= 1) {
+        o.sChoch = clampN(3 + this.sMar * 6, 3, 7);
+        if (this.sStage >= 2) {
+          o.sRetest = 2 + (this.sMax <= this.sLvl ? 1 : 0)
+            + (this.sWorst <= this.sLvl + 0.15 * atr ? 1 : 0);
+          if (this.sStage >= 3) o.sBos = clampN(3 + this.sMar2 * 5, 3, 6);
+        }
+      }
+      o.sCore = (o.sChoch > 0 ? 1 : 0) + (o.sRetest > 0 ? 1 : 0) + (o.sBos > 0 ? 1 : 0);
+      o.sScore = o.sSwing + o.sHL + o.sChoch + o.sRetest + o.sBos;
+      if (o.sSetup && sEvS) o.sEv = 2;
+      if (o.sSetup && sEvL) o.sEvL = 2;
+    }
+    return o;
+  };
+
+  /* 批量跑整段 5m 序列 → 逐根结构事件 / 分值
+     ev   严格档事件（1=多头触发 2=空头触发 0=无）—— 图中 long_trigger 的口径
+     evL  宽松档事件（核心条件 ≥2）
+     lsc / ssc  多头 / 空头结构总分（0–25） */
+  function msSeries(s) {
+    const n = s.n, st = new MsStream();
+    const ev = new Uint8Array(n), evL = new Uint8Array(n);
+    const lsc = new Float32Array(n), ssc = new Float32Array(n);
+    const lc = new Uint8Array(n), sc = new Uint8Array(n);
+    let last = null;
+    for (let i = 0; i < n; i++) {
+      const r = st.push(s.o[i], s.h[i], s.l[i], s.c[i]);
+      ev[i] = r.lEv ? 1 : (r.sEv ? 2 : 0);
+      evL[i] = r.lEvL ? 1 : (r.sEvL ? 2 : 0);
+      lsc[i] = r.lScore; ssc[i] = r.sScore;
+      lc[i] = r.lCore; sc[i] = r.sCore;
+      last = r;
+    }
+    return {
+      n: n, ev: ev, evL: evL, lsc: lsc, ssc: ssc,
+      lcore: lc, score_side: sc, last: last,
+    };
+  }
+
+  /* 把快照拷成普通对象（快照对象是复用的，跨根保留必须先拷贝） */
+  function msCopy(r) {
+    return {
+      i: r.i, atr: r.atr,
+      lSetup: r.lSetup, sSetup: r.sSetup,
+      lSwing: r.lSwing, lHL: r.lHL, lChoch: r.lChoch, lRetest: r.lRetest, lBos: r.lBos,
+      sSwing: r.sSwing, sHL: r.sHL, sChoch: r.sChoch, sRetest: r.sRetest, sBos: r.sBos,
+      lScore: r.lScore, sScore: r.sScore, lCore: r.lCore, sCore: r.sCore,
+      lStage: r.lStage, sStage: r.sStage, lLvl: r.lLvl, sLvl: r.sLvl,
+      lEv: r.lEv, sEv: r.sEv, lEvL: r.lEvL, sEvL: r.sEvL,
+    };
+  }
+
+  /* 实盘用：给一段 K 线数组（{open,high,low,close}）直接算出逐根结构快照 */
+  function msReplay(candles) {
+    const n = candles.length;
+    const s = {
+      n: n,
+      o: new Float64Array(n), h: new Float64Array(n),
+      l: new Float64Array(n), c: new Float64Array(n),
+    };
+    for (let i = 0; i < n; i++) {
+      const c = candles[i];
+      s.o[i] = c.open; s.h[i] = c.high; s.l[i] = c.low; s.c[i] = c.close;
+    }
+    return msSeries(s);
+  }
+
+  /* ============================================================
      共振沿触发检测
      dirs: 0=wait 1=long 2=short
      ============================================================ */
@@ -550,6 +825,56 @@
       }
       if (on && !prev) out.push({ i: i, dir: d1h[mc1h[i]] === 1 ? 'long' : 'short' });
       prev = on;
+    }
+    return out;
+  }
+
+  /* ============================================================
+     第 6 节开单逻辑：1h 定方向 + 15m 共振 + 5m 市场结构触发
+     ------------------------------------------------------------
+     与旧「共振沿」的区别：5m 不再参与方向投票，只负责扣扳机。
+       ① 1h 必须有方向
+       ② 15m 与该方向一致（共振）
+       ③ 5m 出现**同向**的市场结构触发事件（严格档 = CHOCH+Retest+BOS 齐备）
+     结构触发本身是离散事件（一次结构只响一次），因此不需要再判「跃变沿」。
+     opt.minScore  结构总分下限（0 = 不限）
+     opt.andDir    true 时附加要求 5m 方向分也同向（旧口径 AND 叠加）
+     ============================================================ */
+  function triggerAtMs(d1h, d15, msEv, msScore, d5, opt) {
+    if (d1h === 0) return 0;                              // 1h 无方向 → 不开仓
+    if (d15 !== d1h) return 0;                            // 15m 必须共振
+    if (msEv !== d1h) return 0;                           // 5m 结构触发必须同向
+    if (opt && opt.minScore > 0 && !(msScore >= opt.minScore)) return 0;
+    if (opt && opt.andDir && d5 !== d1h) return 0;        // 附加：5m 方向也要同向
+    return d1h;
+  }
+
+  /* 实盘口径（粗周期用「进行中」的那一根） */
+  function findTriggersMs(d5, d15, d1h, m15, m1h, ms, opt) {
+    const out = [];
+    if (!ms) return out;
+    for (let i = 1; i < d5.length; i++) {
+      const j15 = m15[i], j1h = m1h[i];
+      if (j15 < 1 || j1h < 1) continue;
+      const ev = opt && opt.loose ? ms.evL[i] : ms.ev[i];
+      const sc = ev === 1 ? ms.lsc[i] : ev === 2 ? ms.ssc[i] : 0;
+      const k = triggerAtMs(d1h[j1h], d15[j15], ev, sc, d5[i], opt);
+      if (k) out.push({ i: i, dir: k === 1 ? 'long' : 'short', sc: sc });
+    }
+    return out;
+  }
+
+  /* 回测口径（粗周期只用「已收线」的那一根） */
+  function findTriggersClosedMs(d5, d15, d1h, mc15, mc1h, ms, opt) {
+    const out = [];
+    if (!ms) return out;
+    for (let i = 1; i < d5.length; i++) {
+      const j15 = mc15[i], j1h = mc1h[i];
+      if (j15 < 0 || j1h < 0) continue;
+      const ev = opt && opt.loose ? ms.evL[i] : ms.ev[i];
+      const sc = ev === 1 ? ms.lsc[i] : ev === 2 ? ms.ssc[i] : 0;
+      const k = triggerAtMs(d1h[j1h], d15[j15], ev, sc, d5[i], opt);
+      if (k) out.push({ i: i, dir: k === 1 ? 'long' : 'short', sc: sc });
     }
     return out;
   }
@@ -694,23 +1019,42 @@
     const tpslFn = opt.tpslFn || defaultTpsl;
     const maxHold = opt.maxHold || 2016;          // 最多持仓 2016 根 5m（7 天），超时按市价平
     const onProgress = opt.onProgress || function () {};
+    /* opt.cache：多配置对比时复用「聚合 + 三周期方向序列 + 结构序列」这些与配置无关的重活 */
+    const C = opt.cache || null;
 
     onProgress(0, '聚合 15m / 1h');
-    const s15 = aggregate(s5, TF_SEC['15m']);
-    const s1h = aggregate(s5, TF_SEC['1h']);
+    const s15 = C ? C.s15 : aggregate(s5, TF_SEC['15m']);
+    const s1h = C ? C.s1h : aggregate(s5, TF_SEC['1h']);
 
     onProgress(0.1, '计算三周期信号序列');
-    const r5 = dirSeries(s5), r15 = dirSeries(s15), r1h = dirSeries(s1h);
+    const r5 = C ? C.r5 : dirSeries(s5);
+    const r15 = C ? C.r15 : dirSeries(s15);
+    const r1h = C ? C.r1h : dirSeries(s1h);
     /* 回测必须用「已收线」映射：buildMap 给出的是包含当前 5m 的那根 15m/1h，
        它尚未走完，用它的 high/low/close 等于偷看未来（未来函数）。
        opt.live=true 可切回实盘口径做对照。 */
     const m15 = opt.live ? buildMap(s5.t, s15.t) : buildClosedMap(s5.t, s15.t, TF_SEC['5m'], TF_SEC['15m']);
     const m1h = opt.live ? buildMap(s5.t, s1h.t) : buildClosedMap(s5.t, s1h.t, TF_SEC['5m'], TF_SEC['1h']);
 
-    onProgress(0.5, '寻找共振入场点');
-    const trig = opt.live
-      ? findTriggers(r5.dirs, r15.dirs, r1h.dirs, m15, m1h)
-      : findTriggersClosed(r5.dirs, r15.dirs, r1h.dirs, m15, m1h);
+    /* 5m 市场结构（第 6 节）。msMode === false 时退回旧的「三周期共振沿」口径做对照。 */
+    const msOpt = Object.assign({ loose: false, minScore: 0, andDir: false }, opt.ms || {});
+    let ms = null;
+    if (opt.msMode !== false) {
+      onProgress(0.4, '计算 5m 市场结构（pivot / CHOCH / Retest / BOS）');
+      ms = (C && C.ms) ? C.ms : msSeries(s5);
+    }
+
+    onProgress(0.5, '寻找入场点');
+    let trig;
+    if (ms) {
+      trig = opt.live
+        ? findTriggersMs(r5.dirs, r15.dirs, r1h.dirs, m15, m1h, ms, msOpt)
+        : findTriggersClosedMs(r5.dirs, r15.dirs, r1h.dirs, m15, m1h, ms, msOpt);
+    } else {
+      trig = opt.live
+        ? findTriggers(r5.dirs, r15.dirs, r1h.dirs, m15, m1h)
+        : findTriggersClosed(r5.dirs, r15.dirs, r1h.dirs, m15, m1h);
+    }
 
     onProgress(0.6, '逐笔模拟出场');
     const trades = [];
@@ -770,16 +1114,22 @@
         exit: exitPx, how: how, hold: holdT, risk: risk,
         pnl: net, r: net / risk,
         grossR: gross / risk, feeR: fee / risk,
-        win: net > 0,
+        win: net > 0, msSc: tg.sc || 0,
       });
       if (k % 200 === 0) onProgress(0.6 + 0.35 * k / Math.max(1, trig.length), '模拟第 ' + (k + 1) + ' / ' + trig.length + ' 笔');
     }
 
     onProgress(0.98, '统计');
-    return summarize(trades, s5, trig.length, skipped);
+    const res = summarize(trades, s5, trig.length, skipped, {
+      scores: trig.map(t => t.sc || 0),
+      ms: ms, msOpt: msOpt,
+    });
+    /* 供多配置对比复用（不含 trades，避免重复占内存） */
+    res.cache = { s15: s15, s1h: s1h, r5: r5, r15: r15, r1h: r1h, ms: ms };
+    return res;
   }
 
-  function summarize(trades, s5, trigCount, skipped) {
+  function summarize(trades, s5, trigCount, skipped, meta) {
     const n = trades.length;
     const wins = trades.filter(t => t.win).length;
     const losses = n - wins;
@@ -816,6 +1166,13 @@
     const longs = trades.filter(t => t.dir === 'long');
     const shorts = trades.filter(t => t.dir === 'short');
 
+    /* 第 6 节诊断：5m 结构触发事件总数（未经 1h/15m 过滤） */
+    let msEvCount = 0;
+    if (meta && meta.ms) {
+      const arr = (meta.msOpt && meta.msOpt.loose) ? meta.ms.evL : meta.ms.ev;
+      for (let i = 0; i < arr.length; i++) if (arr[i]) msEvCount++;
+    }
+
     return {
       trades: trades, curve: curve,
       count: n, wins: wins, losses: losses,
@@ -833,7 +1190,34 @@
       trigCount: trigCount, skipped: skipped,
       bars: s5.n,
       from: s5.n ? s5.t[0] : null, to: s5.n ? s5.t[s5.n - 1] : null,
+      /* 第 6 节诊断：结构触发事件数 / 平均结构分 / 各分数段成交表现 */
+      msEvCount: msEvCount, msEvPerDay: msEvCount / Math.max(1, spanDays),
+      msMinScore: (meta && meta.msOpt) ? meta.msOpt.minScore : 0,
+      msLoose: (meta && meta.msOpt) ? !!meta.msOpt.loose : false,
+      msAndDir: (meta && meta.msOpt) ? !!meta.msOpt.andDir : false,
+      msAvgScore: (meta && meta.scores && meta.scores.length)
+        ? meta.scores.reduce((a, b) => a + b, 0) / meta.scores.length : 0,
+      msBands: msBands(trades, meta && meta.scores, trigCount),
     };
+  }
+
+  /* 按结构总分分档看成交表现（判断「分越高是否越值得开」） */
+  function msBands(trades, scores, trigCount) {
+    const cuts = [0, 10, 13, 16, 19, 22, 26];
+    const out = [];
+    for (let b = 0; b + 1 < cuts.length; b++) {
+      const lo = cuts[b], hi = cuts[b + 1];
+      const sel = trades.filter(t => t.msSc >= lo && t.msSc < hi);
+      if (!sel.length) { out.push({ lo: lo, hi: hi, n: 0, winRate: 0, avgR: 0, grossAvg: 0 }); continue; }
+      const g = sel.reduce((a, t) => a + (t.grossR || 0), 0) / sel.length;
+      out.push({
+        lo: lo, hi: hi, n: sel.length,
+        winRate: sel.filter(t => t.win).length / sel.length,
+        avgR: sel.reduce((a, t) => a + t.r, 0) / sel.length,
+        grossAvg: g,
+      });
+    }
+    return out;
   }
 
   async function backtest(sym, years, opt) {
@@ -848,6 +1232,7 @@
     onPhase('calc', 0.6, '共 ' + h.rows.length + ' 根，开始计算');
     const res = backtestCore(h.series, {
       tpslFn: opt.tpslFn, maxHold: opt.maxHold, live: opt.live,
+      ms: opt.ms, msMode: opt.msMode,
       onProgress: (p, txt) => onPhase('calc', 0.6 + 0.4 * p, txt),
     });
     res.live = !!opt.live;
@@ -870,6 +1255,18 @@
     buildMap: buildMap,
     buildClosedMap: buildClosedMap,
     alignTime: alignTime,
+    /* 第 6 节 · 5m 市场结构触发 */
+    MsStream: MsStream,
+    msSeries: msSeries,
+    msReplay: msReplay,
+    msCopy: msCopy,
+    triggerAtMs: triggerAtMs,
+    findTriggersMs: findTriggersMs,
+    findTriggersClosedMs: findTriggersClosedMs,
+    MS_PIV: MS_PIV, MS_SCORE_MAX: MS_SCORE_MAX,
+    MS_RETEST_MAX: MS_RETEST_MAX, MS_CHOCH_MIN: MS_CHOCH_MIN,
+    MS_CHOCH_FRESH: MS_CHOCH_FRESH, MS_RETEST_NEAR: MS_RETEST_NEAR,
+    MS_RETEST_TOL: MS_RETEST_TOL, MS_SWING_FRESH: MS_SWING_FRESH,
     triggerAt: triggerAt,
     findTriggers: findTriggers,
     findTriggersClosed: findTriggersClosed,
