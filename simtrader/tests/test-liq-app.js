@@ -40,6 +40,32 @@ ok(/window\.LiqMap\.refresh\(false\)/.test(appSrc), '存在增量刷新定时器
 ok(/--liqw: 118px/.test(css) && /#chartBox\.liq-off \{ --liqw: 0px/.test(css), 'CSS：默认留 118px，关闭时归零');
 ok(/#chart \{ position: absolute; left: var\(--liqw\)/.test(css), 'CSS：K线容器右移，不与清算图重叠');
 
+/* ---------- 本轮：三周期 + 共振沿开单 + 5 年回测 ---------- */
+const stSrc = fs.readFileSync(path.join(DIR, 'strategy.js'), 'utf8');
+console.log('\n【三周期 / 共振沿开单 / 回测 静态检查】');
+ok(/strategy\.js\?v=\d+/.test(html), 'index.html 引入 strategy.js 且带版本号');
+ok(html.indexOf('strategy.js') < html.indexOf('app.js?v='), 'strategy.js 先于 app.js 加载');
+ok(/data-tf="5m"/.test(html) && /data-tf="15m"/.test(html) && /data-tf="1h"/.test(html), 'K线周期为 5m / 15m / 1h 三档');
+ok(!/data-tf="4h"/.test(html) && !/data-tf="30m"/.test(html), '已移除 4h 与 30m 周期按钮');
+ok(/const TFS = \['5m', '15m', '1h'\]/.test(appSrc), 'app.js 周期为 5m/15m/1h');
+ok(!/'4h'|"4h"|'30m'|"30m"/.test(appSrc), 'app.js 无 4h / 30m 残留');
+ok(/TF_ROLE = \{[^}]*'1h': '方向'/.test(appSrc), '1h 角色标注为「方向」');
+ok(/id="btRun"/.test(html) && /id="btCards"/.test(html) && /id="btList"/.test(html) && /id="btBar"/.test(html) && /id="btProg"/.test(html) && /id="btNote"/.test(html), '页面含回测面板（运行/进度条/结果卡/明细/口径）');
+ok(/id="btSym"/.test(html), '回测面板显示当前品种');
+ok(/开始回测（5 年）/.test(html), '回测按钮固定为 5 年');
+ok(/function updateResonance\(\)/.test(appSrc) && /function paintTriggers\(\)/.test(appSrc), '共振沿计算与 K线标记函数已实现');
+ok(/setMarkers\(marks\)/.test(appSrc), '信号标记写入 K 线 series（setMarkers）');
+ok(/arrowUp/.test(appSrc) && /arrowDown/.test(appSrc), '买入箭头 / 卖出箭头');
+ok(/state\.triggers/.test(appSrc) && /findTriggers\(/.test(appSrc), '触发点来自 Strategy.findTriggers');
+ok(/function bindBacktest\(\)/.test(appSrc) && /bindBacktest\(\);/.test(appSrc), '回测按钮绑定且 boot 中调用');
+ok(/window\.Strategy\.backtest\(/.test(appSrc) && /tpslFn: tpSlPlan/.test(appSrc), '回测复用看板止盈止损 tpSlPlan（口径一致）');
+ok(/onPhase/.test(appSrc) && /btBar/.test(appSrc), '回测进度条已接入 onPhase 回调');
+ok(/\.bt-panel/.test(css) && /\.bt-cards/.test(css) && /\.bt-bar/.test(css) && /\.bt-row/.test(css), 'CSS：回测面板样式齐全');
+ok(/function triggerAt\(/.test(stSrc) && /function findTriggers\(/.test(stSrc), 'strategy.js 实现 triggerAt / findTriggers');
+ok(/FEE_RATE/.test(stSrc) && /maxHold/.test(stSrc), '回测含手续费与最大持仓约束');
+ok(/onProgress/.test(stSrc) && /poolMap/.test(stSrc), '历史数据分段并发拉取（含进度回调）');
+ok(/module\.exports/.test(stSrc) && /global\.Strategy/.test(stSrc), 'strategy.js 同时支持 Node 测试与浏览器');
+
 /* ---------- mock 环境（沿用 test-gate-perp.js 的骨架） ---------- */
 const store = {};
 const LS = { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }, removeItem: k => { delete store[k]; } };
@@ -86,6 +112,20 @@ ok(typeof win.LiqMap.init === 'function' && typeof win.LiqMap.setInstrument === 
 new Function('window', 'document', 'localStorage', 'requestAnimationFrame', 'cancelAnimationFrame', 'ResizeObserver', 'AbortController', 'fetch', lsSrc)(win, doc, LS, win.requestAnimationFrame, () => {}, win.ResizeObserver, AbortController, async () => ({ json: async () => [], ok: true }));
 ok(!!win.LsMap, 'lsmap.js 挂载 window.LsMap');
 ok(typeof win.LsMap.init === 'function' && typeof win.LsMap.setSpan === 'function' && typeof win.LsMap.span === 'function' && typeof win.LsMap.book === 'function', '多空热力图对外接口齐全');
+new Function('window', 'document', 'fetch', 'AbortController', 'AbortSignal', stSrc)(win, doc, async () => ({ json: async () => ([]), ok: true }), AbortController, AbortSignal);
+ok(!!win.Strategy, 'strategy.js 挂载 window.Strategy');
+ok(['dirSeries', 'aggregate', 'findTriggers', 'triggerAt', 'backtest', 'fetchHistory'].every(k => typeof win.Strategy[k] === 'function'), 'strategy.js 对外接口齐全', Object.keys(win.Strategy).length + ' 项');
+ok(win.Strategy.TF_SEC['5m'] === 300 && win.Strategy.TF_SEC['15m'] === 900 && win.Strategy.TF_SEC['1h'] === 3600, '周期秒数表正确');
+/* triggerAt 严格共振沿：1h 定方向，15m/5m 必须同向且至少一个刚翻转 */
+const T = win.Strategy.triggerAt;
+ok(T(1, 1, 1, 1, 0, 0) === 1, '1h多 + 15m/5m 双双刚翻多 → 触发买入');
+/* 约定：triggerAt 返回 0=不触发 / 1=买入 / 2=卖出 */
+ok(T(-1, -1, -1, 0, -1, 0) === 2, '1h空 + 两周期刚翻空 → 触发卖出');
+ok(T(1, 1, 1, 1, 0, 0) === 1, '只有 5m 刚翻多、15m 早已同向 → 仍触发（至少一个翻转即可）');
+ok(T(1, 1, 1, 1, 1, 1) === 0, '三者早就同向（无翻转沿）→ 不触发');
+ok(T(0, 1, 1, 1, 1, 1) === 0, '1h 无方向 → 不触发');
+ok(T(1, 1, -1, 1, 0, 0) === 0, '5m 与 1h 反向 → 不触发');
+ok(T(1, -1, 1, 1, 0, 0) === 0, '15m 与 1h 反向 → 不触发');
 
 let bootErr = null;
 try {

@@ -502,6 +502,31 @@ button { font-family: inherit; }
 .adv-tp { color: var(--up); font-weight: 700; }
 .tpsl-note { font-size: 9px; color: var(--muted-2); margin-top: 6px; line-height: 1.6; }
 
+/* ---------- 开单逻辑回测 ---------- */
+.bt-panel { margin-top: 10px; }
+.bt-ctrl { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; flex-wrap: wrap; }
+.bt-run { padding: 5px 12px; font-size: 11px; }
+.bt-run:disabled { opacity: .55; cursor: progress; }
+.bt-tip { font-size: 10.5px; color: var(--muted); }
+.bt-bar { height: 4px; background: var(--line); border-radius: 3px; overflow: hidden; margin-bottom: 9px; }
+.bt-bar > i { display: block; height: 100%; width: 0; background: #2563eb; border-radius: 3px; transition: width .25s; }
+.bt-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 7px; }
+.bt-cards .rc b { font-size: 14px; font-weight: 700; display: block; margin-top: 2px; }
+.bt-cards .rc small { display: block; font-size: 9.5px; color: var(--muted-2); margin-top: 2px; }
+.bt-list { margin-top: 9px; }
+.bt-lhead, .bt-row {
+  display: grid; grid-template-columns: 92px 46px 1fr 1fr 1fr 88px 68px;
+  gap: 6px; align-items: center; font-size: 10.5px; padding: 3px 6px;
+}
+.bt-lhead { color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 5px; }
+.bt-row { border-bottom: 1px dashed var(--line); font-variant-numeric: tabular-nums; }
+.bt-row span { color: var(--muted); }
+.bt-row b { font-weight: 700; }
+.bt-lfoot { font-size: 9.5px; color: var(--muted-2); margin-top: 5px; }
+.bt-empty { font-size: 11px; color: var(--muted); padding: 8px 0; }
+.bt-note { font-size: 9.5px; color: var(--muted-2); line-height: 1.75; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
+.bt-note b { color: var(--muted); }
+
 /* ---------- Toast ---------- */
 .toast {
   position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%) translateY(18px);

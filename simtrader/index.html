@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260924b">
+<link rel="stylesheet" href="style.css?v=20260924d">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -69,10 +69,9 @@
         </span>
         <span class="liq-stat" id="liqStat"></span>
         <div class="tf-tabs" id="tfTabs">
+        <button data-tf="5m">5分钟</button>
         <button data-tf="15m" class="active">15分钟</button>
-        <button data-tf="30m">30分钟</button>
         <button data-tf="1h">1小时</button>
-        <button data-tf="4h">4小时</button>
         </div>
       </div>
     </div>
@@ -82,7 +81,7 @@
     <div class="sig-cards-wrap">
       <div class="sc-head">
         <h3>多周期交易提示</h3>
-        <span class="sc-sub" id="sigSub">四周期独立计算 · 依据真实K线 · 绿涨红跌</span>
+        <span class="sc-sub" id="sigSub">三周期独立计算 · 1h 定方向 / 15m·5m 定入场 · 依据真实K线 · 绿涨红跌</span>
       </div>
       <div class="sig-cards" id="sigMatrix"></div>
       <div class="sig-hint" id="sigHint"></div>
@@ -102,6 +101,22 @@
       </div>
       <div class="tpsl-block" id="tpslBlock"></div>
     </div>
+  </section>
+
+  <!-- ★ 开单逻辑回测：1h 定方向 + 15m / 5m 共振沿入场 -->
+  <section class="panel bt-panel">
+    <div class="sc-head">
+      <h3>开单逻辑回测 · <span id="btSym">—</span></h3>
+      <span class="sc-sub">1h 定方向 · 15m 与 5m 共振沿入场 · 看板同款止盈止损出场 · 5 年真实 5m K线（币安现货，Gate 永续只保留近 35 天）</span>
+    </div>
+    <div class="bt-ctrl">
+      <button class="btn-xs bt-run" id="btRun">开始回测（5 年）</button>
+      <span class="bt-tip" id="btProg">未运行 · 首次约需 2～5 分钟（5 年 5m K线约 53 万根，分 526 段并发拉取）</span>
+    </div>
+    <div class="bt-bar"><i id="btBar"></i></div>
+    <div class="bt-cards" id="btCards"></div>
+    <div class="bt-list" id="btList"></div>
+    <div class="bt-note" id="btNote"></div>
   </section>
 
   <!-- 右侧：多平台实时价格 + 下单 -->
@@ -261,7 +276,7 @@
       </ul>
       <h4>数据刷新（页面右上角刷新控件）</h4>
       <ul>
-        <li><b>立即刷新</b>：点击按钮或按 <b>R</b> 键，强制重新拉取 K线、四周期信号、多空热力图、左侧清算图与实时价格。</li>
+        <li><b>立即刷新</b>：点击按钮或按 <b>R</b> 键，强制重新拉取 K线、三周期信号、多空热力图、左侧清算图与实时价格。</li>
         <li><b>刷新档位</b>：实时 / 5分钟 / 10分钟 / 30分钟，选择后会记住（下次打开沿用），右侧显示到下次自动刷新的倒计时。</li>
         <li>档位只作用于<b>行情与分析数据</b>（K线、信号、止盈止损区间、多空热力图、左侧清算图）。</li>
         <li><b>实时价格与挂单撮合、强平检查固定为 5 秒</b>，不随档位变慢 —— 否则限价单触发与风控会失效。</li>
@@ -294,12 +309,20 @@
       </ul>
       <h4>止盈 / 止损价格区间（信号栏内提示）</h4>
       <ul>
-        <li><b>数据依据</b>：对 15分钟 / 30分钟 / 1小时 / 4小时 四个周期的<b>真实K线</b>分别计算 ATR(14) 波动、近 N 根结构高低点（15m 取20根、30m 24根、1h 30根、4h 40根）、布林带(20,2) 与多因子信号方向</li>
-        <li><b>止损价</b>：优先取「结构止损」（做多 = 近期最低点再让 0.15×ATR，做空 = 近期最高点再让 0.15×ATR）；若该止损距离超过单笔风险上限（15m 2.0×ATR、30m 2.2、1h 2.4、4h 2.8），则改用 ATR 止损（1.2/1.5/1.8/2.4 × ATR），避免单笔风险过大</li>
+        <li><b>开单逻辑（核心）</b>：<b>1h 判定大方向</b>（多 / 空 / 观望）；只有当 <b>15m 与 5m 同时与 1h 同向</b>，
+          且其中<b>至少一个刚刚从「观望 / 反向」翻转过来</b>时，才在翻转那一刻触发一次<b>买入 / 卖出</b>报警 —— 这就是「严格共振沿」，
+          三者早已同向时不会重复报警。触发点会画成 K 线上的 <b>▲买入（绿）</b> / <b>▼卖出（红）</b> 标记；
+          K 线下方的标题栏实时显示 <code>1h 多（方向） · 15m 多 · 5m 多 → 三周期共振中</code> 这类状态</li>
+        <li><b>回测</b>：对当前品种跑 <b>5 年真实 5m K线</b>（约 26 万根，分段并发拉取，首次约 1～4 分钟）→ 聚合出 15m / 1h →
+          三周期信号序列 → 共振沿入场 → <b>看板同款止盈止损</b>出场。入场用<b>下一根 5m 开盘价</b>（不用触发那根的收盘价，避免未来函数）；
+          同一根 K 线内同时触及止盈与止损时<b>保守按止损计</b>；已扣 0.10% 市价手续费。
+          <b>回测是历史统计，不代表未来收益</b>，滑点与资金费率未计入</li>
+        <li><b>数据依据</b>：对 5分钟 / 15分钟 / 1小时 三个周期的<b>真实K线</b>分别计算 ATR(14) 波动、近 N 根结构高低点（5m 取16根、15m 20根、1h 30根）、布林带(20,2) 与多因子信号方向</li>
+        <li><b>止损价</b>：优先取「结构止损」（做多 = 近期最低点再让 0.15×ATR，做空 = 近期最高点再让 0.15×ATR）；若该止损距离超过单笔风险上限（5m 1.6×ATR、15m 2.0、1h 2.4），则改用 ATR 止损（0.90/1.20/1.80 × ATR），避免单笔风险过大</li>
         <li><b>止盈价</b>：止盈一 = 1R（1 倍风险距离）；止盈二 = 结构压力/布林上轨（做空为结构支撑/布林下轨）与 2R 中<b>更近且可达</b>者，否则退回 2R；同时给出止盈三（3R 以上）供参考</li>
         <li><b>盈亏比</b>：以止损距离为 1R 衡量，显示 1:1 / 1:x；<b>单笔风险</b>列为该周期止损距离占现价的百分比</li>
         <li><b>参考入场区</b>：做多为现价下方 0.12~0.60×ATR（回踩买入），做空为现价上方同样区间（反弹卖出），天然符合「限价单须挂在未触及一侧」的规则</li>
-        <li><b>综合结论</b>：按周期权重（15m 20% / 30m 24% / 1h 26% / 4h 30%）加权同向周期的绝对价位，给出综合止损/止盈与盈亏比；置信度 = 方向一致性 60% + 信号强度，若 2 个以上周期为震荡则下调；共振 3/4 周期同向时标注「四周期共振」</li>
+        <li><b>综合结论</b>：按周期权重（5m 26% / 15m 30% / 1h 44%）加权同向周期的绝对价位，给出综合止损/止盈与盈亏比；置信度 = 方向一致性 60% + 信号强度，若 2 个以上周期为震荡则下调；三周期同向时标注「三周期共振」</li>
         <li><b>建议数量</b>：按单笔风险预算（总权益 2%）÷ 止损距离反推，并受当前杠杆下最大可开量限制</li>
         <li><b>持仓提示</b>：当前品种的持仓会按所选周期的方案列出参考止损/止盈与状态（接近止损 / 接近止盈 / 持有观察）</li>
         <li><b>一键填入</b>：列表内「用此方案」只把委托价与数量填进下单面板，<b>不会自动下单</b>，仍需手动点击买入/卖出并完成二次确认</li>
@@ -322,7 +345,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260924b · Gate.io 永续单一数据源 · 多空热力图（订单簿 ±200/±500/±2000/±5000 tick） · K线缩放拖动</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260924d · 实盘 Gate.io 永续 · 回测 币安现货 5m 5年（无未来函数） · 1h定方向/15m·5m共振沿开单 · 信号画在K线 · 盈亏拆解 · K线缩放拖动</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -342,8 +365,9 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260924b"></script>
-<script src="lsmap.js?v=20260924b"></script>
-<script src="app.js?v=20260924b"></script>
+<script src="liq-map.js?v=20260924d"></script>
+<script src="lsmap.js?v=20260924d"></script>
+<script src="strategy.js?v=20260924d"></script>
+<script src="app.js?v=20260924d"></script>
 </body>
 </html>

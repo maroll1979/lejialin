@@ -29,8 +29,10 @@ const INSTRUMENTS = [
   { id: 'UST5Y',  name: '美债5年收益率',   short: '美5Y',  type: 'ust', tenor: '5 Yr',  dec: 3, qtyStep: 1, source: '美国财政部' },
   { id: 'UST10Y', name: '美债10年收益率',  short: '美10Y', type: 'ust', tenor: '10 Yr', dec: 3, qtyStep: 1, source: '美国财政部' },
 ];
-const TFS = ['15m', '30m', '1h', '4h'];
-const TF_NAME = { '15m': '15分钟', '30m': '30分钟', '1h': '1小时', '4h': '4小时' };
+const TFS = ['5m', '15m', '1h'];
+const TF_NAME = { '5m': '5分钟', '15m': '15分钟', '1h': '1小时' };
+/* 角色分工：1h 定大方向，15m 与 5m 做共振入场（见 strategy.js 的共振沿逻辑） */
+const TF_ROLE = { '5m': '入场共振', '15m': '入场共振', '1h': '方向' };
 
 const FEE = 0.001;            // 兼容旧引用（=市价 Taker 费率）
 const FEE_TAKER = 0.001;      // 市价单手续费 0.10%
@@ -60,11 +62,10 @@ function rfLevel() { return REFRESH_LEVELS.find(l => l.id === state.refreshLevel
    w        ：该周期在综合结论中的权重
    riskPct  ：单笔风险预算（占总权益比例，用于反推建议数量） */
 const TPSL_CFG = {
-  '15m': { atrK: 1.20, maxAtrK: 2.0, look: 20, rr: [1.0, 2.0, 3.0], w: 0.20 },
-  '30m': { atrK: 1.50, maxAtrK: 2.2, look: 24, rr: [1.0, 2.0, 3.0], w: 0.24 },
-  '1h':  { atrK: 1.80, maxAtrK: 2.4, look: 30, rr: [1.0, 2.0, 3.2], w: 0.26 },
-  '4h':  { atrK: 2.40, maxAtrK: 2.8, look: 40, rr: [1.0, 2.2, 3.5], w: 0.30 },
-};
+  '5m':  { atrK: 0.90, maxAtrK: 1.6, look: 16, rr: [1.0, 2.0, 3.0], w: 0.26 },
+  '15m': { atrK: 1.20, maxAtrK: 2.0, look: 20, rr: [1.0, 2.0, 3.0], w: 0.30 },
+  '1h':  { atrK: 1.80, maxAtrK: 2.4, look: 30, rr: [1.0, 2.0, 3.2], w: 0.44 },
+};   /* 1h 是方向周期，权重最高；权重和 = 1.00 */
 const TPSL_RISK_BUDGET = 0.02;   // 单笔风险预算 = 总权益的 2%
 
 /* ---------- 工具 ---------- */
@@ -838,7 +839,7 @@ function parseTreasuryCSV(text) {
   }
   return out.ust10Y.series.length ? out : null;
 }
-// 美债：日频 → 合成到四周期视图（相同信号，备注日频）
+// 美债：日频 → 合成到三周期视图（相同信号，备注日频）
 async function fetchUstKlines(inst, tf) {
   const all = await fetchTreasuryYields();
   const d = all[inst.id.toLowerCase()];
@@ -860,8 +861,11 @@ const state = {
   signals: {},         // tf -> signal
   venueQuotes: {},     // 品种 -> { gate:{px,open24h}, okx:{...}, ... } 多平台实时比价
   venueTs: {},         // 品种 -> 比价缓存时间戳
-  tfCandles: null,     // { _inst, 15m:[], 30m:[], 1h:[], 4h:[] } 各周期真实K线
+  tfCandles: null,     // { _inst, 5m:[], 15m:[], 1h:[] } 各周期真实K线
   tpsl: null,          // 当前品种的多周期止盈止损方案
+  triggers: [],        // 开单逻辑触发点 [{time, dir}]，画在 K 线上
+  _lastAlert: '',      // 已报警的触发点 key（避免同一触发反复弹窗）
+  _btRunning: false, _btResult: null,   // 回测运行状态
   tpOv: loadTpOv(),    // "品种:周期" -> { stop?, tp1?, tp2? } 手动微调覆盖值（持久化）
   cacheTs: {},         // 各品种各周期K线缓存时间戳
   orderType: 'market', // market | limit
@@ -1176,7 +1180,7 @@ async function loadChart(force) {
     let candles;
     if (inst.type === 'ust') {
       candles = await ensureCandles(inst, state.tf, !!force);
-      note.textContent = `美债收益率为日频官方数据，四周期视图显示同一日线序列`;
+      note.textContent = `美债收益率为日频官方数据，三周期视图显示同一日线序列`;
       if (candles.length > 260) candles = candles.slice(-260);
     } else {
       candles = force ? await fetchKlines(inst.sym, state.tf, 300) : await ensureCandles(inst, state.tf);
@@ -1220,6 +1224,189 @@ function paintChart(candles) {
   if (window.LiqMap) { window.LiqMap.setCandles(candles); window.LiqMap.render(); }   // 清算图随 K 线重绘
 }
 
+/* ============================================================
+   开单逻辑：1h 定方向 + 15m / 5m 共振沿入场
+   ------------------------------------------------------------
+   严格共振沿（用户口径）：
+     ① 1h 必须有方向（long / short）
+     ② 15m 与 5m 必须同时与 1h 同向
+     ③ 且至少一个「刚刚」从 观望 / 反向 翻转过来
+   → 满足则在翻转那一刻触发一次买入 / 卖出，之后不再重复报警。
+   历史触发点画成 K 线上的 ▲买入 / ▼卖出 标记。
+   ============================================================ */
+function updateResonance() {
+  const st = window.Strategy;
+  const inst = instOf(state.current);
+  const sub = $('#sigSub');
+  state.triggers = [];
+  if (!st) { if (sub) sub.textContent = '三周期独立计算 · 依据真实K线 · 绿涨红跌'; return; }
+
+  const c5 = state.candles[state.current + '_5m'];
+  const c15 = state.candles[state.current + '_15m'];
+  const c1h = state.candles[state.current + '_1h'];
+  const s1 = state.signals || {};
+
+  /* 顶部状态条：三个周期各自方向 + 是否共振 */
+  if (sub) {
+    const dTxt = d => (d === 'long' ? '多' : d === 'short' ? '空' : '观望');
+    const d1h = s1['1h'] ? s1['1h'].dir : 'wait';
+    const d15 = s1['15m'] ? s1['15m'].dir : 'wait';
+    const d5 = s1['5m'] ? s1['5m'].dir : 'wait';
+    const aligned = d1h !== 'wait' && d15 === d1h && d5 === d1h;
+    sub.textContent = `1h ${dTxt(d1h)}（方向） · 15m ${dTxt(d15)} · 5m ${dTxt(d5)} → `
+      + (aligned ? '三周期共振中' : '未共振')
+      + (state.triggers && state.triggers.length ? '' : '');
+  }
+
+  if (!c5 || !c15 || !c1h || c5.length < 60 || c15.length < 60 || c1h.length < 60) return;
+  try {
+    const S5 = st.toSeries(c5), S15 = st.toSeries(c15), S1h = st.toSeries(c1h);
+    const r5 = st.dirSeries(S5), r15 = st.dirSeries(S15), r1h = st.dirSeries(S1h);
+    const m15 = st.buildMap(S5.t, S15.t), m1h = st.buildMap(S5.t, S1h.t);
+    state.triggers = st.findTriggers(r5.dirs, r15.dirs, r1h.dirs, m15, m1h)
+      .map(t => ({ time: S5.t[t.i], dir: t.dir }));
+  } catch (e) { state.triggers = []; }
+
+  paintTriggers();
+  alertResonance(c5);
+}
+
+/* 把触发点画成 K 线上的标记（同一根 K 线多次触发只保留最后一次） */
+function paintTriggers() {
+  if (!state.candleSeries || typeof state.candleSeries.setMarkers !== 'function') return;
+  const st = window.Strategy;
+  if (!st) return;
+  /* 只画落在当前图表数据范围内的触发点：越界的时间会让整个 setMarkers 失效 */
+  const bars = state.candles[state.current + '_' + state.tf] || [];
+  if (!bars.length) return;
+  const t0 = bars[0].time, t1 = bars[bars.length - 1].time;
+  const seen = new Map();
+  (state.triggers || []).forEach(t => {
+    const tt = st.alignTime(t.time, state.tf);
+    if (tt < t0 || tt > t1) return;
+    seen.set(tt, t.dir);
+  });
+  const marks = [];
+  seen.forEach((dir, time) => {
+    const isLong = dir === 'long';
+    marks.push({
+      time: time,
+      position: isLong ? 'belowBar' : 'aboveBar',
+      color: isLong ? '#0a8f4e' : '#d92c2c',
+      shape: isLong ? 'arrowUp' : 'arrowDown',
+      text: isLong ? '买入' : '卖出',
+      size: 2,
+    });
+  });
+  marks.sort((a, b) => a.time - b.time);
+  try { state.candleSeries.setMarkers(marks); } catch (e) { /* 图表库版本不支持则跳过 */ }
+}
+
+/* 最新一根刚触发 → 弹报警（同一触发只报一次） */
+function alertResonance(c5) {
+  const trig = state.triggers;
+  if (!trig || !trig.length) return;
+  const last = trig[trig.length - 1];
+  const lastBar = c5[c5.length - 1].time;
+  if (last.time < lastBar) return;                       // 不是最新一根 → 只是历史标记，不报警
+  const key = state.current + '|' + last.time + '|' + last.dir;
+  if (state._lastAlert === key) return;
+  state._lastAlert = key;
+
+  const inst = instOf(state.current);
+  const isLong = last.dir === 'long';
+  const p1h = (state.tpsl && state.tpsl.plans) ? state.tpsl.plans.find(p => p.tf === '1h') : null;
+  const side = p1h ? (isLong ? p1h.long : p1h.short) : null;
+  let msg = (isLong ? '🟢 买入信号' : '🔴 卖出信号') + ` · ${inst.short}：1h 定方向，15m 与 5m 共振同向`;
+  if (side) msg += ` · 参考止损 ${fmt(side.stop, inst.dec)} / 止盈一 ${fmt(side.tp1, inst.dec)} / 止盈二 ${fmt(side.tp2, inst.dec)}`;
+  toast(msg);
+}
+
+/* ---------- 开单逻辑回测 ---------- */
+function setBtProg(txt) { const el = $('#btProg'); if (el) el.textContent = txt; }
+function bindBacktest() {
+  const btn = $('#btRun');
+  if (!btn || !window.Strategy) return;
+  btn.addEventListener('click', async () => {
+    if (state._btRunning) return;
+    const inst = instOf(state.current);
+    if (!inst.sym) { setBtProg('该品种无对应可回测的交易对'); return; }
+    state._btRunning = true;
+    btn.disabled = true;
+    btn.textContent = '回测中…';
+    const bar = $('#btBar');
+    if (bar) bar.style.width = '0%';
+    try {
+      const res = await window.Strategy.backtest(inst.sym, 5, {
+        tpslFn: tpSlPlan,
+        onPhase: (ph, p, txt) => {
+          setBtProg(txt);
+          if (bar) bar.style.width = Math.max(2, Math.round(p * 100)) + '%';
+        },
+      });
+      state._btResult = res;
+      renderBacktest(res, inst);
+      setBtProg(`完成 · ${res.count} 笔交易 · ${res.bars.toLocaleString('en-US')} 根 5m K线`);
+    } catch (e) {
+      setBtProg('回测失败：' + (e && e.message ? e.message : e));
+    } finally {
+      state._btRunning = false;
+      btn.disabled = false;
+      btn.textContent = '开始回测（5 年）';
+    }
+  });
+}
+function renderBacktest(r, inst) {
+  const cards = $('#btCards'), list = $('#btList'), note = $('#btNote');
+  if (!cards) return;
+  const dec = inst.dec, P = v => fmt(v, dec), pct = v => (v * 100).toFixed(1) + '%';
+  const cls = v => (v >= 0 ? 'txt-up' : 'txt-down');
+  const pf = r.profitFactor === Infinity ? '∞' : (r.profitFactor || 0).toFixed(2);
+  cards.innerHTML = `
+    <div class="rc"><span class="k">交易笔数</span><b>${r.count}</b><small>多 ${r.longCount}（胜 ${r.longWin}） / 空 ${r.shortCount}（胜 ${r.shortWin}）</small></div>
+    <div class="rc"><span class="k">胜率</span><b class="${r.winRate >= 0.5 ? 'txt-up' : 'txt-down'}">${pct(r.winRate)}</b><small>盈 ${r.wins} / 亏 ${r.losses}</small></div>
+    <div class="rc"><span class="k">累计收益</span><b class="${cls(r.totalR)}">${r.totalR >= 0 ? '+' : ''}${r.totalR.toFixed(1)}R</b><small>平均 ${r.avgR >= 0 ? '+' : ''}${r.avgR.toFixed(2)}R / 笔</small></div>
+    <div class="rc"><span class="k">最大回撤</span><b class="txt-down">${pct(r.maxDD)}</b><small>固定风险 2% / 笔</small></div>
+    <div class="rc"><span class="k">盈亏因子</span><b>${pf}</b><small>毛利 ÷ 毛损</small></div>
+    <div class="rc"><span class="k">年化</span><b class="${cls(r.annRet)}">${r.annRet >= 0 ? '+' : ''}${(r.annRet * 100).toFixed(1)}%</b><small>${r.years.toFixed(1)} 年</small></div>
+    <div class="rc"><span class="k">平均持仓</span><b>${r.avgHoldHours.toFixed(1)} 小时</b><small>${r.avgHoldBars.toFixed(0)} 根 5m</small></div>
+    <div class="rc"><span class="k">样本区间</span><b>${r.spanDays.toFixed(0)} 天</b><small>${ts(r.from * 1000).slice(0, 10)} → ${ts(r.to * 1000).slice(0, 10)}</small></div>`;
+
+  const rows = (r.trades || []).slice(-24).reverse().map(t => {
+    const howCls = t.how === '止损' || t.how === '止损（半仓）' ? 'txt-down' : 'txt-up';
+    return `<div class="bt-row">
+      <span>${ts(t.time * 1000).slice(5, 16)}</span>
+      <b class="${t.dir === 'long' ? 'txt-up' : 'txt-down'}">${t.dir === 'long' ? '买入' : '卖出'}</b>
+      <span>${P(t.entry)}</span><span>${P(t.stop)}</span><span>${P(t.tp2)}</span>
+      <span class="${howCls}">${t.how}</span>
+      <b class="${cls(t.r)}">${t.r >= 0 ? '+' : ''}${t.r.toFixed(2)}R</b>
+    </div>`;
+  }).join('');
+  if (list) {
+    list.innerHTML = rows
+      ? `<div class="bt-lhead"><span>时间</span><span>方向</span><span>入场</span><span>止损</span><span>止盈二</span><span>出场</span><span>盈亏</span></div>${rows}
+         <div class="bt-lfoot">仅显示最近 ${Math.min(24, r.trades.length)} 笔 / 共 ${r.count} 笔</div>`
+      : '<div class="bt-empty">样本内没有触发任何开单信号</div>';
+  }
+  if (note) {
+    const srcLine = r.src === 'binance'
+      ? `K线来源 <b>币安现货 ${r.market} 5m</b>（分段 ${r.segTotal} 次，失败 ${r.segFailed}）。
+         Gate.io 永续免费接口只保留<b>最近 10000 根</b>（5m 仅约 ${r.cappedDays ? r.cappedDays.toFixed(0) : 35} 天），
+         做不了 5 年，故长周期回测改用币安现货；实盘信号仍走 Gate 永续，两者存在<b>基差</b>（通常 &lt;0.1%，对 ATR 百分比止损影响可忽略）。`
+      : `K线来源 <b>Gate.io 永续 ${r.market} 5m</b>（分段 ${r.segTotal} 次，失败 ${r.segFailed}）${r.capped ? `，该源上限最近 10000 根 ≈ ${r.cappedDays.toFixed(0)} 天，已自动截断` : ''}。`;
+    note.innerHTML = `<b>数据源</b>：${srcLine}
+      <br><b>口径</b>：入场 = 1h 定方向，且 15m 与 5m 同时同向、至少一个刚从观望/反向翻转（共振沿），
+      一次共振只开一次仓；回测中 1h/15m 只取<b>已收线</b>的 K 线（避免未来函数），
+      按<b>下一根 5m 开盘价</b>成交；出场 = 看板同款止盈止损（1h 方案：ATR 止损 + 止盈一/二分批），
+      同一根 K 线内同时触及止盈与止损时<b>保守按止损计</b>；已扣 <b>0.10%</b> 市价手续费（开平各一次）。
+      <b>R</b> = 净收益 ÷ 入场到止损的距离。权益曲线按「每笔风险 = 当前权益 2%」滚动。
+      <br><b>盈亏拆解</b>：毛利 <b class="${r.grossR >= 0 ? 'txt-up' : 'txt-down'}">${r.grossR >= 0 ? '+' : ''}${r.grossR.toFixed(1)}R</b>（${(r.grossR / Math.max(1, r.count)).toFixed(3)}R/笔）
+      − 手续费 <b class="txt-down">${(-r.feeR).toFixed(1)}R</b>（${r.avgFeeR.toFixed(3)}R/笔）
+      = 净 ${r.totalR.toFixed(1)}R；平均止损宽度约为入场价的 <b>${(r.avgRiskPct * 100).toFixed(2)}%</b>。
+      <br><b>提醒</b>：这是历史统计，<b>不代表未来收益</b>；滑点、资金费率与深度不足造成的成交偏差均未计入，实盘结果会更差。`;
+  }
+}
+
 /* ---------- 信号 ---------- */
 /* force=true 时强制重新拉取四个周期的K线（用于右上角刷新/定时刷新），
    否则沿用内存中的K线缓存（切品种、切周期时使用）。 */
@@ -1234,7 +1421,7 @@ async function runSignals(existingCandles, force) {
       if (!candles) candles = await ensureCandles(inst, state.tf, !!force);
       if (candles.length > 260) candles = candles.slice(-260);
       const sig = computeSignal(candles);
-      TFS.forEach(tf => { results[tf] = sig; byTf[tf] = candles; });  // 美债为日频，四周期共用同一序列
+      TFS.forEach(tf => { results[tf] = sig; byTf[tf] = candles; });  // 美债为日频，三周期共用同一序列
     } else {
       await Promise.all(TFS.map(async tf => {
         try {
@@ -1249,8 +1436,9 @@ async function runSignals(existingCandles, force) {
     state._sigInst = state.current;
     state.signals = results;
     state.tfCandles = byTf;
-    computeTpSl();       // 依据四周期真实K线推导止盈止损区间
-    renderSigCards();    // K线图下方四格交易提示（信号 + 入场区 + 止损止盈 + 一键填入）
+    computeTpSl();       // 依据三周期真实K线推导止盈止损区间（先算，报警里要带止损止盈）
+    updateResonance();   // 开单逻辑：1h 定方向 + 15m/5m 共振沿 → K线标记 + 报警
+    renderSigCards();    // K线图下方三格交易提示（信号 + 入场区 + 止损止盈 + 一键填入）
     renderIndPanel();    // 指标全景（KDJ / MACD / 布林 / OBV / RSI / ATR）
     renderTpOvPanel();   // 止盈止损手动微调面板
     const cur = results[state.tf];
@@ -1270,8 +1458,8 @@ async function runSignals(existingCandles, force) {
   }
 }
 
-/* ---------- K线图下方：四周期交易提示（四个独立格子，整齐排列） ----------
-   每格承载一个周期（15分钟 / 30分钟 / 1小时 / 4小时）的完整交易提示：
+/* ---------- K线图下方：三周期交易提示（三个独立格子，整齐排列） ----------
+   每格承载一个周期（5分钟 / 15分钟 / 1小时）的完整交易提示：
    信号方向与评分 · 参考入场区 · 止损 · 止盈一 / 止盈二 · 盈亏比 · ATR · 一键填入
    「用此方案」只把参数填进下单面板，不会自动下单，仍需手动点击并二次确认。 */
 function renderSigCards() {
@@ -2453,7 +2641,7 @@ function computeTpSl() {
   applyTpSlOverride();
 }
 
-/* 止盈止损相关界面的统一重绘（四格 + 综合区 + 指标面板 + 微调面板） */
+/* 止盈止损相关界面的统一重绘（三格 + 综合区 + 指标面板 + 微调面板） */
 function renderAllTpSl() {
   renderSigCards();
   renderTpSl();
@@ -2484,20 +2672,20 @@ function renderTpSl() {
   if (s && s.alignedCount >= 1) {
     const isLong = s.mainDir === 'long';
     const agreeTxt = `${s.alignedCount}/${s.total} 个周期同向`;
-    const lvl = s.alignedCount >= 3 ? '四周期共振' : s.alignedCount === 2 ? '多周期偏' : '单周期偏';
+    const lvl = s.alignedCount >= 3 ? '三周期共振' : s.alignedCount === 2 ? '双周期共振' : '单周期偏';
     const dirTfs = t.plans.filter(p => p.dir === s.mainDir).map(p => TF_NAME[p.tf]).join(' / ');
     const wTxt = (s.weights && s.weights.length)
       ? s.weights.map(w => `${TF_NAME[w.tf]} ${(w.w * 100).toFixed(0)}%`).join(' / ') : '—';
     head = `<div class="tpsl-hint ${isLong ? 'long' : 'short'}">
       <div class="th-main">${isLong ? '📈' : '📉'} ${lvl}${isLong ? '多' : '空'} · ${agreeTxt} · 置信度 ${s.conf}%</div>
-      <div class="th-line">同向周期：<b>${dirTfs || '—'}</b>（四周期：${TFS.map(tf => TF_NAME[tf]).join(' / ')}）</div>
+      <div class="th-line">同向周期：<b>${dirTfs || '—'}</b>（三周期：${TFS.map(tf => TF_NAME[tf]).join(' / ')} · 1h 定方向 / 15m·5m 定入场）</div>
       <div class="th-line">参考止损 <b>${P(s.stop)}</b>${dTxt(s.stop)} · 止盈一 <b>${P(s.tp1)}</b>${dTxt(s.tp1)} · 止盈二 <b>${P(s.tp2)}</b>${dTxt(s.tp2)} · 盈亏比 <b>1:${s.rr1.toFixed(1)} / 1:${s.rr2.toFixed(1)}</b><small>（扣开平仓手续费后净 1:${(s.rr1Net || 0).toFixed(1)} / 1:${(s.rr2Net || 0).toFixed(1)}）</small></div>
       <div class="th-line">综合价 = 同向周期按权重归一化：<b>${wTxt}</b>（仅加权参考值，不是另行识别的支撑压力位）</div>
       <div class="th-line">止损距离 <b>${(s.riskPct * 100).toFixed(2)}%</b> · 单笔风险预算 ${(TPSL_RISK_BUDGET * 100).toFixed(0)}% 权益 = <b>${fmt(s.budget, 2)}</b> USDT → 建议数量 ≈ <b>${s.sugQtyCapped}</b> ${inst.short}（按当前 ${state.lever}x）<small> · 风险预算未计手续费与滑点，实际净亏损不封顶于 ${(TPSL_RISK_BUDGET * 100).toFixed(0)}%</small></div>
       ${s.neutralCount >= 2 ? `<div class="th-line th-warn">⚠ ${s.neutralCount} 个周期信号中性（震荡），方向一致性不足，建议降低仓位或等待突破确认</div>` : ''}
     </div>`;
   } else {
-    head = `<div class="tpsl-hint wait"><div class="th-main">⏸ 四周期均处于震荡区间，暂无明确方向</div>
+    head = `<div class="tpsl-hint wait"><div class="th-main">⏸ 三周期均处于震荡区间，暂无明确方向</div>
       <div class="th-line">建议按区间交易：靠近支撑挂限价买、靠近压力挂限价卖，跌破/突破后再顺势跟进</div></div>`;
   }
 
@@ -2759,6 +2947,14 @@ function selectInstrument(id) {
     window.LsMap.setInstrument(contract ? { id: inst.id, contract, dec: inst.dec } : null);
     const t = $('#lsSym'); if (t) t.textContent = contract ? `${inst.short} · ${contract}` : `${inst.short} · 无永续合约`;
   }
+  /* 回测面板：换品种后清空上一次结果（不同品种不能混读） */
+  const inst = instOf(id);
+  state._btResult = null; state._lastAlert = ''; state.triggers = [];
+  const btSym = $('#btSym');
+  if (btSym) btSym.textContent = inst.sym ? `${inst.short} · ${GATE_FUT_PAIR[inst.sym] || ''}` : `${inst.short} · 无永续合约`;
+  ['#btCards', '#btList', '#btNote'].forEach(s => { const e = $(s); if (e) e.innerHTML = ''; });
+  const bb = $('#btBar'); if (bb) bb.style.width = '0%';
+  setBtProg(inst.sym ? '未运行 · 点击「开始回测」跑 5 年真实 5m K线（首次约 1～4 分钟）' : '该品种无 Gate 永续合约，无法回测');
   loadChart();
   updatePricePanel();
   refreshVenues(true);       // 切换品种后立即拉取该品种的多平台比价
@@ -2800,6 +2996,7 @@ function boot() {
   $('#btnBuy').addEventListener('click', () => doOrder('buy'));
   $('#btnSell').addEventListener('click', () => doOrder('sell'));
   bindTpOvEvents();                    // 止盈止损手动微调（输入即联动，可一键恢复自动）
+  bindBacktest();                      // 开单逻辑回测（1h 定方向 + 15m/5m 共振沿）
   $('#btnBacktest').addEventListener('click', runBacktest);
   $('#btnReset').addEventListener('click', async () => {
     const ok = await confirmYes({
@@ -2871,7 +3068,7 @@ function paintLiqStat() {
 /* ================= 右上角刷新控件 =================
    档位只影响「行情/分析数据」刷新节奏；实时价格与撮合强平仍为 5s，不受档位影响。 */
 
-/* 全量刷新：K线 + 四周期信号 + 止盈止损 + 多空热力图 + 左侧清算图 */
+/* 全量刷新：K线 + 三周期信号 + 止盈止损 + 多空热力图 + 左侧清算图 */
 async function refreshAll(manual) {
   const ico = $('#btnRefresh');
   if (ico) ico.classList.add('spin');
