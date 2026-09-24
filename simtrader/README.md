@@ -84,12 +84,29 @@ K 线图整体右移 118px，让出的左侧整条就是清算图：顶部是近
 
 ### 为什么不是 CoinGlass
 
-最初想直接抓 `https://www.coinglass.com/zh`，实测**免密抓不到**：
-官方 Open API（`open-api-v3/v4`）返回 `{"code":"401","msg":"API key missing."}`，
-网页自身数据走签名接口，`capi.coinglass.com` 的聚合路径要么 404、要么返回空壳
-（`{"code":"0","msg":"success","success":true}` 没有数据）。**需要付费 Key**。
+最初想直接抓 `https://www.coinglass.com/zh`，实测**免密抓不到**：网页自身数据走签名接口，
+`capi.coinglass.com`（官网自用域名，不是 API 域名）返回 Spring 风格 404 或空壳
+`{"code":"0","msg":"success","success":true}`。
+
+后来拿到一枚 CoinGlass API Key 实测，结论是 **Key 有效、但账号没有套餐**：
+
+- Host 用 `open-api-v4.coinglass.com`，Header 必须是 **`CG-API-KEY`**
+  （v3 时代的 `coinglassSecret` 已不认，会回到 `API key missing`）
+- 带上 Key 后**所有端点**都返回 `{"code":"401","msg":"Upgrade plan"}`，
+  连最基础的 `/api/futures/supported-coins`、`/api/index/fear-greed-history` 都一样
+- 路径写错会返回 `404 Endpoint not found`——用这个可以区分「路径不对」和「套餐不够」
+
+**CoinGlass 没有免费额度**（2026-09 官方价）：Hobbyist $29/月、Startup $79/月、
+Standard $299/月、Professional $699/月；速率 30/80/300/1200 次每分钟。
+Hobbyist 拿不到 1 小时粒度历史，要 1h 历史至少 Startup。
+
 所以改用 **Gate.io 自身的公开真实多空/强平数据**——同样是交易所平台的真实数据，不是合成价，
 只是覆盖 Gate 一家而不是全市场聚合。
+
+> 若将来接 CoinGlass：这是纯静态站没有后端，**Key 写进 JS 等于公开**（F12 就能拿走）。
+> 真要接就走后端代理，Key 放服务端。相关端点路径见 `docs.coinglass.com/reference/endpoint-overview`
+> 的 Liquidation / Long-Short Ratio 两类（`liquidation/heatmap/model1|2|3`、`liquidation/map`、
+> `liquidation/order` 等），别再猜路径。
 
 ## K线交互
 
