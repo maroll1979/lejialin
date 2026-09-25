@@ -312,6 +312,111 @@ function loadAppSignalCore() {
   ok(/严格档/.test(htmlSrc) && /宽松档/.test(htmlSrc) && /CHOCH/.test(htmlSrc) && /Retest/.test(htmlSrc),
     'index.html 已写明严格档 / 宽松档 / CHOCH / Retest 口径');
 
+  /* ================= v2.1 层级评分（第 1–13 节） ================= */
+  const V = require(path.join(DIR, 'v21.js'));
+
+  head('16. v2.1 各层分值不越界（1H 20 / 30m 25 / 15m 30 / 5m 25）');
+  const B = V.build(s, { live: false });
+  ok(B.s15.n > 0 && B.s30.n > 0 && B.s1h.n > 0 && B.s4h.n > 0, '四层聚合成功',
+    `15m ${B.s15.n} / 30m ${B.s30.n} / 1h ${B.s1h.n} / 4h ${B.s4h.n}`);
+  let oob = 0, maxTot = 0;
+  for (let i = 0; i < B.s1h.n; i++) if (B.v1h.tL[i] > 20.001 || B.v1h.tS[i] > 20.001) oob++;
+  for (let i = 0; i < B.s30.n; i++) if (B.v30.rL[i] > 25.001 || B.v30.rS[i] > 25.001) oob++;
+  for (let i = 0; i < B.s15.n; i++) if (B.v15.uL[i] > 30.001 || B.v15.uS[i] > 30.001) oob++;
+  for (let i = 0; i < s.n; i++) {
+    if (B.ms.lsc[i] > 25.001 || B.ms.ssc[i] > 25.001) oob++;
+    const j15 = B.m15[i], j30 = B.m30[i], j1h = B.m1h[i];
+    if (j15 >= 0 && j30 >= 0 && j1h >= 0) {
+      maxTot = Math.max(maxTot, B.v1h.tL[j1h] + B.v30.rL[j30] + B.v15.uL[j15] + B.ms.lsc[i]);
+    }
+  }
+  ok(oob === 0, '四层分值均不超过各自上限', `越界 ${oob} 个`);
+  ok(maxTot <= 100.001, 'LongScore 不超过 100', `实测最大 ${maxTot.toFixed(1)}`);
+
+  head('17. Gate 蕴含关系：出信号 ⇒ 评分与 Gate 同时成立');
+  const sig = V.findSignals(s, B, { thrOverride: 55, chain: 'gate' });
+  ok(sig.length > 0, '样本内存在 v2.1 信号', `${sig.length} 个`);
+  let gateBad = 0;
+  const P = {};
+  sig.forEach(t => {
+    const i = t.i, j15 = B.m15[i], j30 = B.m30[i], j1h = B.m1h[i], j4h = B.m4h[i];
+    P.tL = B.v1h.tL[j1h]; P.tS = B.v1h.tS[j1h];
+    P.rL = B.v30.rL[j30]; P.rS = B.v30.rS[j30];
+    P.st1 = B.v1h.stt[j1h]; P.st30 = B.v30.stt[j30];
+    P.uL = B.v15.uL[j15]; P.uS = B.v15.uS[j15];
+    P.reg = B.v4h.reg[j4h];
+    P.trigL = B.ms.lsc[i]; P.trigS = B.ms.ssc[i];
+    P.lsf = B.ms.lsf[i]; P.ssf = B.ms.ssf[i];
+    P.lLvl = B.ms.llv[i]; P.sLvl = B.ms.slv[i];
+    P.c5 = s.c[i]; P.atr5 = B.ms.atr[i];
+    const d = V.decideAt(P, { thrOverride: 55, chain: 'gate' });
+    const g = t.dir === 'long' ? d.g : d.gs;
+    const okAll = g.setup && g.chain && g.notStrong && g.needExh && g.noChase
+      && (t.dir === 'long' ? d.longScore >= d.lThr : d.shortScore >= d.sThr);
+    if (!okAll) gateBad++;
+  });
+  ok(gateBad === 0, '每个信号都满足 Setup / 结构链 / 非强加速 / 30m衰竭 / 不追价 / 总分≥门槛',
+    `例外 ${gateBad} 个`);
+  const sigFull = V.findSignals(s, B, { thrOverride: 55, chain: 'full' });
+  ok(sigFull.length <= sig.length, '完整三段 ⊂ Gate 档（三段更严格）',
+    `full ${sigFull.length} / gate ${sig.length}`);
+
+  head('18. v2.1 无未来函数：后 30% 数据改动不影响前 70%');
+  const B2 = V.build(s2, { live: false });
+  let v21Leak = 0, v21Cmp = 0, maxD = 0;
+  for (let i = 0; i < m; i++) {
+    const j15 = B.m15[i], j30 = B.m30[i], j1h = B.m1h[i], j4h = B.m4h[i];
+    if (j15 < 0 || j30 < 0 || j1h < 0 || j4h < 0) continue;
+    v21Cmp++;
+    const d1 = Math.abs(B.v15.uL[j15] - B2.v15.uL[B2.m15[i]]);
+    const d2 = Math.abs(B.v30.rL[j30] - B2.v30.rL[B2.m30[i]]);
+    const d3 = Math.abs(B.v1h.tL[j1h] - B2.v1h.tL[B2.m1h[i]]);
+    const d4 = Math.abs(B.v4h.reg[j4h] - B2.v4h.reg[B2.m4h[i]]);
+    const d5 = Math.abs(B.ms.lsc[i] - B2.ms.lsc[i]);
+    const dd = Math.max(d1, d2, d3, d4, d5);
+    if (dd > maxD) maxD = dd;
+    if (dd > 1e-9) v21Leak++;
+  }
+  ok(v21Leak === 0, '前 70% 的四层分值与 4H 背景完全不受后 30% 影响',
+    `比较 ${v21Cmp} 根 · 泄漏 ${v21Leak} · 最大偏差 ${maxD.toExponential(1)}`);
+
+  head('19. v2.1 多空对称：价格镜像后 Long/Short 互换');
+  let mx = -Infinity, mn = Infinity;
+  for (let i = 0; i < s.n; i++) { mx = Math.max(mx, s.h[i]); mn = Math.min(mn, s.l[i]); }
+  const K = mx + mn;
+  const sm = {
+    n: s.n, t: s.t,
+    o: Float64Array.from(s.o, v => K - v), h: Float64Array.from(s.l, v => K - v),
+    l: Float64Array.from(s.h, v => K - v), c: Float64Array.from(s.c, v => K - v),
+    v: s.v,
+  };
+  const vm = V.tfScores(sm);
+  const vo = V.tfScores(s);          // 原始序列作为对照
+  let symBad = 0, symN = 0, symMax = 0;
+  for (let i = 300; i < s.n; i++) {
+    /* 镜像后：mirror 的多头分 应该等于 原始的空头分，反之亦然 */
+    const d = Math.max(
+      Math.abs(vm.tL[i] - vo.tS[i]), Math.abs(vm.tS[i] - vo.tL[i]),
+      Math.abs(vm.rL[i] - vo.rS[i]), Math.abs(vm.rS[i] - vo.rL[i]),
+      Math.abs(vm.uL[i] - vo.uS[i]), Math.abs(vm.uS[i] - vo.uL[i]),
+    );
+    if (d > symMax) symMax = d;
+    symN++;
+    if (d > 0.02) symBad++;
+  }
+  ok(symBad === 0, '镜像序列的 Long / Short 分值完全对称',
+    `${symN} 根 · 不对称 ${symBad} · 最大偏差 ${symMax.toFixed(4)}`);
+  ok([-3, -2, -1, 0, 1, 2, 3].every(k => V.ST_NAME[k] !== undefined), '七状态机命名齐全');
+  ok(V.TH_WITH === 70 && V.TH_RANGE === 75 && V.TH_AGAINST === 85, '4H 门槛 = 70 / 75 / 85');
+  ok(V.SETUP_MIN === 18 && V.SETUP_MIN_CT === 22, '15m Setup 下限 = 18 / 逆势 22');
+
+  head('20. v2.1 看板接入点');
+  ok(/function renderV21Panel|function paintV21\(/.test(appSrc2), '看板含 v2.1 面板渲染函数');
+  ok(/id="v21Panel"/.test(htmlSrc), 'index.html 含 v2.1 面板容器');
+  ok(/V\.decideNow\(|V21\.decideNow\(/.test(appSrc2), '实盘走 V21.decideNow（与回测同实现）');
+  ok(/v21\.js/.test(htmlSrc), 'index.html 已引入 v21.js');
+  ok(/v21Thr/.test(appSrc2), '门槛可切换（规范 70/75/85 · 统一 70/65/60）');
+
   console.log('\n' + '='.repeat(64));
   console.log(fail === 0 ? `✅ 全部通过（${pass} 项）` : `❌ ${fail} 项失败 / ${pass} 项通过`);
   console.log('='.repeat(64));

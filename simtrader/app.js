@@ -1054,6 +1054,8 @@ const state = {
   msMode: msCfg('mode', 'strict'),   // strict=CHOCH+回踩+BOS 全满足 / loose=核心≥2
   msMin: +msCfg('min', '0') || 0,    // 最低结构分（0 = 不限）
   msAnd: msCfg('and', '0') === '1',  // true 时附加要求 5m 方向也同向
+  v21: null,           // v2.1 层级评分快照（第 1–13 节）
+  v21Thr: (function () { try { return localStorage.getItem('simtrader_v21_thr') || 'spec'; } catch (e) { return 'spec'; } })(),
   _lastAlert: '',      // 已报警的触发点 key（避免同一触发反复弹窗）
   _btRunning: false, _btResult: null,   // 回测运行状态
   tpOv: loadTpOv(),    // "品种:周期" -> { stop?, tp1?, tp2? } 手动微调覆盖值（持久化）
@@ -1465,6 +1467,7 @@ function updateResonance() {
   if (!c5 || !c15 || !c1h || c5.length < 60 || c15.length < 60 || c1h.length < 60) {
     if (sub) sub.textContent = 'K线不足，等待加载…';
     renderMsPanel();
+    refreshV21();
     return;
   }
   try {
@@ -1492,6 +1495,7 @@ function updateResonance() {
 
   paintTriggers();
   renderMsPanel();
+  refreshV21();
   alertResonance(c5);
 }
 
@@ -1606,6 +1610,160 @@ function bindMsCtrl() {
       state.msAnd = and.checked ? 1 : 0;
       try { localStorage.setItem('simtrader_ms_and', state.msAnd ? '1' : '0'); } catch (e) {}
       updateResonance();
+    });
+  }
+}
+
+/* ============================================================
+   v2.1 层级评分面板（第 1–13 节）
+   4H 只做背景（定门槛 70/75/85，不计分）
+   1H 20 + 30m 25 + 15m 30 + 5m 25 = 100 分
+   评分决定「质量」，Gate 决定「能否开仓」，两者同时满足才出信号。
+   与回测共用 v21.js 的同一份实现（实盘走 live 口径）。
+   ============================================================ */
+const V21_THR = [
+  { v: 'spec', t: '规范 70/75/85' },
+  { v: '70', t: '统一 70' },
+  { v: '65', t: '统一 65' },
+  { v: '60', t: '统一 60' },
+];
+function v21ThrOpt() {
+  if (state.v21Thr === '70') return { thrOverride: 70 };
+  if (state.v21Thr === '65') return { thrOverride: 65 };
+  if (state.v21Thr === '60') return { thrOverride: 60 };
+  return {};
+}
+/* v2.1 要用到 4H 背景：只从 5m 聚合的话最多 7 天（Gate 单次 2000 根），
+   4H 只有 41 根、指标还没热身完。故各周期各拉一份真实 K线。 */
+async function ensureV21Candles(inst) {
+  const key = inst.id + '_v21';
+  if (state.candlesV21 && state.candlesV21Ts && Date.now() - state.candlesV21Ts < 300000
+    && state.candlesV21Key === key) return state.candlesV21;
+  const st = window.Strategy;
+  const get = async tf => { try { return await fetchKlines(inst.sym, tf, 300); } catch (e) { return null; } };
+  const c5 = await get('5m');
+  if (!c5 || !c5.length) return state.candlesV21 || (state.candles[inst.id + '_5m'] || []);
+  const [a, b, c, d] = await Promise.all([get('15m'), get('30m'), get('1h'), get('4h')]);
+  const pack = { c5, s15: a && st ? st.toSeries(a) : null, s30: b && st ? st.toSeries(b) : null, s1h: c && st ? st.toSeries(c) : null, s4h: d && st ? st.toSeries(d) : null };
+  state.candlesV21 = pack; state.candlesV21Key = key; state.candlesV21Ts = Date.now();
+  return pack;
+}
+
+let v21Busy = false;
+async function refreshV21() {
+  const V = window.V21;
+  if (!V || !$('#v21Panel')) return;
+  const inst = instOf(state.current);
+  if (!inst || v21Busy) return;
+  v21Busy = true;
+  try {
+    const pack = await ensureV21Candles(inst);
+    const c5 = pack && (pack.c5 || pack);
+    if (!c5 || !c5.length || c5.length < 400) { paintV21(null, '5m K线不足（需 ≥400 根，当前 ' + (c5 ? c5.length : 0) + '）'); return; }
+    const r = V.decideNow(c5, Object.assign({ chain: 'gate', tfs: { s15: pack.s15, s30: pack.s30, s1h: pack.s1h, s4h: pack.s4h } }, v21ThrOpt()));
+    state.v21 = r;
+    paintV21(r, '');
+  } catch (e) {
+    paintV21(null, '计算失败：' + (e && e.message || e));
+  } finally { v21Busy = false; }
+}
+
+function v21Stage(ms, long) {
+  if (!ms) return '';
+  const stg = long ? ms.lStage : ms.sStage;
+  const core = long ? ms.lCore : ms.sCore;
+  if (stg >= 3) return '结构确认（BOS 完成）';
+  if (stg === 2) return '已回踩守住 · 等 BOS';
+  if (stg === 1) return '已 CHOCH · 等回踩';
+  return core > 0 ? '结构建设中' : '等结构（无有效 CHOCH）';
+}
+function v21Bar(v, cap, up) {
+  const pct = Math.max(0, Math.min(100, Math.round(v / cap * 100)));
+  return `<span class="v21-bar"><i style="width:${pct}%" class="${up ? 'up' : 'down'}"></i></span>`;
+}
+function v21Row(name, v, cap, up, note) {
+  return `<div class="v21-row">
+    <span class="v21-n">${name}</span>
+    ${v21Bar(v, cap, up)}
+    <span class="v21-s ${v > 0 ? (up ? 'up' : 'down') : ''}">${v.toFixed(1)}<em>/${cap}</em></span>
+    <span class="v21-t">${note || ''}</span>
+  </div>`;
+}
+function paintV21(r, err) {
+  const box = $('#v21Panel');
+  if (!box) return;
+  if (!r) {
+    box.innerHTML = `<div class="v21-head"><span class="v21-title">多周期层级评分 v2.1 · <b>0 / 100</b></span></div>
+      <div class="v21-empty">${err || '计算中…（需要 5m K线）'}</div>`;
+    return;
+  }
+  const V = window.V21;
+  const d = r.d, P = r.P;
+  const long = d.longScore >= d.shortScore;
+  const tot = long ? d.longScore : d.shortScore;
+  const thr = long ? d.lThr : d.sThr;
+  const g = long ? d.g : d.gs;
+  const regTone = r.reg > 0 ? 'up' : r.reg < 0 ? 'down' : '';
+  const regTxt = { '1': 'Bull 多头', '0': 'Range 震荡', '-1': 'Bear 空头' }[String(r.reg)] || '—';
+  const dec = instOf(state.current).dec;
+  const setupVal = long ? P.uL : P.uS;
+  const setupMin = long ? d.lSetupMin : d.sSetupMin;
+
+  const rows = [
+    `<div class="v21-bg">4H 背景 <b class="${regTone}">${regTxt}</b> · 不计分，只定门槛 →
+       做${long ? '多' : '空'}的门槛 <b>${thr}</b>${d.lCt || d.sCt ? '（逆势档）' : r.reg === 0 ? '（震荡档）' : '（顺势档）'}</div>`,
+    v21Row('1H 主趋势', long ? P.tL : P.tS, 20, long, `状态 ${r.st1Name}`),
+    v21Row('30m 衰竭/过渡', long ? P.rL : P.rS, 25, long, `状态 ${r.st30Name}`),
+    v21Row('15m 反转 Setup', setupVal, 30, long, `门槛 ≥${setupMin}`),
+    v21Row('5m 结构触发', long ? P.trigL : P.trigS, 25, long, v21Stage(r.ms, long)),
+  ].join('');
+
+  const gates = [
+    ['15m Setup ≥' + setupMin, g.setup, setupVal.toFixed(1)],
+    ['5m CHOCH 链', g.chain, long ? ['CHOCH', 'Retest', 'BOS'].filter((_, k) => (P.lsf & (1 << k))).join('+') || '—' : ['CHOCH', 'Retest', 'BOS'].filter((_, k) => (P.ssf & (1 << k))).join('+') || '—'],
+    ['1H 非强趋势加速', g.notStrong, r.st1Name],
+    ['30m 已进入衰竭/过渡', g.needExh, r.st30Name],
+    ['未追价（≤1.5 ATR）', g.noChase, r.atr5 ? '±' + fmt(1.5 * r.atr5, dec) : '—'],
+    ['总分 ≥ 门槛', tot >= thr, tot.toFixed(1) + ' / ' + thr],
+  ];
+  const gHtml = gates.map(x => `<div class="v21-g ${x[1] ? 'on' : 'off'}"><i></i><span>${x[0]}</span><b>${x[2]}</b></div>`).join('');
+  const pass = long ? d.long : d.short;
+
+  box.innerHTML = `
+    <div class="v21-head">
+      <span class="v21-title">多周期层级评分 v2.1（第 7 节 100 分制）·
+        <b class="${long ? 'up' : 'down'}">${tot.toFixed(1)} / 100</b>
+        <em class="v21-dir ${long ? 'up' : 'down'}">${long ? '偏多' : '偏空'}</em></span>
+      <span class="v21-ctrl">
+        <label>门槛
+          <select id="v21Thr">${V21_THR.map(o => `<option value="${o.v}"${(state.v21Thr || 'spec') === o.v ? ' selected' : ''}>${o.t}</option>`).join('')}</select>
+        </label>
+      </span>
+    </div>
+    <div class="v21-body">
+      <div class="v21-rows">${rows}</div>
+      <div class="v21-side">
+        <div class="v21-kv"><span>总分 / 门槛</span><b class="${tot >= thr ? 'up' : ''}">${tot.toFixed(1)} / ${thr}</b></div>
+        <div class="v21-kv"><span>另一侧</span><b>${(long ? d.shortScore : d.longScore).toFixed(1)} / ${long ? d.sThr : d.lThr}</b></div>
+        <div class="v21-kv"><span>5m ATR(14)</span><b>${r.atr5 ? fmt(r.atr5, dec) : '—'}</b></div>
+        <div class="v21-gates">${gHtml}</div>
+        <div class="v21-verdict ${pass ? 'on' : 'off'}">${pass
+          ? (long ? 'LONG 信号成立' : 'SHORT 信号成立')
+          : (tot >= thr ? '分数够了，但 Gate 未过 —— 不开仓' : '还差 ' + (thr - tot).toFixed(1) + ' 分到门槛')}</div>
+        <div class="v21-note">周期不是投票，是层级状态机：<b>4H 背景 → 1H 方向 → 30m 衰竭 → 15m Setup → 5m 扳机</b>。
+          评分只解决质量，Gate 解决是否允许开仓，两者同时满足才出信号。</div>
+      </div>
+    </div>`;
+  bindV21Ctrl();
+}
+function bindV21Ctrl() {
+  const sel = $('#v21Thr');
+  if (sel && !sel._b) {
+    sel._b = 1;
+    sel.addEventListener('change', () => {
+      state.v21Thr = sel.value;
+      try { localStorage.setItem('simtrader_v21_thr', sel.value); } catch (e) {}
+      refreshV21();
     });
   }
 }

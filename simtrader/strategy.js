@@ -29,7 +29,7 @@
   /* 各源单次请求根数上限：Gate 单段 2000、全局仅最近 10000；币安现货单段 1000、无全局上限 */
   const SRC_LIMIT = { binance: 1000, gate: 2000 };
   const GATE_MAX_POINTS = 10000;
-  const TF_SEC = { '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
+  const TF_SEC = { '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
   /* 八因子权重（与 app.js SIG_W 逐字一致，和为 1.00） */
   const SIG_W = { trend: 0.15, macd: 0.14, adx: 0.13, rsi: 0.11, kdj: 0.10, boll: 0.10, obv: 0.13, vol: 0.14 };
   /* 与看板实盘窗口保持一致：app.js 的 runSignals → ensureCandles → fetchKlines(sym, tf, 200)，
@@ -733,12 +733,18 @@
   /* 批量跑整段 5m 序列 → 逐根结构事件 / 分值
      ev   严格档事件（1=多头触发 2=空头触发 0=无）—— 图中 long_trigger 的口径
      evL  宽松档事件（核心条件 ≥2）
-     lsc / ssc  多头 / 空头结构总分（0–25） */
+     lsc / ssc  多头 / 空头结构总分（0–25）
+     lsv / ssv  setup 是否有效（Swing 低点/高点成立，v2.1 第 8 节 Gate 需要）
+     lsf / ssf  分段标志位 bit0=CHOCH bit1=Retest bit2=BOS（Gate 的 (retest OR bos) 需要） */
   function msSeries(s) {
     const n = s.n, st = new MsStream();
     const ev = new Uint8Array(n), evL = new Uint8Array(n);
     const lsc = new Float32Array(n), ssc = new Float32Array(n);
     const lc = new Uint8Array(n), sc = new Uint8Array(n);
+    const lsv = new Uint8Array(n), ssv = new Uint8Array(n);
+    const lsf = new Uint8Array(n), ssf = new Uint8Array(n);
+    const llv = new Float32Array(n), slv = new Float32Array(n);   // CHOCH 突破位（追价判断用）
+    const atr = new Float32Array(n);                              // 逐根 ATR（追价判断要按当时的 ATR，不能取末根）
     let last = null;
     for (let i = 0; i < n; i++) {
       const r = st.push(s.o[i], s.h[i], s.l[i], s.c[i]);
@@ -746,11 +752,17 @@
       evL[i] = r.lEvL ? 1 : (r.sEvL ? 2 : 0);
       lsc[i] = r.lScore; ssc[i] = r.sScore;
       lc[i] = r.lCore; sc[i] = r.sCore;
+      lsv[i] = r.lSetup ? 1 : 0; ssv[i] = r.sSetup ? 1 : 0;
+      lsf[i] = (r.lChoch > 0 ? 1 : 0) | (r.lRetest > 0 ? 2 : 0) | (r.lBos > 0 ? 4 : 0);
+      ssf[i] = (r.sChoch > 0 ? 1 : 0) | (r.sRetest > 0 ? 2 : 0) | (r.sBos > 0 ? 4 : 0);
+      llv[i] = r.lLvl; slv[i] = r.sLvl; atr[i] = r.atr || 0;
       last = r;
     }
     return {
       n: n, ev: ev, evL: evL, lsc: lsc, ssc: ssc,
-      lcore: lc, score_side: sc, last: last,
+      lcore: lc, score_side: sc, lsv: lsv, ssv: ssv, lsf: lsf, ssf: ssf,
+      llv: llv, slv: slv, atr: atr,
+      last: last,
     };
   }
 
@@ -761,9 +773,11 @@
       lSetup: r.lSetup, sSetup: r.sSetup,
       lSwing: r.lSwing, lHL: r.lHL, lChoch: r.lChoch, lRetest: r.lRetest, lBos: r.lBos,
       sSwing: r.sSwing, sHL: r.sHL, sChoch: r.sChoch, sRetest: r.sRetest, sBos: r.sBos,
-      lScore: r.lScore, sScore: r.sScore, lCore: r.lCore, sCore: r.sCore,
+      lScore: r.lScore, sScore: r.sScore,       lCore: r.lCore, sCore: r.sCore,
       lStage: r.lStage, sStage: r.sStage, lLvl: r.lLvl, sLvl: r.sLvl,
       lEv: r.lEv, sEv: r.sEv, lEvL: r.lEvL, sEvL: r.sEvL,
+      lsf: (r.lChoch > 0 ? 1 : 0) | (r.lRetest > 0 ? 2 : 0) | (r.lBos > 0 ? 4 : 0),
+      ssf: (r.sChoch > 0 ? 1 : 0) | (r.sRetest > 0 ? 2 : 0) | (r.sBos > 0 ? 4 : 0),
     };
   }
 

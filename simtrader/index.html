@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260925a">
+<link rel="stylesheet" href="style.css?v=20260925b">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -87,6 +87,7 @@
       <div class="sig-hint" id="sigHint"></div>
       <div class="sig-detail" id="sigDetail"></div>
       <div class="ms-panel" id="msPanel"></div>
+      <div class="v21-panel" id="v21Panel"></div>
       <div class="ind-panel" id="indPanel"></div>
       <div class="tpov-panel" id="tpOvPanel">
         <div class="tpov-head">
@@ -320,6 +321,39 @@
           所以「最低结构分」不适合当作过滤器；这层的主要价值是<b>大幅降低开单频率</b>（BTC 5 年从 3712 笔降到约 450 笔），
           而不是提高期望</li>
       </ul>
+      <h4>多周期层级评分 v2.1（100 分制 · 第 1–13 节）</h4>
+      <ul>
+        <li><b>核心原则</b>：周期<b>不是民主投票</b>，而是层级状态机 ——
+          <b>4H 背景 → 1H 方向 → 30m 衰竭 → 15m Setup → 5m 扳机</b>。
+          不再使用「多周期同权投票 + 指标金叉后开仓」</li>
+        <li><b>4H Macro Regime</b>：只输出 Bull / Range / Bear，<b>不参与 100 分</b>，只改开仓门槛 ——
+          顺势 <b>70</b> / 4H 震荡 <b>75</b> / 逆 4H <b>85</b></li>
+        <li><b>1H Primary Trend 20 分</b>：EMA 趋势 6 · MACD 方向 4 · ADX 质量 3 · RSI 区域 2 · 市场结构 HH/HL 5（空头镜像）</li>
+        <li><b>30m Transition 25 分</b>（最重要的提前预警层）：柱体一阶变化 5 · 二阶加速度 4 · ADX 衰减 4 ·
+          RSI/KDJ 脱离钝化 3 · Volume Climax 3 · OBV 背离 3 · ATR 波动衰竭 3。
+          附七状态机：Strong Bear / Bear / Bear Exhaustion / Transition / Bull Exhaustion / Bull / Strong Bull</li>
+        <li><b>15m Reversal Setup 30 分</b>：RSI 背离 5 · MACD 背离 5 · 柱体加速 4 · OBV 背离 5 ·
+          假突破收回 4 · HL/LH 雏形 3 · BOLL 极端 2 · Volume Climax 2。
+          <b>Setup ≥ 18</b> 才允许 5m 找扳机；逆 4H 时 <b>≥ 22</b></li>
+        <li><b>5m Trigger 25 分</b>：沿用上面的市场结构引擎（Swing / HL / CHOCH / Retest / BOS）</li>
+        <li><b>开仓 Gate（评分与 Gate 同时满足才出信号）</b>：① 15m Setup ≥18（逆势 ≥22）·
+          ② 5m 至少出现 CHOCH，高质量再要求 Retest 或 BOS · ③ 1H 不得处于强趋势且继续加速 ·
+          ④ 若 1H 仍与交易方向相反，30m 必须已进入衰竭/过渡 · ⑤ 距 5m 触发位超过 1.5 ATR 禁止追价 ·
+          ⑥ 总分 ≥ 门槛</li>
+        <li><b>背离带有效期</b>：pivot 口径确认的背离在 <b>16 根内满分、40 根后失效</b>。
+          否则 15m 背离只在确认那一根存在，几乎不可能与 5m 扳机撞上</li>
+        <li><b>Confirmed / Live 双状态</b>：回测只吃<b>已收线</b>那一根（无未来函数）；
+          实盘面板用<b>进行中</b>那一根，用于提前预警</li>
+        <li><b>⚠ 实测提醒（5 年 5m 回测，不粉饰）</b>：
+          ① 规范门槛 70/75/85 极严格 —— BTC 5 年只出 <b>19 笔</b>、ETH <b>15 笔</b>，统计上不可用；
+          统一降到 60 分才有 BTC 1103 笔 / ETH 1040 笔。
+          ② <b>4H 风险分层只在 BTC 上成立</b>：BTC 顺 4H 组毛利 <b>+0.145R/笔（t=2.98）</b>、震荡 −0.037R、逆势 −0.095R；
+          但 ETH 上是顺 4H −0.028R、震荡 −0.003R、逆势 +0.037R，<b>方向完全相反</b>，所以这一层不能当通用 edge。
+          ③ 30m 衰竭层没有加分：衰竭组与趋势仍成立组的期望差异在两品种上都不显著。
+          ④ 旧模型 <b>63~65% 的信号追在 30m 强趋势末端</b>，这部分确实更差（BTC −0.149R vs −0.089R）
+          —— 这才是 30m 层真正的价值：<b>用来排除，不用来加分</b>。
+          ⑤ 净期望仍为负：手续费 0.13~0.18R/笔，是毛利的 2~5 倍</li>
+      </ul>
       <h4>多空热力图（订单簿口径）</h4>
       <ul>
         <li><b>看什么</b>：现价上下各 N 个 tick 内的<b>挂单分布</b> —— <b>横条向左 = 价格下方的买盘挂单</b>（多头阵营，承接下跌），<b>横条向右 = 价格上方的卖盘挂单</b>（空头阵营，压制上涨）；条越长=该价位区间挂单名义金额越大，中间虚线是多空分界，蓝线是现价</li>
@@ -379,7 +413,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260925a · 八因子状态量信号（不看金叉死叉与绝对数值） · 1h定方向 / 15m共振 / 5m市场结构触发（pivot·CHOCH·Retest·BOS，0-25分） · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260925b · 多周期层级评分 v2.1（4H背景·1H20·30m25·15m30·5m25=100分 + Gate） · 八因子状态量信号（不看金叉死叉与绝对数值） · 5m市场结构触发（pivot·CHOCH·Retest·BOS） · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -399,9 +433,10 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260925a"></script>
-<script src="lsmap.js?v=20260925a"></script>
-<script src="strategy.js?v=20260925a"></script>
-<script src="app.js?v=20260925a"></script>
+<script src="liq-map.js?v=20260925b"></script>
+<script src="lsmap.js?v=20260925b"></script>
+<script src="strategy.js?v=20260925b"></script>
+<script src="v21.js?v=20260925b"></script>
+<script src="app.js?v=20260925b"></script>
 </body>
 </html>

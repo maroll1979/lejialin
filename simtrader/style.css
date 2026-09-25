@@ -285,6 +285,50 @@ button { font-family: inherit; }
 .msb-head { color: var(--muted-2); font-size: 9px; margin-top: 4px; }
 .msb-row > span { font-variant-numeric: tabular-nums; }
 
+/* ---------- v2.1 层级评分面板（4H背景 + 1H20 + 30m25 + 15m30 + 5m25） ---------- */
+.v21-panel { margin-top: 14px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.v21-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 7px; }
+.v21-title { font-size: 11px; font-weight: 600; color: var(--text); }
+.v21-title b { font-variant-numeric: tabular-nums; }
+.v21-title b.up, .v21-s.up, .v21-kv b.up { color: var(--up); }
+.v21-title b.down, .v21-s.down, .v21-kv b.down { color: var(--down); }
+.v21-dir { font-style: normal; font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 20px; background: #f4f6f9; color: var(--muted); margin-left: 6px; }
+.v21-dir.up { background: rgba(217, 44, 44, .1); color: var(--up); }
+.v21-dir.down { background: rgba(10, 143, 78, .1); color: var(--down); }
+.v21-ctrl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 9px; color: var(--muted-2); }
+.v21-ctrl label { display: inline-flex; align-items: center; gap: 4px; }
+.v21-ctrl select { font-size: 10px; padding: 2px 4px; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: var(--text); }
+.v21-empty { font-size: 11px; color: var(--muted-2); padding: 6px 0; }
+.v21-body { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 10px; align-items: start; }
+.v21-rows { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 9px; background: #fff; display: flex; flex-direction: column; gap: 6px; }
+.v21-row { display: grid; grid-template-columns: 100px minmax(0, 1fr) 58px minmax(0, 1.1fr); align-items: center; gap: 8px; }
+.v21-n { font-size: 10px; color: var(--text); font-weight: 600; white-space: nowrap; }
+.v21-bar { height: 6px; border-radius: 6px; background: #f0f3f7; overflow: hidden; }
+.v21-bar > i { display: block; height: 100%; border-radius: 6px; transition: width .25s; }
+.v21-bar > i.up { background: var(--up); }
+.v21-bar > i.down { background: var(--down); }
+.v21-s { font-size: 10px; font-weight: 700; text-align: right; color: var(--muted-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.v21-s em { font-style: normal; font-size: 8px; font-weight: 500; }
+.v21-t { font-size: 9px; color: var(--muted-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v21-bg { font-size: 9px; color: var(--muted); background: #f8fafc; border-radius: var(--r-sm); padding: 4px 7px; line-height: 1.5; }
+.v21-bg b { color: var(--text); }
+.v21-bg b.up { color: var(--up); }
+.v21-bg b.down { color: var(--down); }
+.v21-side { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 9px; background: #fff; display: flex; flex-direction: column; gap: 5px; }
+.v21-kv { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; color: var(--muted-2); }
+.v21-kv > b { color: var(--text); font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.v21-gates { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
+.v21-g { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; align-items: center; gap: 6px; font-size: 9px; color: var(--muted-2); }
+.v21-g > i { width: 8px; height: 8px; border-radius: 50%; background: #e3e7ed; }
+.v21-g.on > i { background: var(--up); }
+.v21-g.on { color: var(--text); }
+.v21-g > b { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.v21-g.on > b { color: var(--up); }
+.v21-verdict { font-size: 10px; font-weight: 600; padding: 4px 7px; border-radius: var(--r-sm); text-align: center; }
+.v21-verdict.on { background: rgba(217, 44, 44, .08); color: var(--up); }
+.v21-verdict.off { background: #f4f6f9; color: var(--muted-2); }
+.v21-note { font-size: 9px; color: var(--muted-2); line-height: 1.55; }
+
 .ind-panel { margin-top: 12px; }
 .ind-empty { font-size: 11px; color: var(--muted-2); padding: 6px 0; }
 .ind-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 7px; }
