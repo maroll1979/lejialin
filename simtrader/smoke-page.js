@@ -8,7 +8,7 @@
 const path = require('path');
 const fs = require('fs');
 const MOD = 'C:/Users/windos/.workbuddy/binaries/node/workspace/node_modules/';
-const jsdom = require('jsdom');
+const jsdom = require(MOD + 'jsdom');
 const { JSDOM, VirtualConsole } = jsdom;
 
 const ROOT = path.join(__dirname, 'simtrader');
@@ -89,7 +89,7 @@ window.LightweightCharts = {
   vc.on('jsdomError', e => errors.push(String(e.message).split('\n')[0].slice(0, 160)));
   vc.on('error', (...a) => errors.push(String(a[0]).split('\n')[0].slice(0, 160)));
 
-  const WS = require('ws');
+  const WS = require(MOD + 'ws');
 
   const dom = new JSDOM(html, {
     runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc, url: 'https://local.test/',
@@ -117,7 +117,12 @@ window.LightweightCharts = {
   chk('Strategy 含 MA200 三个函数',
     !!(win.Strategy && win.Strategy.smaCalc && win.Strategy.ma200FromDaily && win.Strategy.maWindowProject));
   chk('Strategy 含 TF_SEC', !!(win.Strategy && win.Strategy.TF_SEC));
-  chk('v21 模块已挂载', !!win.V21);
+  chk('策略含九指标投票 API',
+    !!(win.Strategy && win.Strategy.voteSeries && win.Strategy.voteDir
+      && win.Strategy.VoteStream && win.Strategy.dailyMa200Lookup && win.Strategy.findVoteTriggersClosed),
+    win.Strategy ? 'VOTE_LABEL ' + (win.Strategy.VOTE_LABEL || []).length + ' 项' : '');
+  chk('页面不再依赖 v21 模块', !win.V21 || !/decideNow/.test(String(win.V21.decideNow === undefined)),
+    win.V21 ? 'v21.js 仍可被加载（仅旧结构测试引用）' : 'v21.js 未加载（已下线）');
   chk('LiqMap 模块已挂载', !!win.LiqMap);
   chk('自检 UI 函数存在（runSrcCheck / renderSrcCheck）',
     typeof win.runSrcCheck === 'function' && typeof win.renderSrcCheck === 'function');
@@ -127,6 +132,9 @@ window.LightweightCharts = {
   chk('自检按钮与自动开关存在', !!doc.querySelector('#btnSrcCheck') && !!doc.querySelector('#chkAuto'));
   chk('MA200 图例容器存在', !!doc.querySelector('#ma200Legend'));
   chk('MA200 图表线序列已创建', !!(doc.querySelector('#chart')));
+  chk('投票面板容器存在', !!doc.querySelector('#votePanel'));
+  chk('投票 UI 函数存在（paintVote / refreshVote / voteMaArr）',
+    typeof win.paintVote === 'function' && typeof win.refreshVote === 'function' && typeof win.voteMaArr === 'function');
 
   /* ---- 真实跑一遍 MA200 全链路：取日线 → 算 → 投影到三种周期 ---- */
   if (win.Strategy && win.Strategy.ma200FromDaily) {

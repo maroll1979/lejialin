@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260925d">
+<link rel="stylesheet" href="style.css?v=20260928a">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -90,7 +90,7 @@
       <div class="sig-hint" id="sigHint"></div>
       <div class="sig-detail" id="sigDetail"></div>
       <div class="ms-panel" id="msPanel"></div>
-      <div class="v21-panel" id="v21Panel"></div>
+      <div class="vote-panel" id="votePanel"></div>
       <div class="ind-panel" id="indPanel"></div>
       <div class="tpov-panel" id="tpOvPanel">
         <div class="tpov-head">
@@ -484,7 +484,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260925d · 多周期层级评分 v2.1（第1-14节口径校正：4H三要素·结构0.10ATR阈值·七档区间·Confirmed/Live双状态）· 1H20/30m25/15m30/5m25=100分 + Gate · K线叠加200日均线（日线SMA200）· 新增「数据有效性自检」页，逐个实打所有外部接口 · 八因子状态量信号（不看金叉死叉与绝对数值） · 5m市场结构触发（pivot·CHOCH·Retest·BOS） · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260928a · 九指标投票定方向（EMA/MACD/ADX/RSI/KDJ/BOLL/OBV/VOL + MA200 位置，赢家≥4票且多于反方）· 1H 定方向 + 15m·5m 同向 → 刚凑齐那一根触发一次 · K线叠加200日均线 · 数据有效性自检页 · 5m市场结构（CHOCH·Retest·BOS）· Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -504,10 +504,9 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260925d"></script>
-<script src="lsmap.js?v=20260925d"></script>
-<script src="strategy.js?v=20260925d"></script>
-<script src="v21.js?v=20260925d"></script>
-<script src="app.js?v=20260925d"></script>
+<script src="liq-map.js?v=20260928a"></script>
+<script src="lsmap.js?v=20260928a"></script>
+<script src="strategy.js?v=20260928a"></script>
+<script src="app.js?v=20260928a"></script>
 </body>
 </html>

@@ -37,6 +37,17 @@
      不是全历史累加 —— 回测若不窗口化，OBV 会累积成天文数字使 obvV 因子失真、与实盘口径不一致。
      EMA/RSI/KDJ/BOLL 则相反：它们有记忆衰减，200 根后「全历史累积」与「200 根窗口重算」等价，
      故这些因子直接全程累积（一致性由 tests/test-strategy.js 逐根对照量化）。 */
+  const VOTE_KEYS = ['trend', 'macd', 'adx', 'rsi', 'kdj', 'boll', 'obv', 'vol'];
+  const VOTE_N_MA = 9;                 // 含 MA200 的票总数
+  const VOTE_WARM = 59;                // 与 SignalStream 内部预热口径一致（i < 59 不出方向）
+  const VOTE_DEF = { thz: 0.30, bufPct: 0.005, minVotes: 4 };
+  const VOTE_LABEL = [
+    { k: 'trend', name: 'EMA 趋势' }, { k: 'macd', name: 'MACD 动能' },
+    { k: 'adx', name: 'ADX 趋向' }, { k: 'rsi', name: 'RSI 摆动' },
+    { k: 'kdj', name: 'KDJ 摆动' }, { k: 'boll', name: 'BOLL 通道' },
+    { k: 'obv', name: 'OBV 量价' }, { k: 'vol', name: 'VOL 量能' },
+    { k: 'ma200', name: 'MA200 位置' },
+  ];
   const OBV_WIN = 200;
   const FEE_RATE = 0.001;      // 市价 Taker 费率（与 app.js FEE_TAKER 一致）
 
@@ -1032,6 +1043,8 @@
   function backtestCore(s5, opt) {
     const tpslFn = opt.tpslFn || defaultTpsl;
     const maxHold = opt.maxHold || 2016;          // 最多持仓 2016 根 5m（7 天），超时按市价平
+    /* 费率可调：同一批入场点换成 Maker / VIP 费率，用来分离「策略」与「摩擦」的贡献 */
+    const feeRate = opt.feeRate == null ? FEE_RATE : opt.feeRate;
     const onProgress = opt.onProgress || function () {};
     /* opt.cache：多配置对比时复用「聚合 + 三周期方向序列 + 结构序列」这些与配置无关的重活 */
     const C = opt.cache || null;
@@ -1041,9 +1054,25 @@
     const s1h = C ? C.s1h : aggregate(s5, TF_SEC['1h']);
 
     onProgress(0.1, '计算三周期信号序列');
-    const r5 = C ? C.r5 : dirSeries(s5);
-    const r15 = C ? C.r15 : dirSeries(s15);
-    const r1h = C ? C.r1h : dirSeries(s1h);
+    /* opt.vote —— 九指标投票制（传入即启用，此时 5m/15m/1h 都由票数定方向）。
+       投票制下 5m 参与方向投票，不再走第 6 节的「结构扣扳机」，两者互斥。 */
+    const V = opt.vote || null;
+    let r5, r15, r1h, s1d = null, ma5 = null, ma15 = null, ma1h = null;
+    if (V) {
+      onProgress(0.12, '日线 MA200 → 各周期（严格用已收盘日线）');
+      s1d = (C && C.s1d) ? C.s1d : aggregate(s5, TF_SEC['1d']);
+      ma5 = (C && C.ma5) ? C.ma5 : dailyMa200Lookup(s5, s1d, V.period || 200, TF_SEC['5m']);
+      ma15 = (C && C.ma15) ? C.ma15 : dailyMa200Lookup(s15, s1d, V.period || 200, TF_SEC['15m']);
+      ma1h = (C && C.ma1h) ? C.ma1h : dailyMa200Lookup(s1h, s1d, V.period || 200, TF_SEC['1h']);
+      onProgress(0.2, '九指标投票');
+      r5 = (C && C.r5) ? C.r5 : voteSeries(s5, ma5, V);
+      r15 = (C && C.r15) ? C.r15 : voteSeries(s15, ma15, V);
+      r1h = (C && C.r1h) ? C.r1h : voteSeries(s1h, ma1h, V);
+    } else {
+      r5 = C ? C.r5 : dirSeries(s5);
+      r15 = C ? C.r15 : dirSeries(s15);
+      r1h = C ? C.r1h : dirSeries(s1h);
+    }
     /* 回测必须用「已收线」映射：buildMap 给出的是包含当前 5m 的那根 15m/1h，
        它尚未走完，用它的 high/low/close 等于偷看未来（未来函数）。
        opt.live=true 可切回实盘口径做对照。 */
@@ -1053,14 +1082,16 @@
     /* 5m 市场结构（第 6 节）。msMode === false 时退回旧的「三周期共振沿」口径做对照。 */
     const msOpt = Object.assign({ loose: false, minScore: 0, andDir: false }, opt.ms || {});
     let ms = null;
-    if (opt.msMode !== false) {
+    if (opt.msMode !== false && !V) {
       onProgress(0.4, '计算 5m 市场结构（pivot / CHOCH / Retest / BOS）');
       ms = (C && C.ms) ? C.ms : msSeries(s5);
     }
 
     onProgress(0.5, '寻找入场点');
     let trig;
-    if (ms) {
+    if (V) {
+      trig = findVoteTriggersClosed(r5.dirs, r15.dirs, r1h.dirs, m15, m1h, r5, r15, r1h);
+    } else if (ms) {
       trig = opt.live
         ? findTriggersMs(r5.dirs, r15.dirs, r1h.dirs, m15, m1h, ms, msOpt)
         : findTriggersClosedMs(r5.dirs, r15.dirs, r1h.dirs, m15, m1h, ms, msOpt);
@@ -1110,17 +1141,17 @@
       let gross, fee;
       if (how === '止损') {
         gross = (exitPx - entry) * dirSign;
-        fee = (entry + exitPx) * FEE_RATE;
+        fee = (entry + exitPx) * feeRate;
       } else if (how === '止损（半仓）') {
         /* 已有一半在 tp1 止盈，剩余一半止损 */
         gross = 0.5 * (r1 - entry) * dirSign + 0.5 * (exitPx - entry) * dirSign;
-        fee = entry * FEE_RATE + 0.5 * r1 * FEE_RATE + 0.5 * exitPx * FEE_RATE;
+        fee = entry * feeRate + 0.5 * r1 * feeRate + 0.5 * exitPx * feeRate;
       } else if (how === '止盈二') {
         gross = 0.5 * (r1 - entry) * dirSign + 0.5 * (exitPx - entry) * dirSign;
-        fee = entry * FEE_RATE + 0.5 * r1 * FEE_RATE + 0.5 * exitPx * FEE_RATE;
+        fee = entry * feeRate + 0.5 * r1 * feeRate + 0.5 * exitPx * feeRate;
       } else {
         gross = (exitPx - entry) * dirSign;
-        fee = (entry + exitPx) * FEE_RATE;
+        fee = (entry + exitPx) * feeRate;
       }
       const net = gross - fee;
       trades.push({
@@ -1128,18 +1159,27 @@
         exit: exitPx, how: how, hold: holdT, risk: risk,
         pnl: net, r: net / risk,
         grossR: gross / risk, feeR: fee / risk,
-        win: net > 0, msSc: tg.sc || 0,
+        win: net > 0, msSc: tg.sc || (V ? (tg.dir === 'long' ? Math.min(tg.up5, tg.up15, tg.up1h) : Math.min(tg.dn5, tg.dn15, tg.dn1h)) : 0),
       });
       if (k % 200 === 0) onProgress(0.6 + 0.35 * k / Math.max(1, trig.length), '模拟第 ' + (k + 1) + ' / ' + trig.length + ' 笔');
     }
 
     onProgress(0.98, '统计');
     const res = summarize(trades, s5, trig.length, skipped, {
-      scores: trig.map(t => t.sc || 0),
+      /* 投票制的「共振强度」= 三个周期里最弱的那一环的同频票数
+         （用户口径：4/9 ≈ 44% 即算确认）。越长 harness 旧 ms 体系用的是结构分。 */
+      scores: trig.map(function (t) {
+        if (t.sc != null) return t.sc;
+        if (!V) return 0;
+        return t.dir === 'long'
+          ? Math.min(t.up5, t.up15, t.up1h)
+          : Math.min(t.dn5, t.dn15, t.dn1h);
+      }),
       ms: ms, msOpt: msOpt,
     });
     /* 供多配置对比复用（不含 trades，避免重复占内存） */
-    res.cache = { s15: s15, s1h: s1h, r5: r5, r15: r15, r1h: r1h, ms: ms };
+    res.cache = { s15: s15, s1h: s1h, r5: r5, r15: r15, r1h: r1h, ms: ms, V: V,
+      s1d: s1d, ma5: ma5, ma15: ma15, ma1h: ma1h };
     return res;
   }
 
@@ -1246,7 +1286,7 @@
     onPhase('calc', 0.6, '共 ' + h.rows.length + ' 根，开始计算');
     const res = backtestCore(h.series, {
       tpslFn: opt.tpslFn, maxHold: opt.maxHold, live: opt.live,
-      ms: opt.ms, msMode: opt.msMode,
+      ms: opt.ms, msMode: opt.msMode, vote: opt.vote, cache: opt.cache,
       onProgress: (p, txt) => onPhase('calc', 0.6 + 0.4 * p, txt),
     });
     res.live = !!opt.live;
@@ -1297,6 +1337,15 @@
        页面 UI 只负责调用，绝不自己再抄一份同样的算法。
        三个函数都是纯函数，输出可被独立重算验证。 */
     smaCalc: smaCalc, ma200FromDaily: ma200FromDaily, maWindowProject: maWindowProject,
+
+    /* ---------- 九指标投票制方向判定 ---------- */
+    VOTE_KEYS: VOTE_KEYS, VOTE_N_MA: VOTE_N_MA, VOTE_DEF: VOTE_DEF, VOTE_WARM: VOTE_WARM,
+    VOTE_LABEL: VOTE_LABEL,
+    triState: triState, ma200Vote: ma200Vote, voteDir: voteDir,
+    VoteStream: VoteStream, voteSeries: voteSeries,
+    dailyMa200Lookup: dailyMa200Lookup,
+    voteTriple: voteTriple,
+    findVoteTriggersClosed: findVoteTriggersClosed,
   };
 
   /* ============================================================
@@ -1373,6 +1422,145 @@
     if (out.length >= 2) return out;
     /* 最后兜底：最近两个日线点，至少画得出一段线 */
     return points.slice(-2);
+  }
+
+  /* ============================================================
+     九指标投票制方向判定
+     ------------------------------------------------------------
+     每个周期跑同一套 SignalStream 拿到 ①–⑧ 八个因子值，
+     第九票来自「价格 vs 日线 MA200」的位置。九个指标各自给出
+     多(+1) / 平(0) / 空(-1) 三态，最后按票数定方向。
+
+        例：2 多 · 3 平 · 4 空 → 看空（4/9 ≈ 44% 同频确认）
+
+     定方向的规则是「赢家至少 minVotes 票，且严格多于反对方」，
+     而不是简单看 net 的符号 —— 否则「1 多 8 平 0 空」也会被判成
+     看多，这与「要有一批指标同时表态」的原意不符。
+
+     为什么不用原来的加权求和：加权制里一个因子给 ±1、其余全 0
+     也能把总分推过阈值，但那其实是「一个指标说了算」。投票制把
+     「有几个指标在说话」显式化了，便于用 minVotes 直接调松紧。
+     ============================================================ */
+  /* VOTE_KEYS / VOTE_N_MA / VOTE_WARM / VOTE_DEF / VOTE_LABEL 已提到文件顶部常量区
+     （它们要在 `const api = {...}` 之前初始化，否则导出时会踩 TDZ）。 */
+
+  /* 单因子 → 三态。|v| 不足 thz 视为「未表态」，避免把噪声当成票 */
+  function triState(v, thz) {
+    if (v == null || !isFinite(v)) return 0;
+    if (Math.abs(v) < thz) return 0;
+    return v > 0 ? 1 : -1;
+  }
+
+  /* 第九票：价格 vs 日线 MA200。
+     死区 bufPct 的意义：价格贴着均线反复穿越时这一票会在多空之间
+     抖动，留出缓冲后它只在明确站上 / 跌破时才表态。 */
+  function ma200Vote(close, ma, bufPct) {
+    if (ma == null || !isFinite(ma) || !(ma > 0)) return 0;
+    const dev = (close - ma) / ma;
+    if (Math.abs(dev) < bufPct) return 0;
+    return dev > 0 ? 1 : -1;
+  }
+
+  /* 票数组 → 方向 */
+  function voteDir(votes, minVotes) {
+    let up = 0, dn = 0;
+    for (let i = 0; i < votes.length; i++) {
+      if (votes[i] > 0) up++; else if (votes[i] < 0) dn++;
+    }
+    const flat = votes.length - up - dn;
+    if (up >= minVotes && up > dn) return { dir: 'long', up: up, dn: dn, flat: flat };
+    if (dn >= minVotes && dn > up) return { dir: 'short', up: up, dn: dn, flat: flat };
+    return { dir: 'wait', up: up, dn: dn, flat: flat };
+  }
+
+  function VoteStream(opt) {
+    opt = opt || {};
+    this.thz = opt.thz == null ? VOTE_DEF.thz : opt.thz;
+    this.bufPct = opt.bufPct == null ? VOTE_DEF.bufPct : opt.bufPct;
+    this.minVotes = opt.minVotes == null ? VOTE_DEF.minVotes : opt.minVotes;
+    this.useMa = !!opt.useMa;
+    this.n = 0;
+    this.st = new SignalStream();
+  }
+  VoteStream.prototype.push = function (open, high, low, close, volume, maVal) {
+    const i = this.n++;
+    const r = this.st.push(open, high, low, close, volume);
+    const f = r.f;
+    const votes = new Int8Array(VOTE_N_MA);
+    for (let k = 0; k < VOTE_KEYS.length; k++) votes[k] = triState(f[VOTE_KEYS[k]], this.thz);
+    if (this.useMa) votes[8] = ma200Vote(close, maVal, this.bufPct);
+    const d = voteDir(votes, this.minVotes);
+    /* 预热期（前 59 根）因子值还没算稳，不许它们投票 */
+    if (i < VOTE_WARM) d.dir = 'wait';
+    return { i: i, votes: votes, up: d.up, dn: d.dn, flat: d.flat, dir: d.dir, f: f, score: r.score };
+  };
+
+  /* 整段序列跑投票。maArr 可为 null（不用第九票时仍是八票，
+     但票数组按 9 列存，末列恒 0，便于 UI 统一渲染）。 */
+  function voteSeries(s, maArr, opt) {
+    const n = s.n, W = VOTE_N_MA;
+    const st = new VoteStream(Object.assign({ useMa: !!maArr }, opt));
+    const dirs = new Uint8Array(n), up = new Uint8Array(n), dn = new Uint8Array(n);
+    const votes = new Int8Array(n * W);
+    for (let i = 0; i < n; i++) {
+      const r = st.push(s.o[i], s.h[i], s.l[i], s.c[i], s.v[i], maArr ? maArr[i] : null);
+      dirs[i] = r.dir === 'long' ? 1 : r.dir === 'short' ? 2 : 0;
+      up[i] = r.up; dn[i] = r.dn;
+      for (let k = 0; k < W; k++) votes[i * W + k] = r.votes[k];
+    }
+    return { dirs: dirs, up: up, dn: dn, votes: votes, w: W, n: n };
+  }
+
+  /* 把日线 MA200 铺到任意周期的每一根 bar 上。
+     ★ 必须用**已收盘**的那根日线（buildClosedMap），不能用当天还在走的那根：
+       后者会把「当天收盘价」提前泄漏给盘中每一根 bar —— 这是典型未来函数，
+       会让回测出来的胜率虚高。实盘也同理：盘中该用的是昨日收盘算出的 MA200。
+     daily 可以是列式 series({t,c,n}) 或对象数组([{time,close}])。 */
+  function dailyMa200Lookup(s, daily, p, sec) {
+    p = p || 200;
+    const dT = daily.t ? daily.t : daily.map(function (d) { return d.time; });
+    const dC = daily.c ? daily.c : daily.map(function (d) { return d.close; });
+    const mv = smaCalc(dC, p);
+    const m = buildClosedMap(s.t, dT, sec, 86400);
+    const out = new Float64Array(s.n);
+    for (let i = 0; i < s.n; i++) {
+      const j = m[i];
+      out[i] = (j >= 0 && mv[j] != null && isFinite(mv[j])) ? mv[j] : NaN;
+    }
+    return out;
+  }
+
+  /* 实时口径：三周期最新已收线是否同向（供 UI 每帧判断，跃变沿由调用方维护） */
+  function voteTriple(d1hNow, d15Now, d5Now) {
+    if (d1hNow === 0) return null;
+    if (d15Now !== d1hNow || d5Now !== d1hNow) return null;
+    return d1hNow === 1 ? 'long' : 'short';
+  }
+
+  /* 入场点：1h 定方向，15m 与 5m 同时同向 → 只在「刚刚凑齐」的那一根响一次。
+     粗周期必须用已收线映射（mc15/mc1h）：否则同一根 15m 之内的每根 5m
+     都会重复满足，5 年回测会炸出几万次重复信号。 */
+  function findVoteTriggersClosed(d5, d15, d1h, mc15, mc1h, v5, v15, v1h) {
+    const out = [];
+    let prev = false;
+    for (let i = 1; i < d5.length; i++) {
+      const j15 = mc15[i], j1h = mc1h[i];
+      let on = false;
+      if (j15 >= 0 && j1h >= 0) {
+        const a = d1h[j1h];
+        on = a !== 0 && d15[j15] === a && d5[i] === a;
+      }
+      if (on && !prev) {
+        out.push({
+          i: i, dir: d1h[mc1h[i]] === 1 ? 'long' : 'short',
+          up5: v5 ? v5.up[i] : 0, dn5: v5 ? v5.dn[i] : 0,
+          up15: v15 ? v15.up[j15] : 0, dn15: v15 ? v15.dn[j15] : 0,
+          up1h: v1h ? v1h.up[j1h] : 0, dn1h: v1h ? v1h.dn[j1h] : 0,
+        });
+      }
+      prev = on;
+    }
+    return out;
   }
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

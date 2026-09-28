@@ -410,12 +410,15 @@ function loadAppSignalCore() {
   ok(V.TH_WITH === 70 && V.TH_RANGE === 75 && V.TH_AGAINST === 85, '4H 门槛 = 70 / 75 / 85');
   ok(V.SETUP_MIN === 18 && V.SETUP_MIN_CT === 22, '15m Setup 下限 = 18 / 逆势 22');
 
-  head('20. v2.1 看板接入点');
-  ok(/function renderV21Panel|function paintV21\(/.test(appSrc2), '看板含 v2.1 面板渲染函数');
-  ok(/id="v21Panel"/.test(htmlSrc), 'index.html 含 v2.1 面板容器');
-  ok(/V\.decideNow\(|V21\.decideNow\(/.test(appSrc2), '实盘走 V21.decideNow（与回测同实现）');
-  ok(/v21\.js/.test(htmlSrc), 'index.html 已引入 v21.js');
-  ok(/v21Thr/.test(appSrc2), '门槛可切换（规范 70/75/85 · 统一 70/65/60）');
+  head('20. 九指标投票制 · 看板接入点');
+  ok(/function paintVote\(/.test(appSrc2), '看板含投票面板渲染函数');
+  ok(/id="votePanel"/.test(htmlSrc), 'index.html 含投票面板容器');
+  ok(/voteSeries\(/.test(appSrc2), '实盘走 Strategy.voteSeries（与回测同一实现）');
+  ok(/buildClosedMap\(/.test(appSrc2) && /findVoteTriggersClosed\(/.test(appSrc2),
+    '实盘与回测同用「已收线」映射与跃变沿');
+  ok(/voteMinV/.test(appSrc2), '票数门槛可在页面切换（≥3/4/5/6）');
+  ok(!/v21\.js/.test(htmlSrc), 'index.html 已不再引入 v21.js（v2.1 百分制下线）');
+  ok(!/V21\.decideNow|V\.decideNow/.test(appSrc2), '看板不再调用 v2.1 的 decideNow');
 
   head('21. v2.1 校正项：第 2/7/9/10 节口径');
   /* 第 10 节：HH/HL/LH/LL 必须超过最小过滤阈值，一个 tick 不能算结构 */
@@ -600,6 +603,135 @@ function loadAppSignalCore() {
     ok(/ma200Legend/.test(htmlSrc), 'index.html 含 MA200 图例容器');
     const cssSrc = fs.readFileSync(__dirname + '/simtrader/style.css', 'utf8');
     ok(/\.ma200-legend \{/.test(cssSrc) && /\.chk-row \{/.test(cssSrc), 'style.css 含两个新组件的样式');
+  }
+
+  /* ==========================================================
+     22. 九指标投票制：票数规则 / 跃变沿 / MA200 无未来函数
+     ========================================================== */
+  {
+    head('22. 九指标投票制');
+
+    /* ① 三态化的边界 */
+    ok(S.triState(0.30, 0.30) === 1 && S.triState(-0.30, 0.30) === -1,
+      'triState · |v| 恰好等于阈值时算「已表态」');
+    ok(S.triState(0.29, 0.30) === 0 && S.triState(-0.29, 0.30) === 0,
+      'triState · |v| 不足阈值算「平」');
+    ok(S.triState(null, 0.30) === 0 && S.triState(NaN, 0.30) === 0,
+      'triState · 缺失值不投票（不是当空也不是当多）');
+
+    /* ② 第九票 MA200 的死区 */
+    ok(S.ma200Vote(1004, 1000, 0.005) === 0, 'ma200Vote · 偏离 0.4% 落在 0.5% 死区内算「平」');
+    ok(S.ma200Vote(1006, 1000, 0.005) === 1, 'ma200Vote · 偏离 0.6% 越过死区才算多');
+    ok(S.ma200Vote(1010, 1000, 0.005) === 1, 'ma200Vote · 偏离 1% 明确站上算多');
+    ok(S.ma200Vote(990, 1000, 0.005) === -1, 'ma200Vote · 明确跌破算空');
+    ok(S.ma200Vote(1000, null, 0.005) === 0 && S.ma200Vote(1000, 0, 0.005) === 0,
+      'ma200Vote · MA 未算出时不投票（避免拿 NaN 当方向）');
+
+    /* ③ 用户的原始例子：2 多 3 平 4 空 → 看空（4/9 ≈ 44%） */
+    {
+      const v2 = [1, 1, 0, 0, 0, -1, -1, -1, -1];
+      const d = S.voteDir(v2, 4);
+      ok(d.dir === 'short' && d.up === 2 && d.dn === 4 && d.flat === 3,
+        'voteDir · 2多3平4空 → 看空（用户口径 4/9=44%）', `${d.up}/${d.flat}/${d.dn} → ${d.dir}`);
+
+      const mirror = v2.map(x => -x);
+      const dm = S.voteDir(mirror, 4);
+      ok(dm.dir === 'long', 'voteDir · 多空镜像后结论精确反过来（无方向偏置）');
+
+      /* 4 多 4 空 1 平：赢家未「严格多于」反方 → 观望 */
+      const tie = [1, 1, 1, 1, 0, -1, -1, -1, -1];
+      ok(S.voteDir(tie, 4).dir === 'wait', 'voteDir · 4 多对 4 空 = 观望（没人胜出）');
+
+      /* 1 多 8 平 0 空：票数不足，不能算「多」——这是投净票数符号会犯的错 */
+      const weak = [1, 0, 0, 0, 0, 0, 0, 0, 0];
+      const dw = S.voteDir(weak, 4);
+      ok(dw.dir === 'wait', 'voteDir · 只有 1 票支持不算方向（净票数符号法的典型错误）',
+        `${dw.up} 票 → ${dw.dir}`);
+
+      /* 门槛旋钮：同一组票，minVotes 从 3 放到 6 应当单调变严 */
+      const v5 = [1, 1, 1, 1, 1, 0, 0, -1, -1];
+      ok(S.voteDir(v5, 3).dir === 'long' && S.voteDir(v5, 5).dir === 'long' && S.voteDir(v5, 6).dir === 'wait',
+        'voteDir · minVotes 越大越严（5票仍过、6票不过）');
+    }
+
+    /* ④ 跃变沿：三周期状态持续时不得重复触发 */
+    {
+      const d5 = [0, 1, 1, 1, 1, 0, 2, 2, 0];
+      const d15 = [0, 1, 1, 1, 1, 0, 2, 2, 0];
+      const d1h = [0, 1, 1, 1, 1, 0, 2, 2, 0];
+      const mc = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+      const tg = S.findVoteTriggersClosed(d5, d15, d1h, mc, mc, null, null, null);
+      ok(tg.length === 2, '跃变沿 · 多→同向只响一次（4 根持续 ≠ 4 次信号）', `触发 ${tg.length} 次`);
+      ok(tg[0].i === 1 && tg[0].dir === 'long' && tg[1].i === 6 && tg[1].dir === 'short',
+        '跃变沿 · 位置与方向正确', tg.map(t => `${t.i}:${t.dir}`).join(' '));
+    }
+
+    /* ⑤ ★ MA200 铺到 5m 不许偷看未来：日线当天还没走完时，只能用昨天的 MA200 */
+    {
+      const day = 86400;
+      const base = Math.floor(Date.now() / day) * day - 400 * day;
+      const closes = [];
+      for (let i = 0; i < 420; i++) closes.push(1000 + i);       // 单调上升，便于验证
+      const daily = { n: 420, t: [], c: closes, o: closes, h: closes, l: closes, v: closes.map(() => 1) };
+      for (let i = 0; i < 420; i++) daily.t.push(base + i * day);
+
+      /* 造一批落在某个交易日「当天」的 5m bar */
+      const dIdx = 300;                                          // 取第 300 根日线做实验
+      const dayStart = daily.t[dIdx];
+      const t5 = [], o5 = [], h5 = [], l5 = [], c5 = [], v5 = [];
+      for (let k = 0; k < 6; k++) {                              // 当天前 30 分钟
+        t5.push(dayStart + k * 300); o5.push(1); h5.push(1); l5.push(1); c5.push(1); v5.push(1);
+      }
+      const s5 = { n: 6, t: t5, o: o5, h: h5, l: l5, c: c5, v: v5 };
+      const got = S.dailyMa200Lookup(s5, daily, 200, 300);
+
+      /* 正确答案：用第 299 根（含）之前 200 根日线算的均值 */
+      let expect = 0;
+      for (let i = dIdx - 200; i < dIdx; i++) expect += daily.c[i];
+      expect /= 200;
+      const allSame = [0, 1, 2, 3, 4, 5].every(i => Math.abs(got[i] - expect) < 1e-9);
+      ok(allSame, 'dailyMa200Lookup · 当日盘中只用「昨日已收盘」的 MA200',
+        `得到 ${got[0].toFixed(4)} / 应为 ${expect.toFixed(4)}`);
+
+      /* 反证：若用了当天那根（第 300 根），均值会高出 (c300-c100)/200 */
+      let wrong = 0;
+      for (let i = dIdx - 199; i <= dIdx; i++) wrong += daily.c[i];
+      wrong /= 200;
+      ok(Math.abs(got[0] - wrong) > 1e-6,
+        'dailyMa200Lookup · 确认没有误用当天未收盘日线',
+        `若错用当天应为 ${wrong.toFixed(4)}`);
+
+      /* 最后一个 5m bar（23:55）落在当日末尾时，才允许切到当天新值 ——
+         而这一批 bar 都在开盘后 30 分钟内，所以 6 根必须全部相同 */
+      ok(got[0] === got[5], 'dailyMa200Lookup · 同一交易日内取值稳定，不随盘中价格变动');
+    }
+
+    /* ⑥ 票数与方向：EMA 明显多头时 trend 那一票必须是「多」 */
+    {
+      const vs = new S.VoteStream({ thz: 0.30, minVotes: 4, useMa: false });
+      for (let i = 0; i < s.n; i++) vs.push(s.o[i], s.h[i], s.l[i], s.c[i], s.v[i]);
+      ok(vs.n === s.n, 'VoteStream · 逐根推进计数正确');
+      ok(S.VOTE_LABEL.length === 9, '九个指标均有名称（①EMA…⑨MA200）');
+      ok(S.VOTE_KEYS.length === 8 && S.VOTE_N_MA === 9, '八因子 + MA200 = 九票');
+    }
+
+    /* ⑦ 回测可用性：投票制能接入 backtestCore 并产出成交 */
+    {
+      const shared = {
+        s15: S.aggregate(s, 900), s1h: S.aggregate(s, 3600), s1d: S.aggregate(s, 86400),
+      };
+      const V = { thz: 0.30, bufPct: 0.005, minVotes: 3 };
+      shared.ma5 = S.dailyMa200Lookup(s, shared.s1d, 200, 300);
+      const r5 = S.voteSeries(s, shared.ma5, V);
+      ok(r5.n === s.n && r5.w === 9, 'voteSeries · 输出维度正确', `${r5.n} 根 × ${r5.w} 票`);
+      const cnt = { long: 0, short: 0, wait: 0 };
+      for (let i = 0; i < r5.n; i++) {
+        cnt[r5.dirs[i] === 1 ? 'long' : r5.dirs[i] === 2 ? 'short' : 'wait']++;
+      }
+      ok(cnt.long + cnt.short > 0, 'voteSeries · 样本内产生了方向',
+        `多 ${cnt.long} / 空 ${cnt.short} / 观望 ${cnt.wait}`);
+      ok(r5.dirs[0] === 0 && r5.dirs[58] === 0, 'voteSeries · 预热期（前 59 根）不出方向');
+    }
   }
 
   console.log('\n' + '='.repeat(64));
