@@ -19,6 +19,20 @@
 | `lsmap.js` | **多空热力图**：按价位分档的背靠背分布图（真实爆仓 + 潜在强平推算），窗口 实时/5m/15m/1h/4h |
 | `strategy.js` | **开单逻辑 + 回测引擎**：八因子状态量信号引擎（流式）、**5m 市场结构触发状态机 `MsStream`**（pivot / CHOCH / Retest / BOS）、三周期入场判定、5 年回测、**200 日均线纯函数**（`smaCalc` / `ma200FromDaily` / `maWindowProject`） |
 | `v21.js` | **多周期层级评分 v2.1**：`VStream` 指标流 + 1H 20 / 30m 25 / 15m 30 三层评分 + 4H Macro Regime（只定门槛）+ 100 分总评 + 第 7 节总分区间 + Long/Short Gate + Confirmed/Live 双状态 + 四阶段回测统计量 |
+| `preview-ls.html` | 多空热力图的独立预览页（脱离主站单独调试 `lsmap.js` 用） |
+
+**命令行脚本**（`tools/` 与根目录，Node 直跑）：
+
+| 脚本 | 作用 |
+| --- | --- |
+| `probe-src.js` | 数据有效性命令行探针：逐个实打 14 个接口，输出条数 / 最新时间 / 延迟，主源与辅助源分开计数 |
+| `smoke-page.js` | 用 jsdom 真正加载 `index.html` 并调用页面内自检 / MA200 逻辑（需 `npm i jsdom ws`） |
+| `scan-sl.js` | 止损宽度 × 4H 顺逆过滤器联合扫描，强制在第二品种做样本外验证 |
+| `cmp-v21.js` / `cmp-ms.js` / `diag-v21.js` / `stat-bt.js` / `run-bt5y.js` | 四阶段回测、配置对比、分值诊断、显著性统计、端到端回测 |
+| `fetch-cache.js` | 5m 历史缓存，避免每轮实验重复拉数 |
+| `tools/test-gate-perp.js` | 源收敛验证：站点内无 FVG 残留、源链只有 Gate 永续一个、推送走 `fx-ws.gateio.ws`，并用真实数据实跑 K 线 / 实时价 / 逐笔 |
+| `tools/test-liq-backfill.js` | 验证 Gate 强平接口按 1 小时窗口回溯（窗口 > 1h 会 `INVALID_PARAM_VALUE`） |
+| `tools/test-liq-ws.js` | Gate 永续 WS 强平推送频道的最小探针（需 `npm i ws`） |
 
 ## 数据源
 

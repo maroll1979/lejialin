@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<title>多空热力图预览</title>
+<link rel="stylesheet" href="style.css">
+<style>body{background:#f6f8fb;padding:18px;margin:0}</style>
+</head><body>
+<section class="heat-wrap">
+  <div class="heat-grid">
+    <section class="panel ls-panel">
+      <div class="heat-head">
+        <h3>多空热力图 · <span id="lsSym">—</span></h3>
+        <div class="ls-ctrl">
+          <span class="liq-tag">窗口</span>
+          <span class="ls-seg" id="lsIv">
+            <button data-lsiv="live">实时</button>
+            <button data-lsiv="5m">5m</button>
+            <button data-lsiv="15m">15m</button>
+            <button data-lsiv="1h">1h</button>
+            <button data-lsiv="4h">4h</button>
+          </span>
+          <span class="liq-tag">图层</span>
+          <span class="ls-seg" id="lsLayer">
+            <button data-lslayer="real">真实爆仓</button>
+            <button data-lslayer="model">潜在推算</button>
+            <button data-lslayer="both">叠加</button>
+          </span>
+          <button id="lsReset" class="liq-sw">复位视图</button>
+        </div>
+      </div>
+      <div class="ls-body">
+        <div class="ls-chart" id="lsChart"></div>
+        <div class="range-cards" id="lsCards"></div>
+      </div>
+      <div class="heat-tip ls-meta" id="lsMeta">加载中…</div>
+      <div class="ls-legend">
+        <span><i class="ls-dot" style="background:#0a8f4e"></i>多头被强平（条向左）</span>
+        <span><i class="ls-dot" style="background:#d92c2c"></i>空头被强平（条向右）</span>
+        <span><i class="ls-dot" style="background:#2563eb"></i>现价</span>
+      </div>
+    </section>
+  </div>
+</section>
+<script src="lsmap.js"></script>
+<script>
+  LsMap.init(document.querySelector('#lsChart'), document.querySelector('#lsCards'), document.querySelector('#lsMeta'));
+  LsMap.setIv('4h');
+  LsMap.setInstrument({ id: 'BTC', contract: 'BTC_USDT', dec: 2 });
+  document.querySelector('#lsSym').textContent = 'BTC · BTC_USDT';
+  const iv = document.querySelector('#lsIv'), ly = document.querySelector('#lsLayer');
+  iv.querySelectorAll('[data-lsiv]').forEach(b => b.classList.toggle('active', b.dataset.lsiv === '4h'));
+  ly.querySelectorAll('[data-lslayer]').forEach(b => b.classList.toggle('active', b.dataset.lslayer === 'both'));
+</script>
+</body></html>
