@@ -30,6 +30,7 @@
 
   const GATE = 'https://api.gateio.ws';
   const LS_SPAN = 'simtrader_lsspan_v1';     // 视野偏好（单边 tick 数）
+  const LS_BANDS = 'simtrader_lsbands_v1';   // 是否叠加「量能结构带」
   const LS_BOOK = 'simtrader_lsbook_v1';     // 最近一次订单簿快照（离线兜底）
   const LS_MULT = 'simtrader_liqmult_v1';    // 合约面值缓存（与 liq-map 共用同一份）
   const LS_TICK = 'simtrader_lstick_v1';     // 合约 tick（order_price_round）缓存
@@ -38,7 +39,11 @@
   const REFRESH_MS = 5000;                   // 订单簿快照刷新间隔
   const BINS = 72;                           // 价格分档数
   const H = 470;                             // 画布高度
+  /* PAD.l 是左侧价格数字区；AXIS_W 是紧随其后的「价格数轴」（量能结构带画在这里）；
+     真正的能量柱从 PLOT_L 开始 —— 数轴与柱子分离，互不遮挡 */
   const PAD = { l: 86, r: 96, t: 22, b: 22 };
+  const AXIS_W = 22;
+  const PLOT_L = PAD.l + AXIS_W;
 
   const COL_BID = '#0a8f4e';     // 买盘挂单（价格下方 / 多头阵营）
   const COL_ASK = '#d92c2c';     // 卖盘挂单（价格上方 / 空头阵营）
@@ -46,6 +51,9 @@
   const COL_TXT = '#4b5563';
   const COL_TXT2 = '#8a94a6';
   const COL_NOW = '#2563eb';
+  const COL_VA = '#6366f1';      // 价值区（中间聚集的量能带）
+  const COL_UPV = '#f97316';     // 上方流动性空洞（橙色，区别于卖盘红）
+  const COL_DNV = '#0891b2';     // 下方流动性空洞（青色，区别于买盘绿）
 
   const S = {
     host: null, cards: null, meta: null,
@@ -54,6 +62,7 @@
     span: 500, P: 0,
     book: null, quote: null, dist: null, loading: false, err: '', lastTs: 0, offline: false,
     view: null,                    // 手工缩放/平移后的价格窗口 {lo,hi}；null = 按视野自动
+    showBands: true,               // 是否叠加「量能结构带」（POC / 价值区 / 上下空洞）
     drag: null, gen: 0, timer: 0, refetchT: 0, ro: null, raf: 0,
   };
 
@@ -173,6 +182,118 @@
     return Math.max(SPANS[0], Math.max(P - v.lo, v.hi - P) / S.tick * 1.25);
   }
 
+  /* ==========================================================================
+   * 量能结构带 —— 把订单簿读成一张「流动性地图」
+   *
+   *   POC   Point of Control：单位价位内挂单金额最大处（挂单意愿最密集的价位）
+   *   VA    Value Area：包含 VA_SHARE 总挂单额的**最窄**价格区间 = 中间聚集的量能带
+   *         算法：从 POC 向两侧贪心扩张（Market Profile 标准做法），
+   *               保证「同等占比下区间最窄」的最优性
+   *   空洞  上方只在**卖盘侧**、下方只在**买盘侧**滑窗找总额最小的一段
+   *         稀疏度 = 窗口均值 ÷ 同侧均值；< 0.5 才判为「真的稀薄」
+   *
+   * ⚠ 为什么 POC/VA 可以把买卖合成一个数组算，而空洞不行：
+   *   买盘只存在于买一以下、卖盘只存在于卖一以上 —— 两侧在价格上互斥，
+   *   所以 tot[i] = bid[i]+ask[i] 在任何一格都等于「该价位的挂单总额」，不会重复计数，
+   *   用它找全局最密集点是对的。
+   *   但找「稀薄」必须分侧：拿 A 侧的值去衡量 B 侧的稀薄程度毫无意义，
+   *   而且合成后的窗口会越过买卖分界、被另一侧的 0 拉低，选出跨 melaluiát界的假空洞。
+   *
+   * ⚠ 视野越窄越不可信：小视野下单行业发展被切碎，每格里要么是孤立大单要么几乎为零
+   *   （实测 ETH ±400 tick 时格子内有 $54 与 $708K 并存），「最小量能带」退化为挑噪声。
+   *   所以 VA 宽度 > 75% 视野、或稀疏度 > 0.75 时，UI 会明确标「不显著」而不是硬指一个带。
+   * ======================================================================== */
+  const VA_SHARE = 0.70;      // 价值区目标占比（通常 70%，即 Market Profile 的 VA）
+  const VOID_WIN = 0.12;      // 空洞窗口宽度（占视野的比例）
+
+  function findPeak(arr) {
+    let i = 0;
+    for (let k = 1; k < arr.length; k++) if (arr[k] > arr[i]) i = k;
+    return i;
+  }
+
+  function valueArea(arr, target) {
+    const tot = arr.reduce((a, b) => a + b, 0);
+    if (!(tot > 0)) return null;
+    let poc = findPeak(arr), lo = poc, hi = poc, acc = arr[poc];
+    while (lo > 0 || hi < arr.length - 1) {
+      const dv = lo > 0 ? arr[lo - 1] : -1;
+      const uv = hi < arr.length - 1 ? arr[hi + 1] : -1;
+      if (dv < 0 && uv < 0) break;
+      if (dv >= uv) { lo--; acc += arr[lo]; } else { hi++; acc += arr[hi]; }
+      if (acc / tot >= target) break;
+    }
+    return { lo, hi, poc, acc, share: acc / tot };
+  }
+
+  /* 单侧滑窗最小窗口。
+     baseline 取**非零格的中位数**而不是均值 —— 这个选择是真实数据逼出来的：
+     订单簿的典型形态是「少量巨墙 + 大量普通单」，用均值时那堵巨墙会把 baseline 抬高
+     （实测：35 格 1000 + 1 格 50000 → 均值 2361），结果**均匀的普通挂单反过来显得稀薄**
+     （稀疏度被压到 0.42 而误判成真空）。中位数对这类离群值稳健，才是「常态挂单水平」。*/
+  function thinBand(arr, from, to, win) {
+    const a = Math.max(0, from), b = Math.min(arr.length - 1, to);
+    if (b - a + 1 < win || win < 1) return null;
+    const nz = [];
+    for (let i = a; i <= b; i++) if (arr[i] > 0) nz.push(arr[i]);
+    nz.sort((x, y) => x - y);
+    let baseline = 0;
+    if (nz.length) {
+      const m = nz.length >> 1;
+      baseline = (nz.length % 2) ? nz[m] : (nz[m - 1] + nz[m]) / 2;
+    }
+    let sum = 0;
+    for (let i = a; i < a + win; i++) sum += arr[i];
+    let best = { lo: a, hi: a + win - 1, sum };
+    for (let i = a + 1; i + win - 1 <= b; i++) {
+      sum += arr[i + win - 1] - arr[i - 1];
+      if (sum < best.sum) best = { lo: i, hi: i + win - 1, sum };
+    }
+    best.baseline = baseline;
+    best.sparsity = baseline > 0 ? (best.sum / win) / baseline : 1;
+    return best;
+  }
+
+  function computeBands(bidA, askA, lo, step, P, bins, tick) {
+    const tot = new Array(bins).fill(0);
+    for (let i = 0; i < bins; i++) tot[i] = bidA[i] + askA[i];
+    const sumBid = bidA.reduce((a, b) => a + b, 0);
+    const sumAsk = askA.reduce((a, b) => a + b, 0);
+    const sumAll = tot.reduce((a, b) => a + b, 0);
+    if (!(sumAll > 0)) return null;
+
+    const pBin = findPeak(tot);
+    const poc = { bin: pBin, price: lo + (pBin + 0.5) * step, usd: tot[pBin] };
+
+    const r = valueArea(tot, VA_SHARE);
+    const va = r ? {
+      loBin: r.lo, hiBin: r.hi,
+      lo: lo + r.lo * step, hi: lo + (r.hi + 1) * step,
+      usd: r.acc, share: r.share, widthBins: r.hi - r.lo + 1,
+      /* 价值区中心 vs 现价：二者接近 = 价格正处在市场公认的价值中枢 */
+      center: lo + (r.lo + r.hi + 1) / 2 * step,
+    } : null;
+    if (va) va.tooWide = va.widthBins / bins > 0.75;      // 宽到没信息量
+
+    const win = Math.max(2, Math.round(bins * VOID_WIN));
+    const nowBin = clamp(Math.floor((P - lo) / step), 0, bins - 1);
+    const mk = (band, side) => !band ? null : {
+      side: side,
+      loBin: band.lo, hiBin: band.hi,
+      lo: lo + band.lo * step, hi: lo + (band.hi + 1) * step,
+      usd: band.sum, sparsity: band.sparsity, baseline: band.baseline,
+      thin: band.sparsity < 0.5,
+      /* 窗口宽度按 tick 报出来：滑窗法找的是「这么宽的一段里最薄的」，
+         不是「任意宽度的空洞」—— 宽度不写出来，这个数就会被误读 */
+      widTicks: tick > 0 ? Math.round((band.hi - band.lo + 1) * step / tick) : 0,
+      distPct: P > 0 ? ((lo + (band.lo + band.hi + 1) / 2 * step) - P) / P : 0,
+    };
+    const upper = mk(thinBand(askA, nowBin + 1, bins - 1, win), 'up');
+    const lower = mk(thinBand(bidA, 0, nowBin - 1, win), 'down');
+
+    return { poc, va, upper, lower, win, sumBid, sumAsk, sumAll, nowBin };
+  }
+
   /* ---------------------------------------------------------------- 聚合 */
   function build(book, quote) {
     const P = quote.last > 0 ? quote.last : (quote.mark || 0);
@@ -200,6 +321,9 @@
       lo, hi, step, bins: BINS, tick: S.tick, span: S.span,
       bidA, askA, totBid, totAsk, P,
       peakBid: peak(bidA), peakAsk: peak(askA),
+      /* 注意 peakBid/peakAsk 是「各自阵营里最厚的一堵墙」，
+         bands.poc 是「全价位加起来最密集的那格」——两者常不在同一价位 */
+      bands: computeBands(bidA, askA, lo, step, P, BINS, S.tick),
       nBid: (book.bids || []).length, nAsk: (book.asks || []).length,
       interval: book.interval, coverTicks: book.coverTicks || 0,
       bestBid: (book.bids && book.bids[0]) ? book.bids[0][0] : 0,
@@ -303,19 +427,37 @@
     const d = S.dist;
     const v = view() || { lo: d.lo, hi: d.hi };
     const lo = v.lo, hi = v.hi, span = hi - lo, step = span / BINS;
-    const plotW = w - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
-    const cx = PAD.l + plotW / 2, halfW = plotW / 2 - 8;
+    const plotW = w - PLOT_L - PAD.r, plotH = H - PAD.t - PAD.b;
+    const cx = PLOT_L + plotW / 2, halfW = plotW / 2 - 8;
     const yOf = p => PAD.t + (hi - p) / span * plotH;
     const barH = Math.max(2, plotH / BINS - 1.2);
     const maxV = Math.max(Math.max.apply(null, d.bidA), Math.max.apply(null, d.askA), 1e-9);
+    const bd = S.showBands ? d.bands : null;
+
+    /* 把一段价格区间裁进绘图区；整个区间在视野外则返回 null */
+    const clipBand = (bLo, bHi) => {
+      const y1 = Math.max(PAD.t, yOf(bHi)), y2 = Math.min(PAD.t + plotH, yOf(bLo));
+      return (y2 - y1 < 0.6) ? null : { y: y1, h: y2 - y1 };
+    };
 
     let g = '';
     /* 网格 + 左右价格刻度 */
     for (let i = 0; i <= 6; i++) {
       const p = lo + span * i / 6, y = yOf(p);
-      g += `<line x1="${PAD.l}" y1="${y.toFixed(1)}" x2="${w - PAD.r}" y2="${y.toFixed(1)}" stroke="${COL_GRID}"/>`;
+      g += `<line x1="${PLOT_L}" y1="${y.toFixed(1)}" x2="${w - PAD.r}" y2="${y.toFixed(1)}" stroke="${COL_GRID}"/>`;
       g += `<text x="${PAD.l - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" font-size="13" fill="${COL_TXT}">${num(p, d.dec)}</text>`;
       if (d.P > 0) g += `<text x="${w - PAD.r + 8}" y="${(y + 4).toFixed(1)}" font-size="12" fill="${COL_TXT2}">${pct((p - d.P) / d.P, 2)}</text>`;
+    }
+    /* ① 三个「量能带」的横贯底色（画在柱子之前，当背景，不遮挡分布）*/
+    if (bd) {
+      const box = (bLo, bHi, fill, op) => {
+        const r = clipBand(bLo, bHi); if (!r) return '';
+        return `<rect x="${PLOT_L}" y="${r.y.toFixed(1)}" width="${plotW}" height="${r.h.toFixed(1)}" fill="${fill}" fill-opacity="${op}"/>`;
+      };
+      /* 过宽的 VA 说明这一档视野里根本没有明确聚集，把底色压淡，避免误导 */
+      if (bd.va) g += box(bd.va.lo, bd.va.hi, COL_VA, bd.va.tooWide ? 0.03 : 0.085);
+      if (bd.upper) g += box(bd.upper.lo, bd.upper.hi, COL_UPV, bd.upper.thin ? 0.11 : 0.04);
+      if (bd.lower) g += box(bd.lower.lo, bd.lower.hi, COL_DNV, bd.lower.thin ? 0.11 : 0.04);
     }
     /* 多空分界中线 */
     g += `<line x1="${cx}" y1="${PAD.t}" x2="${cx}" y2="${PAD.t + plotH}" stroke="#cbd5e1" stroke-dasharray="4 4"/>`;
@@ -334,12 +476,13 @@
       }
     }
 
-    /* 标注线：24h 高低 / 最厚买盘墙 / 最厚卖盘墙 */
+    /* 标注线：24h 高低 / 最厚买盘墙 / 最厚卖盘墙
+       —— 标签统一靠右：左侧空间留给「量能结构带」的标签，两边不打架 */
     const marks = [];
-    if (d.quote.high24 > lo && d.quote.high24 < hi) marks.push({ p: d.quote.high24, c: '#94a3b8', t: '24h 最高', dash: '3 5', side: 'r' });
-    if (d.quote.low24 > lo && d.quote.low24 < hi) marks.push({ p: d.quote.low24, c: '#94a3b8', t: '24h 最低', dash: '3 5', side: 'r' });
-    if (d.totBid > 0) marks.push({ p: d.peakBid.price, c: COL_BID, t: '最厚买盘 ' + usd(d.peakBid.usd), dash: '7 4', side: 'l' });
-    if (d.totAsk > 0) marks.push({ p: d.peakAsk.price, c: COL_ASK, t: '最厚卖盘 ' + usd(d.peakAsk.usd), dash: '7 4', side: 'r' });
+    if (d.quote.high24 > lo && d.quote.high24 < hi) marks.push({ p: d.quote.high24, c: '#94a3b8', t: '24h 最高', dash: '3 5' });
+    if (d.quote.low24 > lo && d.quote.low24 < hi) marks.push({ p: d.quote.low24, c: '#94a3b8', t: '24h 最低', dash: '3 5' });
+    if (d.totBid > 0) marks.push({ p: d.peakBid.price, c: COL_BID, t: '最厚买盘 ' + usd(d.peakBid.usd), dash: '7 4' });
+    if (d.totAsk > 0) marks.push({ p: d.peakAsk.price, c: COL_ASK, t: '最厚卖盘 ' + usd(d.peakAsk.usd), dash: '7 4' });
     const yList = marks.map(m => yOf(m.p));
     const order = marks.map((m, i) => i).sort((a, b) => yList[a] - yList[b]);
     for (let k = 1; k < order.length; k++) {
@@ -348,24 +491,82 @@
     }
     marks.forEach((m, i) => {
       const y = yOf(m.p);
-      g += `<line x1="${PAD.l}" y1="${y.toFixed(1)}" x2="${w - PAD.r}" y2="${y.toFixed(1)}" stroke="${m.c}" stroke-width="1.4" stroke-dasharray="${m.dash}"/>`;
+      g += `<line x1="${PLOT_L}" y1="${y.toFixed(1)}" x2="${w - PAD.r}" y2="${y.toFixed(1)}" stroke="${m.c}" stroke-width="1.4" stroke-dasharray="${m.dash}"/>`;
       const ly = clamp(yList[i], PAD.t + 11, PAD.t + plotH - 2);
-      const left = m.side === 'l';
-      g += `<text x="${left ? PAD.l + 6 : w - PAD.r - 6}" y="${(ly + 4).toFixed(1)}" text-anchor="${left ? 'start' : 'end'}"
+      g += `<text x="${w - PAD.r - 6}" y="${(ly + 4).toFixed(1)}" text-anchor="end"
         font-size="12.5" font-weight="700" fill="${m.c}" stroke="#fff" stroke-width="3.5" paint-order="stroke" stroke-linejoin="round">${m.t} · ${num(m.p, d.dec)}</text>`;
     });
+
+    /* ② 左侧「价格数轴」：一根按价格着色的竖直窄条，把三个量能带的位置一眼摊开。
+          这是整张图的**纵向标尺**——同一套价格刻度，左侧这根条只回答「哪一段是墙、
+          哪一段是空」，不画柱状长度，所以不会被利润分布图挤压。 */
+    const axX = PAD.l + 4, axW = AXIS_W - 8;
+    g += `<rect x="${axX}" y="${PAD.t}" width="${axW}" height="${plotH}" fill="#f8fafc" stroke="${COL_GRID}"/>`;
+    if (bd) {
+      const seg = (bLo, bHi, fill, op) => {
+        const r = clipBand(bLo, bHi); if (!r) return '';
+        return `<rect x="${axX}" y="${r.y.toFixed(1)}" width="${axW}" height="${r.h.toFixed(1)}" fill="${fill}" fill-opacity="${op}"/>`;
+      };
+      if (bd.va) g += seg(bd.va.lo, bd.va.hi, COL_VA, bd.va.tooWide ? 0.2 : 0.5);
+      if (bd.upper) g += seg(bd.upper.lo, bd.upper.hi, COL_UPV, bd.upper.thin ? 0.9 : 0.3);
+      if (bd.lower) g += seg(bd.lower.lo, bd.lower.hi, COL_DNV, bd.lower.thin ? 0.9 : 0.3);
+      /* POC：数轴上的一道黑刻 */
+      const yp = clamp(yOf(bd.poc.price), PAD.t, PAD.t + plotH);
+      g += `<line x1="${axX}" y1="${yp.toFixed(1)}" x2="${(axX + axW).toFixed(1)}" y2="${yp.toFixed(1)}" stroke="#111827" stroke-width="3"/>`;
+    }
+    const ynp0 = clamp(yOf(d.P), PAD.t, PAD.t + plotH);
+    g += `<line x1="${axX}" y1="${ynp0.toFixed(1)}" x2="${(axX + axW).toFixed(1)}" y2="${ynp0.toFixed(1)}" stroke="${COL_NOW}" stroke-width="2.5"/>`;
+
+    /* ③ 结构标签：贴在绘图区左缘（右侧留给 24h 高低 / 最厚墙），纵向自动避让 */
+    if (bd) {
+      const tags = [];
+      if (bd.upper) tags.push({
+        p: (bd.upper.lo + bd.upper.hi) / 2, c: COL_UPV,
+        t: (bd.upper.thin ? '▲ 上方最薄带 $' : '▲ 上方薄弱（不显著）$') + usd(bd.upper.usd),
+        s: `${num(bd.upper.lo, d.dec)}–${num(bd.upper.hi, d.dec)} · 宽 ${bd.upper.widTicks} tick · 稀疏 ${bd.upper.sparsity.toFixed(2)} · ${pct(bd.upper.distPct, 2)}`,
+      });
+      if (bd.lower) tags.push({
+        p: (bd.lower.lo + bd.lower.hi) / 2, c: COL_DNV,
+        t: (bd.lower.thin ? '▼ 下方最薄带 $' : '▼ 下方薄弱（不显著）$') + usd(bd.lower.usd),
+        s: `${num(bd.lower.lo, d.dec)}–${num(bd.lower.hi, d.dec)} · 宽 ${bd.lower.widTicks} tick · 稀疏 ${bd.lower.sparsity.toFixed(2)} · ${pct(bd.lower.distPct, 2)}`,
+      });
+      if (bd.va) tags.push({
+        p: bd.va.center, c: COL_VA,
+        t: bd.va.tooWide
+          ? `◆ 无明显聚集带（价值区宽达 ${Math.round(bd.va.widthBins / BINS * 100)}% 视野）`
+          : `◆ 中间聚集带 · ${(bd.va.share * 100).toFixed(0)}% 量能挤在 ${Math.round(bd.va.widthBins / BINS * 100)}% 视野内`,
+        s: `${num(bd.va.lo, d.dec)}–${num(bd.va.hi, d.dec)} · $${usd(bd.va.usd)} · 中心偏离现价 ${pct((bd.va.center - d.P) / (d.P || 1), 2)}`,
+      });
+      tags.push({
+        p: bd.poc.price, c: '#111827',
+        t: '● 挂单最密集价位（POC）$' + usd(bd.poc.usd),
+        s: `${num(bd.poc.price, d.dec)} · ${pct((bd.poc.price - d.P) / (d.P || 1), 2)} vs 现价`,
+      });
+      const ty = tags.map(t => yOf(t.p));
+      const ord = tags.map((t, i) => i).sort((a, b) => ty[a] - ty[b]);
+      for (let k = 1; k < ord.length; k++) {
+        const i = ord[k], j = ord[k - 1];
+        if (ty[i] - ty[j] < 31) ty[i] = ty[j] + 31;
+      }
+      tags.forEach((t, i) => {
+        const y0 = clamp(ty[i], PAD.t + 10, PAD.t + plotH - 15);
+        g += `<text x="${PLOT_L + 6}" y="${(y0 - 3).toFixed(1)}" font-size="12" font-weight="700" fill="${t.c}" stroke="#fff" stroke-width="3.5" paint-order="stroke" stroke-linejoin="round">${t.t}</text>`;
+        g += `<text x="${PLOT_L + 6}" y="${(y0 + 11).toFixed(1)}" font-size="11" fill="${COL_TXT2}" stroke="#fff" stroke-width="3" paint-order="stroke" stroke-linejoin="round">${t.s}</text>`;
+      });
+    }
 
     /* 现价 */
     const py = yOf(d.P);
     if (py > PAD.t - 4 && py < PAD.t + plotH + 4) {
-      g += `<line x1="${PAD.l}" y1="${py.toFixed(1)}" x2="${w - PAD.r}" y2="${py.toFixed(1)}" stroke="${COL_NOW}" stroke-width="2"/>`;
+      g += `<line x1="${PLOT_L}" y1="${py.toFixed(1)}" x2="${w - PAD.r}" y2="${py.toFixed(1)}" stroke="${COL_NOW}" stroke-width="2"/>`;
       g += `<rect x="${(cx - 48).toFixed(1)}" y="${(py - 11).toFixed(1)}" width="96" height="21" rx="5" fill="${COL_NOW}"/>`;
       g += `<text x="${cx}" y="${(py + 4).toFixed(1)}" text-anchor="middle" font-size="12.5" font-weight="700" fill="#fff">现价 ${num(d.P, d.dec)}</text>`;
     }
 
-    /* 左右表头 */
-    g += `<text x="${PAD.l + 6}" y="${PAD.t - 7}" font-size="13" font-weight="700" fill="${COL_BID}">◀ 买盘挂单（价格下方）$${usd(d.totBid)}</text>`;
+    /* 左右表头 + 数轴标题 */
+    g += `<text x="${PLOT_L + 6}" y="${PAD.t - 7}" font-size="13" font-weight="700" fill="${COL_BID}">◀ 买盘挂单（价格下方）$${usd(d.totBid)}</text>`;
     g += `<text x="${w - PAD.r - 6}" y="${PAD.t - 7}" text-anchor="end" font-size="13" font-weight="700" fill="${COL_ASK}">卖盘挂单（价格上方）$${usd(d.totAsk)} ▶</text>`;
+    g += `<text x="${PAD.l}" y="${PAD.t - 7}" font-size="9.5" fill="${COL_TXT2}">价位轴</text>`;
     g += `<text x="${cx}" y="${H - 6}" text-anchor="middle" font-size="11.5" fill="${COL_TXT2}">滚轮上下缩放（自动取更深订单簿）· 按住拖动平移 · 双击复位</text>`;
 
     S.g.innerHTML = g;
@@ -415,6 +616,31 @@
       row('现价 / 标记价', num(q.last, dec), '标记 ' + num(q.mark, dec)),
       row('买一 / 卖一', num(d.bestBid, dec), num(d.bestAsk, dec) + (spread > 0 ? ` · 价差 ${num(spread, dec)}` : '')),
     ];
+
+    /* 量能结构带：插在「最厚墙」之后 —— 墙是单点，结构带是区间，二者互补 */
+    const bd = S.showBands ? d.bands : null;
+    if (bd) {
+      const st = [];
+      st.push(row(bd.va && bd.va.tooWide ? '中间聚集带（不显著）' : '中间聚集带（价值区）',
+        bd.va ? '$' + usd(bd.va.usd) : '—',
+        bd.va ? `${num(bd.va.lo, dec)}–${num(bd.va.hi, dec)}` : '', COL_VA));
+      st.push(row('挂单最密集 POC', num(bd.poc.price, dec),
+        '$' + usd(bd.poc.usd) + ' · ' + pct((bd.poc.price - q.last) / (q.last || 1), 2), null));
+      if (bd.upper) st.push(row('上方最薄带', '$' + usd(bd.upper.usd),
+        `稀疏 ${bd.upper.sparsity.toFixed(2)} · ${pct(bd.upper.distPct, 2)}`, COL_UPV));
+      if (bd.lower) st.push(row('下方最薄带', '$' + usd(bd.lower.usd),
+        `稀疏 ${bd.lower.sparsity.toFixed(2)} · ${pct(bd.lower.distPct, 2)}`, COL_DNV));
+      /* 判读：稀疏度越小越接近真空，两侧对比决定「往哪边更好走」 */
+      if (bd.upper && bd.lower) {
+        const diff = bd.lower.sparsity - bd.upper.sparsity;
+        const near = Math.abs(diff) < 0.08;
+        st.push(row('流动性判读',
+          near ? '上下稀薄程度接近' : (diff > 0 ? '上方更薄 → 向上突破阻力更小' : '下方更薄 → 向下跌破阻力更小'),
+          `上 ${bd.upper.sparsity.toFixed(2)} / 下 ${bd.lower.sparsity.toFixed(2)}`,
+          near ? null : (diff > 0 ? 'var(--up)' : 'var(--down)')));
+      }
+      rows.splice(6, 0, ...st);
+    }
     S.cards.innerHTML = rows.join('');
   }
 
@@ -475,6 +701,7 @@
     S.host = host; S.cards = cards; S.meta = meta;
     S.span = lsGet(LS_SPAN, 500);
     if (!SPANS.includes(S.span)) S.span = 500;
+    S.showBands = lsGet(LS_BANDS, true) !== false;
     if (window.ResizeObserver && host) {
       if (S.ro) { try { S.ro.disconnect(); } catch (e) {} }
       S.ro = new ResizeObserver(() => {
@@ -527,6 +754,10 @@
     hasDist: () => !!S.dist,
     dist: () => S.dist,
     book: () => S.book,
+    /* 量能结构带（POC / 价值区 / 上下最薄带） */
+    showBands: () => S.showBands,
+    setBands: on => { S.showBands = !!on; lsSet(LS_BANDS, S.showBands); render(); },
+    bands: () => (S.showBands && S.dist) ? S.dist.bands : null,
     SPANS,
   };
 })();

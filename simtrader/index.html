@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260928b">
+<link rel="stylesheet" href="style.css?v=20260928c">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -233,6 +233,7 @@
             <button data-lsspan="5000" title="现价上下各 5000 个 tick，看得更远但每格更粗">±5000</button>
           </span>
           <span class="liq-unit">tick</span>
+          <button id="lsBands" class="liq-sw" aria-pressed="false" title="叠加「量能结构带」：挂单最密集价位（POC）、中间聚集的价值区、以及上下两侧最稀薄的价格带">量能带</button>
           <button id="lsReset" class="liq-sw" title="恢复自动价格范围（也可在图上双击）">复位视图</button>
         </div>
       </div>
@@ -245,7 +246,12 @@
         <span><i class="ls-dot" style="background:#0a8f4e"></i>买盘挂单（价格下方 · 多头阵营，条向左）</span>
         <span><i class="ls-dot" style="background:#d92c2c"></i>卖盘挂单（价格上方 · 空头阵营，条向右）</span>
         <span><i class="ls-dot" style="background:#2563eb"></i>现价</span>
+        <span><i class="ls-dot" style="background:#6366f1"></i>中间聚集带（价值区，约 70% 挂单所在）</span>
+        <span><i class="ls-dot" style="background:#f97316"></i>上方最薄带</span>
+        <span><i class="ls-dot" style="background:#0891b2"></i>下方最薄带</span>
+        <span><i class="ls-dot" style="background:#111827"></i>挂单最密集价位 POC</span>
         <span>柱长 = 该价位区间内的挂单名义金额（张数 × 合约面值 × 价位）。这是<b>尚未成交的委托</b>，不是未平仓合约（OI）；真实 OI 单独列在右侧卡片里。</span>
+        <span>左侧<b>价位轴</b>把三个量能带纵向标在同一套价格刻度上：<b>实心紫</b>=挂单聚集区、<b>实心橙/青</b>=买卖两侧最稀薄的一段。<b>稀疏度</b>=该段均值÷同侧<b>中位数</b>（订单簿常态是「少量巨墙 + 大量普通单」，用中位数才不会被巨墙拉偏、反过来把均匀挂单误判成真空），越小越接近真空；≥0.5 时标签写「不显著」而不是硬指一个洞。</span>
       </div>
     </section>
   </div>
@@ -432,7 +438,18 @@
         <li><b>视野切换</b>：±200 / ±500 / ±2000 / ±5000 tick（tick = 该合约最小价位变动，BTC 为 0.1、ETH 与黄金为 0.01），默认 <b>±500 tick</b>。滚轮继续放大缩小会自动换用更粗/更细的订单簿粒度重取，状态行会写明当前粒度与覆盖范围</li>
         <li><b>⚠ 挂单 ≠ 未平仓合约</b>：订单簿上的挂单是<b>尚未成交的委托</b>，会随时撤改；未平仓合约（OI，已成交未平仓的持仓）单独列在右侧卡片里，两者不要混着读</li>
         <li><b>标注线</b>：最厚买盘墙、最厚卖盘墙、24h 最高/最低、现价；标签按位置自动下推避免压字</li>
-        <li><b>右侧卡片</b>：盘口方向（按挂单失衡判断）、买/卖盘挂单量与占比、买卖挂单比、最厚买盘墙与卖盘墙、真实未平仓合约、资金费率、现价/标记价、买一/卖一与价差</li>
+        <li><b>右侧卡片</b>：盘口方向（按挂单失衡判断）、买/卖盘挂单量与占比、买卖挂单比、最厚买盘墙与卖盘墙、真实未平仓合约、资金费率、现价/标记价、买一/卖一与价差，开启量能带后追加：中间聚集带、挂单最密集 POC、上下最薄带与流动性判读</li>
+        <li><b>量能结构带</b>（「量能带」按钮开关，默认开）：把订单簿读成一张流动性地图，给出四个层次 ——
+          <b>① POC 挂单最密集价位</b>：单位价位内挂单金额最大的那一格，全图最拥挤的价格；
+          <b>② 中间聚集带（价值区）</b>：从 POC 向两侧贪心扩张到累计 70% 挂单额为止，得到「包含这么多量能的<b>最窄</b>价格区间」（Market Profile 的价值区算法）；
+          <b>③ 上方最薄带</b>：只在<b>卖盘侧</b>滑窗找总额最小的一段 —— 往上突破时阻力最小的路径；
+          <b>④ 下方最薄带</b>：只在<b>买盘侧</b>找 —— 往下砸时阻力最小的路径</li>
+        <li><b>为什么要把买卖两侧分开找空洞</b>：买盘只存在于买一以下、卖盘只存在于卖一以上，两侧在价格上<b>互斥</b>。合成一个数组算总额可以（每格仍是「该价位的挂单总额」，不会重复计数），但用它找「稀薄」会越过买卖分界、被另一侧的 0 拉低，选出横跨两侧的假空洞</li>
+        <li><b>左侧价位轴</b>：紧贴价格刻度的一根竖直窄条，把三个带按同一套价格刻度纵向标出来（紫=聚集区、橙=上方薄、青=下方薄，黑刻=POC、蓝线=现价）。它只画「位置」不画「长度」，与右侧能量柱互补，不会被柱状图挤压</li>
+        <li><b>稀疏度为什么不除以均值</b>：订单簿的常态是<b>少量巨墙 + 大量普通单</b>。用均值做基线时那堵巨墙会把基线抬高（实测：35 格 1000 + 1 格 50000 → 均值 2361），结果<b>均匀的普通挂单反过来被判成稀薄</b>（稀疏度被压到 0.42 而误判成真空）。所以基线取<b>非零格的中位数</b>，对这类离群值稳健</li>
+        <li><b>稀疏度怎么读</b>：= 该段均值 ÷ 同侧挂单的中位数。<b>&lt; 0.5</b> 才算「真的稀薄」；<b>≥ 0.5</b> 时标签老实写成「不显著」，不会硬指一个洞 —— 实测 BTC 在 ±5000 tick 下常出现上下都不达阈值，那时结论就是<b>没有明显空洞</b>，比强行画一个出来诚实</li>
+        <li><b>⚠ 视野越窄越不可信</b>：小视野把盘口切碎后，每格里要么是孤立大单要么几乎为零（ETH ±400 tick 时可见同一视野内 $54 与 $708K 并存），此时「最小量能带」退化成在噪声里挑冠军。<b>价值区宽度超过 75% 视野</b>时标签也会明确写成「无明显聚集带」。想看结构建议用 ±2000 或 ±5000 tick</li>
+        <li><b>⚠ 滑窗的固有语义</b>：窗口宽度固定为视野的 12%，算法回答的是「<b>这么宽</b>的一段里哪段最薄」，不是「任意宽度的空洞在哪」。标签里会写出 <code>宽 N tick</code>，请勿脱离这个尺度解读</li>
         <li>真实发生的爆仓走势仍保留在 <b>K线左侧的多空清算图</b>（按 24h / 3天 / 7天 统计真实强平订单）</li>
       </ul>
       <h4>200 日均线（K 线图上的紫色虚线）</h4>
@@ -514,7 +531,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260928b · 九指标投票定方向（EMA/MACD/ADX/RSI/KDJ/BOLL/OBV/VOL + MA200 位置，赢家≥4票且多于反方）· 1H 定方向 + 15m 与最低周期同向 → 刚凑齐那一根触发一次 · 回测支持 1m 撮合、信号/撮合粒度分离、止损止盈按百分比手动指定并实时算扣费后的保本胜率 · K线叠加200日均线 · 数据有效性自检页 · Gate.io 永续实盘 / 币安现货历史（无未来函数）</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260928c · 九指标投票定方向（EMA/MACD/ADX/RSI/KDJ/BOLL/OBV/VOL + MA200 位置，赢家≥4票且多于反方）· 1H 定方向 + 15m 与最低周期同向 → 刚凑齐那一根触发一次 · 回测支持 1m 撮合、信号/撮合粒度分离、止损止盈按百分比手动指定并实时算扣费后的保本胜率 · 多空热力图增加「量能结构带」（POC / 中间聚集的价值区 / 上下最薄带 + 左侧价位轴）· K线叠加200日均线 · 数据有效性自检页 · Gate.io 永续实盘 / 币安现货历史（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -534,9 +551,9 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260928b"></script>
-<script src="lsmap.js?v=20260928b"></script>
-<script src="strategy.js?v=20260928b"></script>
-<script src="app.js?v=20260928b"></script>
+<script src="liq-map.js?v=20260928c"></script>
+<script src="lsmap.js?v=20260928c"></script>
+<script src="strategy.js?v=20260928c"></script>
+<script src="app.js?v=20260928c"></script>
 </body>
 </html>

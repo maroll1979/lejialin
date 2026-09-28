@@ -1334,6 +1334,21 @@ function initChart() {
     }
     const rBtn = $('#lsReset');
     if (rBtn) rBtn.addEventListener('click', () => window.LsMap.resetView());
+    /* 量能结构带开关（挂单最密集 POC / 中间聚集的价值区 / 上下最薄带） */
+    const bBtn = $('#lsBands');
+    if (bBtn) {
+      const syncBands = () => {
+        const on = !!window.LsMap.showBands();
+        bBtn.classList.toggle('on', on);
+        bBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        bBtn.textContent = on ? '量能带 ✓' : '量能带';
+      };
+      bBtn.addEventListener('click', () => {
+        window.LsMap.setBands(!window.LsMap.showBands());
+        syncBands();
+      });
+      syncBands();
+    }
   }
 }
 
