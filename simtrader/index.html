@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260925c">
+<link rel="stylesheet" href="style.css?v=20260925d">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -75,7 +75,10 @@
         </div>
       </div>
     </div>
-    <div id="chartBox"><div id="chart"></div><div class="chart-note" id="chartNote"></div></div>
+    <div id="chartBox"><div id="chart"></div>
+      <div class="ma200-legend" id="ma200Legend" hidden></div>
+      <div class="chart-note" id="chartNote"></div>
+    </div>
 
     <!-- ★ 交易提示：K线图正下方，四个独立格子 -->
     <div class="sig-cards-wrap">
@@ -224,6 +227,7 @@
     <button data-tab="pos" class="active">持仓与成交</button>
     <button data-tab="bt">历史回测（近10年）</button>
     <button data-tab="doc">数据与模型说明</button>
+    <button data-tab="chk">数据有效性自检</button>
   </div>
 
   <div class="tab-page" id="tab-pos">
@@ -255,6 +259,31 @@
       <button id="btnBacktest" class="btn-ghost">开始回测当前品种</button>
     </div>
     <div id="btResult"></div>
+  </div>
+
+  <!-- ★ 数据有效性自检：逐个实打接口，把「够不够新」摆出来 -->
+  <div class="tab-page hidden" id="tab-chk">
+    <div class="chk-head">
+      <div>
+        <b>逐个实打所有外部接口</b>，报告 HTTP 状态、往返延迟、最新数据时间与新鲜度判定。
+        页面平时只在你不知道的地方默默降级 —— 这里把它摊开，让你能自己复核。
+      </div>
+      <div class="chk-act">
+        <button id="btnSrcCheck" class="btn-ghost">立即自检</button>
+        <label class="chk-auto"><input type="checkbox" id="chkAuto"> 每 5 分钟自动跑</label>
+      </div>
+    </div>
+    <div id="chkSummary" class="chk-sum">尚未自检 · 点「立即自检」开始</div>
+    <div id="chkBody" class="chk-body"></div>
+    <ul class="chk-doc">
+      <li><b>新鲜度怎么算</b>：K 线看最新一根的<b>开始时间</b>（最新一根天然是「进行中」的，它的结束时间落在未来属正常）；
+        逐笔成交看<b>最后一笔的成交时刻</b>；订单簿与 ticker 是快照、实时性由<b>往返延迟</b>体现；美债是<b>日频</b>数据，隔夜更新属正常。</li>
+      <li><b>为何区分主源与辅助源</b>：辅助源（跨平台比价、备用接口）失败只影响参考信息，不影响交易撮合；
+        主源失败才说明这条数据链路真的断了。</li>
+      <li><b>已知的两条限制</b>：① 财政部 fiscaldata JSON 接口已全路径 404（官方下架），主源已改为官网 CSV 直连；
+        ② OKX / Coinbase / Bitstamp 在部分网络环境下域名不可达，此时比价栏留空，属网络环境问题而非程序故障。</li>
+      <li><b>命令行版</b>：<code>node probe-src.js</code> —— 独立于浏览器在终端跑同一套判定，便于无头环境下巡检。</li>
+    </ul>
   </div>
 
   <div class="tab-page hidden" id="tab-doc">
@@ -376,6 +405,36 @@
         <li><b>右侧卡片</b>：盘口方向（按挂单失衡判断）、买/卖盘挂单量与占比、买卖挂单比、最厚买盘墙与卖盘墙、真实未平仓合约、资金费率、现价/标记价、买一/卖一与价差</li>
         <li>真实发生的爆仓走势仍保留在 <b>K线左侧的多空清算图</b>（按 24h / 3天 / 7天 统计真实强平订单）</li>
       </ul>
+      <h4>200 日均线（K 线图上的紫色虚线）</h4>
+      <ul>
+        <li><b>口径固定为日线</b>：一律以<b>日线收盘价</b>算 200 日简单移动平均（SMA200），
+          与你在看 5 分钟还是 1 小时无关 —— 三个周期看到的是<b>同一条日线级别长均线</b>。
+          这样它才保得住「日线级别牛熊分界」的含义；若按当前周期算 200 根，5m 图上就只是 200 根 5 分钟均线，语义完全变了。</li>
+        <li><b>数据来源</b>：Gate.io 永续的日线 K 线，取 400 根（200 根冗余，保证能算出 200 个以上的均线点而不是末端一两个）。美债品种没有 K 线，故不画此线。</li>
+        <li><b>图例读数</b>（图表左上角）：<b>MA200 数值</b> · <b>现价偏离百分比</b>（价在上方为红、下方为绿）·
+          <b>均线自身方向</b>（上行 / 下行 / 走平，按日环比判断）。看得见「价格在均线上方多少」与「均线本身在往上还是往下」，
+          比只看价格在上方信息量更大。</li>
+        <li><b>为什么看不到整天都有一段弯折</b>：均值行情本身是日频的，5 分钟图只跨约 1 天，这条线在图上是近似水平的；
+          切到 1 小时图（跨约 12 天）能看到完整的日线级走势。</li>
+        <li><b>刷新节奏</b>：日频数据变化慢，缓存 30 分钟，不跟着 5 分钟一次的行情刷新重复调接口。</li>
+      </ul>
+      <h4>数据有效性自检（底部标签页）</h4>
+      <ul>
+        <li><b>为什么单开一页</b>：行情页面最忌讳的是<b>数据悄悄不动了、界面却看起来一切正常</b>。
+          这一页逐个<b>实际打一遍</b>所有外部接口，把 HTTP 状态、往返延迟、最新数据时间与新鲜度判定摊开来，你可以随时自己复核。</li>
+        <li><b>检查项</b>：K线（当前品种/周期）· K线 1d（均线数据源）· tickers 实时价 · trades 逐笔成交 ·
+          contracts 合约详情 · liq_orders 强平单 · order_book 盘口 · <b>WebSocket 推送</b> · 美债主源与备用源 · OKX / Coinbase / Bitstamp 比价。</li>
+        <li><b>主源与辅助源分开算</b>：辅助源（跨平台比价、备用接口）失败只影响参考信息，不影响<b>撮合与判信号</b>；
+          只有主源失败才说明这条数据链路真的断了。汇总行分别给出 X/N。</li>
+        <li><b>新鲜度怎么判定</b>：K 线看最新一根的<b>开始时间</b>（最新一根天然是「进行中」的，它的结束时间落在未来属正常，不能据此说数据过期）；
+          逐笔成交看<b>最后一笔的成交时刻</b>；订单簿与 ticker 是快照，实时性由<b>往返延迟</b>体现；美债是<b>日频</b>数据，隔夜更新属正常，超过 7 天才判停滞。</li>
+        <li><b>WebSocket 这一项不只看「连着」</b>：还会检查<b>最近真的收到过成交推送</b>。
+          连接开着但两分钟没消息，照样判不可用 —— 「连着」和「在推送」是两回事。</li>
+        <li><b>当前实测结果（本终端网络环境）</b>：主源 <b>9/9 全部可用</b>；辅助源 4 项降级 ——
+          ① 财政部 fiscaldata JSON 接口官方已下架（全路径 404），主源已改为官网 CSV 直连；
+          ② OKX / Coinbase / Bitstamp 域名在本网络环境不可达（6 秒超时），比价栏会留空，属网络环境问题而非程序故障。</li>
+        <li><b>命令行版</b>：<code>node probe-src.js</code> —— 不依赖浏览器，在终端跑同一套判定，便于无头环境巡检。</li>
+      </ul>
       <h4>K线交互（看得更清楚）</h4>
       <ul>
         <li><b>鼠标滚轮上下滚动</b> = 以光标位置为锚点缩放K线；<b>按住左键左右拖动</b> = 平移；<b>Shift+滚轮</b> = 横向平移；拖动时间轴/价格轴 = 缩放；双击轴 = 复位</li>
@@ -425,7 +484,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260925c · 多周期层级评分 v2.1（第1-14节口径校正：4H三要素·结构0.10ATR阈值·七档区间·Confirmed/Live双状态）· 1H20/30m25/15m30/5m25=100分 + Gate · 八因子状态量信号（不看金叉死叉与绝对数值） · 5m市场结构触发（pivot·CHOCH·Retest·BOS） · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260925d · 多周期层级评分 v2.1（第1-14节口径校正：4H三要素·结构0.10ATR阈值·七档区间·Confirmed/Live双状态）· 1H20/30m25/15m30/5m25=100分 + Gate · K线叠加200日均线（日线SMA200）· 新增「数据有效性自检」页，逐个实打所有外部接口 · 八因子状态量信号（不看金叉死叉与绝对数值） · 5m市场结构触发（pivot·CHOCH·Retest·BOS） · 信号画在K线 · Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -445,10 +504,10 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260925c"></script>
-<script src="lsmap.js?v=20260925c"></script>
-<script src="strategy.js?v=20260925c"></script>
-<script src="v21.js?v=20260925c"></script>
-<script src="app.js?v=20260925c"></script>
+<script src="liq-map.js?v=20260925d"></script>
+<script src="lsmap.js?v=20260925d"></script>
+<script src="strategy.js?v=20260925d"></script>
+<script src="v21.js?v=20260925d"></script>
+<script src="app.js?v=20260925d"></script>
 </body>
 </html>

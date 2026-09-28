@@ -7,8 +7,8 @@
    + ⑤ 阈值扫描（§14.6：最后才优化阈值）
    用法：node cmp-v21.js [SYMBOL] [YEARS]
    ============================================================ */
-const S = require('./simtrader/strategy.js');
-const V = require('./simtrader/v21.js');
+const S = require('./strategy.js');
+const V = require('./v21.js');
 const cache = require('./fetch-cache.js');
 
 const sym = process.argv[2] || 'BTCUSDT';

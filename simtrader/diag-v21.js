@@ -1,6 +1,6 @@
 /* v2.1 分层评分诊断：分值分布 / Gate 各条件命中率 / 总分分布 */
-const S = require('./simtrader/strategy.js');
-const V = require('./simtrader/v21.js');
+const S = require('./strategy.js');
+const V = require('./v21.js');
 const cache = require('./fetch-cache.js');
 
 const sym = process.argv[2] || 'BTCUSDT';

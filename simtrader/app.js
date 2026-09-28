@@ -699,7 +699,9 @@ const GATE_FUT_SOURCE = {
     let q = `contract=${pair}&limit=${opt.limit || 1000}`;
     if (opt.endTime != null) q += `&to=${Math.floor(opt.endTime / 1000)}`;
     const j = await netJson(`${GATE_HOST}/api/v4/futures/usdt/trades?${q}`);
-    return (j || []).map(t => ({ T: Math.round(+(t.create_time_ms != null ? t.create_time_ms : t.create_time * 1000)), p: t.price, q: t.size }));
+    /* 实测陷阱：Gate 的 create_time_ms 与 create_time **同为秒**（值相等，只是小数精度不同）。
+       谁把它当毫秒读，谁就会得到 1970 年的成交时间。这里统一按 create_time（秒）×1000。 */
+    return (j || []).map(t => ({ T: Math.round(+t.create_time * 1000), p: t.price, q: t.size }));
   },
   async ticker24h(sym) {
     const pair = GATE_FUT_PAIR[sym]; if (!pair) throw new NetError('unsupported', 'unsupported');
@@ -1072,6 +1074,9 @@ const state = {
   candleSeries: null,
   ema9Series: null,
   ema21Series: null,
+  ma200Series: null,
+  ma200Data: {},        // 按品种缓存 { ts, points:[{time,value}], last, at, prev }
+  ma200Busy: null,      // 同一品种的并发请求合并，避免切周期时重复打日线接口
   acct: loadAcct(),
 };
 const SYM_MAP = {};
@@ -1282,8 +1287,12 @@ function initChart() {
     upColor: '#0a8f4e', downColor: '#d92c2c', borderUpColor: '#0a8f4e', borderDownColor: '#d92c2c',
     wickUpColor: '#0a8f4e', wickDownColor: '#d92c2c',
   });
-  state.ema9Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1, title: 'EMA9', priceLineVisible: false });
-  state.ema21Series = chart.addLineSeries({ color: '#2563eb', lineWidth: 1, title: 'EMA21', priceLineVisible: false });
+  state.ma200Series = chart.addLineSeries({
+    color: '#7c3aed', lineWidth: 2, title: 'MA200(日)',
+    priceLineVisible: false, lastValueVisible: true,
+    lineStyle: 2,            // LightweightCharts LineStyle.Dashed —— 与日内 EMA 区分开，一眼看出是日线级别
+    crosshairMarkerVisible: true,
+  });
   new ResizeObserver(() => chart.applyOptions({ width: $('#chart').clientWidth, height: $('#chart').clientHeight })).observe($('#chart'));
   /* 多空清算图（Gate 永续强平）：K线左侧强度条 + 清算价位横线，随缩放/平移重绘 */
   if (window.LiqMap) {
@@ -1400,6 +1409,369 @@ async function loadChart(force) {
     note.classList.add('stale');
   }
 }
+/* ============================================================
+   数据有效性自检
+   ------------------------------------------------------------
+   行情页面最忌讳的是数据悄悄不动了、界面却看起来一切正常。
+   这里逐个实打每个外部接口，把 HTTP 状态 / 延迟 / 数据新鲜度摊开来，
+   并明确区分「主源不可用」与「辅助源降级」。判定口径与命令行版 probe-src.js 一致。
+*/
+const CHK_DATA = { rows: [], running: false, lastRun: 0, timer: 0 };
+
+function chkAgo(ms) {
+  if (ms == null || !isFinite(ms)) return '—';
+  if (ms < 0) return '未来 ' + Math.abs(Math.round(ms / 1000)) + 's';
+  if (ms < 60000) return Math.round(ms / 1000) + 's 前';
+  if (ms < 3600000) return (ms / 60000).toFixed(1) + ' 分钟前';
+  if (ms < 86400000) return (ms / 3600000).toFixed(1) + ' 小时前';
+  return (ms / 86400000).toFixed(1) + ' 天前';
+}
+/* K 线新鲜度看「最新一根的开始时间」；最新一根天然是「进行中」的，
+   它的结束时间落在未来属正常，不能据此判断数据过期 */
+function chkKlineFresh(candles, sec) {
+  if (!candles || !candles.length) throw new Error('无数据');
+  const last = candles[candles.length - 1];
+  if (!(last.close > 0)) throw new Error('收盘价无效');
+  const ago = Date.now() - last.time * 1000;
+  if (ago > sec * 1000 * 2.5) throw new Error('数据停滞：最新一根已开于 ' + chkAgo(ago));
+  return { ago: Math.max(0, ago), note: (last.time * 1000 + sec * 1000 > Date.now() ? '进行中' : '已收线') };
+}
+
+const CHK_DEFS = [
+  {
+    key: 'kline', name: 'K线（当前品种 / 当前周期）', host: 'Gate.io 永续', aux: false,
+    async run() {
+      const inst = instOf(state.current);
+      if (inst.type === 'ust') return { skip: true, note: '美债无 K 线（日频收益率曲线）' };
+      /* app.js 里没有 TF_SEC 表，周期秒数统一由 Strategy 提供，避免两处各写一份 */
+      const sec = (window.Strategy.TF_SEC && window.Strategy.TF_SEC[state.tf]) || 300;
+      const c = await trySources(KLINE_SOURCES, 'kline', 'K线', s => callSym((x, tf, n) => s.klines(x, tf, n), inst.sym, state.tf, 300));
+      const f = chkKlineFresh(c, sec);
+      return { ago: f.ago, note: `${c.length} 根 · ${TF_NAME[state.tf]} · 最新一根${f.note} · close ${fmt(c[c.length - 1].close, 2)}` };
+    },
+  },
+  {
+    key: 'kline1d', name: 'K线 1d（200 日均线数据源）', host: 'Gate.io 永续', aux: false,
+    async run() {
+      const inst = instOf(state.current);
+      if (inst.type === 'ust') return { skip: true, note: '美债无 K 线' };
+      const c = await trySources(KLINE_SOURCES, 'kline', '日线', s => callSym((x, tf, n) => s.klines(x, tf, n), inst.sym, '1d', 400));
+      const f = chkKlineFresh(c, 86400);
+      const st = window.Strategy;
+      const r = st.ma200FromDaily(c, 200);
+      if (!r.points.length) throw new Error('日线不足 200 根：' + c.length);
+      return { ago: f.ago, note: `${c.length} 根 · 可算 ${r.n} 个 MA200 点 · MA200 = ${fmt(r.last, 2)}` };
+    },
+  },
+  {
+    key: 'ticker', name: 'tickers（实时价 / 24h 涨跌）', host: 'Gate.io 永续', aux: false,
+    async run() {
+      const inst = instOf(state.current);
+      const o = await trySources(KLINE_SOURCES, 'price', '实时价', s => callSyms(x => s.prices(x), [inst.sym]));
+      const p = o[inst.sym];
+      if (!(p > 0)) throw new Error('价格无效');
+      return { ago: 0, note: `last ${fmt(p, 2)}` };
+    },
+  },
+  {
+    key: 'trades', name: 'trades（逐笔成交）', host: 'Gate.io 永续', aux: false,
+    async run() {
+      const r = await netFetch(`${GATE_HOST}/api/v4/futures/usdt/trades?contract=BTC_USDT&limit=50`, { timeout: 9000 });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      if (!Array.isArray(j) || !j.length) throw new Error('返回空');
+      /* Gate 的 create_time_ms 与 create_time 同为秒（只是精度不同），按毫秒解释会得到 1970 年 */
+      let newest = j[0];
+      j.forEach(x => { if (+x.create_time > +newest.create_time) newest = x; });
+      const ago = Date.now() - Math.round(+newest.create_time * 1000);
+      if (ago > 10 * 60000) throw new Error('成交停摆：最后一笔 ' + chkAgo(ago));
+      return { ago: Math.max(0, ago), note: `${j.length} 笔 · 最新 ${fmt(+newest.price, 2)}` };
+    },
+  },
+  {
+    key: 'contract', name: 'contracts（合约详情 / 面值）', host: 'Gate.io 永续', aux: false,
+    async run() {
+      const r = await netFetch(`${GATE_HOST}/api/v4/futures/usdt/contracts/BTC_USDT`, { timeout: 9000 });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      if (!(parseFloat(j && j.quanto_multiplier) > 0)) throw new Error('面值缺失');
+      return { ago: 0, note: `quanto ${j.quanto_multiplier} · tick ${j.order_price_round}` };
+    },
+  },
+  {
+    key: 'liq', name: 'liq_orders（清算图强平单）', host: 'Gate.io 永续', aux: false,
+    async run() {
+      const t = Math.floor(Date.now() / 1000);
+      const r = await netFetch(`${GATE_HOST}/api/v4/futures/usdt/liq_orders?contract=BTC_USDT&limit=1000&from=${t - 3599}&to=${t}`, { timeout: 9000 });
+      if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 400 ? '（窗口须 ≤1 小时）' : ''));
+      const j = await r.json();
+      if (!Array.isArray(j)) throw new Error('返回非数组');
+      let newest = 0;
+      j.forEach(o => { const x = +o.time; if (x > newest) newest = x; });
+      if (!newest) return { ago: null, note: '接口通，近 1 小时内无强平单（0 条）' };
+      const ago = Date.now() - newest * 1000;
+      if (ago > 24 * 3600000) throw new Error('强平单停摆：最后一条 ' + chkAgo(ago));
+      return { ago: Math.max(0, ago), note: `近 1h ${j.length} 条` };
+    },
+  },
+  {
+    key: 'book', name: 'order_book（多空热力图盘口）', host: 'Gate.io 永续', aux: false,
+    async run() {
+      const r = await netFetch(`${GATE_HOST}/api/v4/futures/usdt/order_book?contract=BTC_USDT&limit=300&interval=0`, { timeout: 9000 });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      const b = j.bids && j.bids[0] ? +j.bids[0].p : 0, a = j.asks && j.asks[0] ? +j.asks[0].p : 0;
+      if (!(a > b)) throw new Error('盘口为空或买卖价倒挂');
+      return { ago: 0, note: `bid ${fmt(b, 2)} / ask ${fmt(a, 2)} · 价差 ${((a - b) / b * 100).toFixed(3)}%` };
+    },
+  },
+  {
+    key: 'ws', name: 'WebSocket 逐笔推送', host: 'Gate.io 永续', aux: false,
+    async run() {
+      if (!state.wsAlive) throw new Error('连接未建立（会自动重连）');
+      /* 「连着」不等于「在推送」—— 必须看最近真的收到过成交 */
+      const gap = state.wsLastTickRaw ? Date.now() - state.wsLastTickRaw : null;
+      if (gap == null) throw new Error('连接已建立但尚未收到任何推送');
+      if (gap > 120000) throw new Error('连接开着但已 ' + chkAgo(gap) + ' 没有推送');
+      return { ago: gap, note: `最后一条推送 ${chkAgo(gap)}` };
+    },
+  },
+  {
+    key: 'ust', name: '美债收益率（主源）', host: '美国财政部官网 CSV', aux: false,
+    async run() {
+      const y = new Date().getUTCFullYear();
+      const url = `https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/${y}/all?type=daily_treasury_yield_curve&field_tdr_date_value=${y}&page&_format=csv`;
+      const r = await netFetch(url, { timeout: 12000 });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const txt = await r.text();
+      const lines = txt.trim().split(/\r?\n/);
+      if (lines.length < 2) throw new Error('CSV 无数据行');
+      const first = lines[1].split(',');
+      const m = String(first[0]).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (!m) throw new Error('日期格式未识别 ' + first[0]);
+      const dt = new Date(`${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}T00:00:00Z`).getTime();
+      const ago = Date.now() - dt;
+      /* 日频数据：隔夜更新正常，超过 7 天才是真停了 */
+      if (ago > 7 * 86400000) throw new Error('数据停滞 ' + chkAgo(ago));
+      return { ago: Math.max(0, ago), note: `${lines.length} 行 · 最新 ${first[0]}` };
+    },
+  },
+  {
+    key: 'ustApi', name: '美债收益率（备用源）', host: 'fiscaldata API', aux: true,
+    async run() {
+      const r = await netFetch('https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/daily_treasury_par_yield_curve_rates?sort=-record_date&page[size]=5', { timeout: 9000 });
+      if (!r.ok) throw new Error('HTTP ' + r.status + '（官方已下架该数据集，主源走官网 CSV）');
+      const j = await r.json();
+      if (!j.data || !j.data.length) throw new Error('data 缺失');
+      return { ago: null, note: '可用 · ' + j.data[0].record_date };
+    },
+  },
+  {
+    key: 'okx', name: '比价 OKX', host: 'OKX', aux: true,
+    async run() {
+      const j = await jFetch('https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT-SWAP', 6000);
+      if (!j || !j.data || !j.data[0]) throw new Error('不可达或返回异常');
+      return { ago: null, note: 'last ' + (+j.data[0].last).toFixed(2) };
+    },
+  },
+  {
+    key: 'cb', name: '比价 Coinbase', host: 'Coinbase', aux: true,
+    async run() {
+      const j = await jFetch('https://api.exchange.coinbase.com/products/BTC-USD/ticker', 6000);
+      if (!j || !(+j.price > 0)) throw new Error('不可达或返回异常');
+      return { ago: null, note: 'last ' + (+j.price).toFixed(2) };
+    },
+  },
+  {
+    key: 'bs', name: '比价 Bitstamp', host: 'Bitstamp', aux: true,
+    async run() {
+      const j = await jFetch('https://www.bitstamp.net/api/v2/ticker/btcusd/', 6000);
+      if (!j || !(+j.last > 0)) throw new Error('不可达或返回异常');
+      return { ago: null, note: 'last ' + (+j.last).toFixed(2) };
+    },
+  },
+];
+
+async function runSrcCheck() {
+  if (CHK_DATA.running) return;
+  CHK_DATA.running = true;
+  const body = $('#chkBody'), btn = $('#btnSrcCheck');
+  if (btn) { btn.disabled = true; btn.textContent = '自检中…'; }
+  if (body) body.innerHTML = '<div class="chk-wait">正在逐个实打接口…</div>';
+  const out = await Promise.all(CHK_DEFS.map(async d => {
+    const t0 = Date.now();
+    try {
+      const r = await d.run();
+      return { def: d, ok: true, skip: !!r.skip, ms: Date.now() - t0, ago: r.ago, note: r.note || '' };
+    } catch (e) {
+      return { def: d, ok: false, ms: Date.now() - t0, err: (e && e.message) ? e.message : String(e) };
+    }
+  }));
+  CHK_DATA.rows = out; CHK_DATA.lastRun = Date.now(); CHK_DATA.running = false;
+  if (btn) { btn.disabled = false; btn.textContent = '立即自检'; }
+  renderSrcCheck();
+}
+
+function renderSrcCheck() {
+  const body = $('#chkBody'), sum = $('#chkSummary');
+  if (!body || !sum) return;
+  const rows = CHK_DATA.rows;
+  if (!rows.length) { sum.textContent = '尚未自检 · 点「立即自检」开始'; return; }
+  const main = rows.filter(r => !r.def.aux), aux = rows.filter(r => r.def.aux);
+  const mainFail = main.filter(r => !r.ok).map(r => r.def.name);
+  const auxDown = aux.filter(r => !r.ok).map(r => r.def.name);
+  const skipped = rows.filter(r => r.skip).map(r => r.def.name);
+
+  sum.className = 'chk-sum ' + (mainFail.length ? 'bad' : 'ok');
+  sum.innerHTML = `<b>主源 ${main.length - mainFail.length}/${main.length}</b>` +
+    (mainFail.length ? ` <span class="bad-t">不可用：${mainFail.join('、')}</span>` : ' <span class="ok-t">全部可用</span>') +
+    ` · <b>辅助源 ${aux.length - auxDown.length}/${aux.length}</b>` +
+    (auxDown.length ? ` <span class="warn-t">降级中：${auxDown.join('、')}</span>` : '') +
+    (skipped.length ? ` · <span class="mute-t">不适用：${skipped.join('、')}</span>` : '') +
+    ` · <span class="mute-t">${new Date(CHK_DATA.lastRun).toLocaleTimeString('zh-CN')} 跑于 ${chkAgo(Date.now() - CHK_DATA.lastRun)}</span>`;
+
+  const rowHtml = r => {
+    const st = r.skip ? 'skip' : (r.ok ? 'ok' : (r.def.aux ? 'aux' : 'bad'));
+    const tag = r.skip ? '不适用' : (r.ok ? '可用' : (r.def.aux ? '降级' : '不可用'));
+    return `<div class="chk-row ${st}">
+      <span class="chk-n">${r.def.name}</span>
+      <span class="chk-h">${r.def.host}</span>
+      <span class="chk-s"><i class="chk-dot ${st}"></i>${tag}</span>
+      <span class="chk-ms">${r.ms}ms</span>
+      <span class="chk-f">${r.ok || r.skip ? chkAgo(r.ago) : '—'}</span>
+      <span class="chk-i">${r.ok || r.skip ? (r.note || '') : r.err}</span>
+    </div>`;
+  };
+  const mainRows = main.map(rowHtml).join(''), auxRows = aux.map(rowHtml).join('');
+  body.innerHTML =
+    `<div class="chk-grp"><div class="chk-gh">主源 —— 这些不可用会让对应功能真的失效</div>${mainRows}</div>` +
+    `<div class="chk-grp"><div class="chk-gh">辅助源 —— 降级只影响参考信息，不影响撮合</div>${auxRows}</div>`;
+}
+
+function bindSrcCheck() {
+  const btn = $('#btnSrcCheck'), auto = $('#chkAuto');
+  if (btn) btn.addEventListener('click', () => runSrcCheck());
+  if (auto) {
+    const KEY = 'simtrader_chk_auto';
+    let on = false;
+    try { on = localStorage.getItem(KEY) === '1'; } catch (e) {}
+    auto.checked = on;
+    const sync = () => {
+      clearInterval(CHK_DATA.timer);
+      if (auto.checked) CHK_DATA.timer = setInterval(() => { if (!document.hidden) runSrcCheck(); }, 5 * 60000);
+    };
+    auto.addEventListener('change', () => {
+      try { localStorage.setItem(KEY, auto.checked ? '1' : '0'); } catch (e) {}
+      sync();
+    });
+    sync();
+  }
+  /* 切到自检页时自动跑一次，省得用户还得再点一次按钮 */
+  document.querySelectorAll('[data-tab]').forEach(b => {
+    b.addEventListener('click', () => {
+      if (b.dataset.tab !== 'chk') return;
+      if (!CHK_DATA.lastRun || Date.now() - CHK_DATA.lastRun > 30000) runSrcCheck();
+      else renderSrcCheck();
+    });
+  });
+}
+
+/* ============================================================
+   200 日均线（日线 SMA200）
+   ------------------------------------------------------------
+   一律以「日线」为单位计算，与当前图表周期无关 —— 切到 5m/15m/1h 看到的都是同一条日线级别长均线。
+   取财要点：
+   ① 多取 200 根冗余日线（共 400 根），保证能算出足够长的均线历史，而不是只有末端一两个点   ② 日线点必须与 K 线时间窗求交集后再喂给图表。若把全部 400 天日线直接塞进去，
+      chart.timeScale().fitContent() 会把可视范围拉到 400 天，5m 图瞬间被压成一根竖线
+   ③ 日频数据变化慢，缓存 30 分钟，不跟着 5 分钟一次的行情刷新重复调接口
+*/
+const MA200_N = 200, MA200_EXTRA = 200, MA200_TTL = 30 * 60 * 1000;
+
+async function ensureMa200(inst) {
+  if (!inst || inst.type === 'ust') return null;   // 美债是日频收益率曲线，没有 K 线，无均线可言
+  const key = inst.sym;
+  const hit = state.ma200Data[key];
+  if (hit && Date.now() - hit.ts < MA200_TTL) return hit;
+  /* 同一品种的并发请求合并：切换周期时会连续触发，没必要重复打接口 */
+  if (state.ma200Busy && state.ma200Busy.key === key) return await state.ma200Busy.p;
+  const p = (async () => {
+    try {
+      const d = await fetchKlines(inst.sym, '1d', MA200_N + MA200_EXTRA);
+      /* 计算走 strategy.js 的共享实现，UI 不另抄一份 —— 口径变更时只改一处 */
+      const st = window.Strategy;
+      const r = st.ma200FromDaily(d, MA200_N);
+      if (!r.points.length) throw new Error(r.need ? ('日线不足 ' + r.need + ' 根：' + d.length) : '均线为空');
+      const out = { ts: Date.now(), points: r.points, last: r.last, prevDay: r.prevDay, err: '' };
+      state.ma200Data[key] = out;
+      return out;
+    } catch (e) {
+      /* 取不到就明确记下原因并在图例里写出来，不要静默留一条没数据的线 */
+      const out = { ts: Date.now(), points: [], last: null, prevDay: null, err: e && e.message ? e.message : String(e) };
+      state.ma200Data[key] = out;
+      return out;
+    } finally {
+      if (state.ma200Busy && state.ma200Busy.key === key) state.ma200Busy = null;
+    }
+  })();
+  state.ma200Busy = { key, p };
+  return await p;
+}
+
+/* 把日线 MA200 裁剪到当前 K 线的时间窗：只保留与 K 线有交集的点（首尾各留 1 天余量保证连线不断）。
+   实际算法走 strategy.js 的共享实现。 */
+function ma200PointsInWindow(points, candles) {
+  const st = window.Strategy;
+  return st ? st.maWindowProject(points, candles, 86400) : points;
+}
+
+/* 画 200 日均线 + 更新图例。异步取数，取完回填 —— K 线主体不等它，避免日线接口慢拖慢整屏刷新 */
+function paintMa200(inst, candles) {
+  const box = $('#ma200Legend');
+  const ser = state.ma200Series;
+  if (!ser) return;
+  if (!inst || inst.type === 'ust') {              // 美债没有 K 线 —— 隐藏而不是留一条空线
+    ser.setData([]);
+    if (box) { box.hidden = true; box.textContent = ''; }
+    return;
+  }
+  ensureMa200(inst).then(m => {
+    if (!m || state.current !== inst.id) return;   // 期间已切走 → 丢弃这次结果
+    if (box) box.hidden = false;
+    if (!m.points || !m.points.length) {
+      ser.setData([]);
+      if (box) {
+        box.className = 'ma200-legend err';
+        box.textContent = 'MA200(日) 取不到：' + (m.err || '未知原因');
+      }
+      return;
+    }
+    ser.setData(ma200PointsInWindow(m.points, candles));
+    renderMa200Legend(m, box);
+  }).catch(e => {
+    if (box) { box.className = 'ma200-legend err'; box.textContent = 'MA200(日) 加载失败：' + (e && e.message || e); }
+  });
+}
+
+function renderMa200Legend(m, box) {
+  if (!box) return;
+  const px = state.prices[state.current];
+  const last = m.last;
+  if (!isFinite(last)) { box.className = 'ma200-legend'; box.textContent = 'MA200(日) —'; return; }
+  const dev = isFinite(px) && px ? (px / last - 1) * 100 : null;
+  const above = dev != null && dev >= 0;
+  /* 均线本身的方向用日环比判断，比单看价格在上方更有信息量 */
+  const rising = isFinite(m.prevDay) && last > m.prevDay;
+  const flat = isFinite(m.prevDay) && Math.abs(last / m.prevDay - 1) < 0.00005;
+  if (box._ma === m.ts && box._px === px) return;
+  box._ma = m.ts; box._px = px;
+  box.className = 'ma200-legend';
+  box.innerHTML = `<i class="ma200-swatch"></i><b>MA200(日)</b> ` +
+    `<span class="mv">${fmt(last, last >= 1000 ? 0 : 2)}</span>` +
+    (dev != null
+      ? `<span class="md ${above ? 'up' : 'down'}">价${above ? '在上方' : '在下方'} ${above ? '+' : ''}${dev.toFixed(2)}%</span>`
+      : '') +
+    `<span class="mt ${rising ? 'up' : flat ? '' : 'down'}">均线${flat ? '走平' : (rising ? '上行' : '下行')}</span>`;
+}
 function paintChart(candles) {
   const inst = instOf(state.current);
   state.candleSeries.setData(candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
@@ -1407,6 +1779,7 @@ function paintChart(candles) {
   const e9 = ema(closes, 9), e21 = ema(closes, 21);
   state.ema9Series.setData(candles.map((c, i) => ({ time: c.time, value: e9[i] })).filter(x => x.value));
   state.ema21Series.setData(candles.map((c, i) => ({ time: c.time, value: e21[i] })).filter(x => x.value));
+  paintMa200(inst, candles);
   /* 只在「首次加载 / 换品种 / 换周期」时自适应铺满；之后的数据刷新保留用户当前的缩放与拖动位置 */
   const fitKey = state.current + '|' + state.tf;
   if (state.chartFitKey !== fitKey) {
@@ -2176,6 +2549,7 @@ function connectTradeStream() {
   wsConn.onmessage = (ev) => {
     let d;
     try { d = JSON.parse(ev.data); } catch (e) { return; }
+    state.wsLastTickRaw = Date.now();      // 自检用：区分「连接开着」与「真的在推送」
     const res = d && (d.result || (d.data && d.data.result));
     if (!Array.isArray(res)) return;
     res.forEach(t => {
@@ -3623,6 +3997,7 @@ function boot() {
   initRefreshCtl();                     // 右上角刷新控件（立即刷新 + 档位选择 + 倒计时）
   scheduleRefresh();                    // 按已保存/默认档位启动定时刷新
   initDataSourceCtl();                  // 数据源状态条 + 手动锁定主源
+  bindSrcCheck();                       // 数据有效性自检（tab-chk）—— 切到该页自动实打所有接口
   initLiqMapCtl();                      // 多空清算图：开关 + 状态文字 + 定时增量刷新
   probeSources();                       // 探测 Gate.io 永续延迟，写入健康度并显示到状态条
   netHint = (t) => { const n = $('#chartNote'); if (n && t) { n.textContent = t; n.classList.add('stale'); } };

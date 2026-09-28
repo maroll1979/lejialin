@@ -1291,7 +1291,89 @@
     backtest: backtest,
     summarize: summarize,
     defaultTpsl: defaultTpsl,
+
+    /* ---------- 长周期均线（200 日均线） ----------
+       这段口径放在这里而不是 app.js，是为了让它能被离线测试覆盖；
+       页面 UI 只负责调用，绝不自己再抄一份同样的算法。
+       三个函数都是纯函数，输出可被独立重算验证。 */
+    smaCalc: smaCalc, ma200FromDaily: ma200FromDaily, maWindowProject: maWindowProject,
   };
+
+  /* ============================================================
+     200 日均线（日线 SMA200）—— 纯函数，与 UI 解耦
+     ------------------------------------------------------------
+     「200 日均线」一律以**日线**为单位计算，与当前图表显示什么周期无关。
+     切到 5m / 15m / 1h 时看到的必须是同一条日线级别的长均线，
+     否则「日线级别牛熊分界」这个语义就不成立了。
+  */
+
+  /* 简单移动平均：前 p−1 根返回 null（不足窗口），之后每根返回窗口均值 */
+  function smaCalc(vals, p) {
+    const out = new Array(vals.length);
+    let sum = 0;
+    for (let i = 0; i < vals.length; i++) {
+      sum += vals[i];
+      if (i >= p) sum -= vals[i - p];
+      out[i] = (i >= p - 1) ? sum / p : null;
+    }
+    return out;
+  }
+
+  /* 日线序列 → SMA200 散点。
+     daily: [{time, close},...]，按时间升序（Gate 日线 t 为当天 00:00 UTC）
+     返回 { points:[{time,value}], last, prevDay, n } */
+  function ma200FromDaily(daily, p) {
+    p = p || 200;
+    const n = daily.length;
+    if (n < p) return { points: [], last: null, prevDay: null, n: 0, need: p };
+    const closes = new Array(n);
+    for (let i = 0; i < n; i++) closes[i] = daily[i].close;
+    const mv = smaCalc(closes, p);
+    const points = [];
+    for (let i = 0; i < n; i++) {
+      if (mv[i] == null || !isFinite(mv[i])) continue;
+      points.push({ time: daily[i].time, value: mv[i] });
+    }
+    const L = points.length;
+    return {
+      points: points, n: L, need: p,
+      last: L ? points[L - 1].value : null,
+      prevDay: L > 1 ? points[L - 2].value : null,
+    };
+  }
+
+  /* 把日线 MA200 投影到当前 K 线的时间窗。
+     为什么必须裁剪：若把全部几百天日线原样喂给图表，
+     chart.timeScale().fitContent() 会把可视范围拉到几百天，
+     5 分钟图会被压成一根竖线 —— 这是加长均线最容易踩的坑。
+
+     为什么又要保底：5m 图只跨约 1 天，窗口内日线点可能不足 2 个，
+     而单点 line series 是不画的（什么都不显示）。所以不足时退化为
+     「逐根 K 线前向填充」，保证任何周期下这条线都看得见。
+
+     candles: [{time,...}] 升序；padSec 首尾各留的余量（默认 1 天） */
+  function maWindowProject(points, candles, padSec) {
+    const pad = padSec == null ? 86400 : padSec;
+    if (!points || !points.length || !candles || candles.length < 2) return points ? points.slice(-2) : [];
+    const t0 = candles[0].time, t1 = candles[candles.length - 1].time;
+    const win = [];
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.time >= t0 - pad && p.time <= t1 + pad) win.push(p);
+    }
+    if (win.length >= 2) return win;
+    /* 退化：前向填充到 K 线时间轴 */
+    const out = [];
+    let j = 0;
+    for (let i = 0; i < candles.length; i++) {
+      const t = candles[i].time;
+      while (j < points.length - 1 && points[j + 1].time <= t) j++;
+      if (points[j] && points[j].time <= t) out.push({ time: t, value: points[j].value });
+    }
+    if (out.length >= 2) return out;
+    /* 最后兜底：最近两个日线点，至少画得出一段线 */
+    return points.slice(-2);
+  }
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   global.Strategy = api;

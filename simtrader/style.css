@@ -191,6 +191,26 @@ button { font-family: inherit; }
 .chart-note { position: absolute; left: calc(var(--liqw, 118px) + 8px); bottom: 4px; font-size: 13px; color: var(--muted-2); pointer-events: none; }
 .chart-note.stale { color: #7c3aed; font-weight: 600; }
 
+/* 200 日均线图例：左上角浮层，与图表的 EMA9 / EMA21 配套 */
+.ma200-legend {
+  position: absolute; top: 4px; left: calc(var(--liqw, 118px) + 8px);
+  display: flex; align-items: center; gap: 6px; z-index: 3;
+  padding: 2px 8px; border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, .82); border: 1px solid var(--line);
+  font-size: 11px; color: var(--muted); pointer-events: none;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.ma200-legend .ma200-swatch {
+  width: 14px; height: 0; border-top: 2px dashed #7c3aed; display: inline-block; flex: none;
+}
+.ma200-legend b { color: var(--text); font-weight: 600; }
+.ma200-legend .mv { color: #7c3aed; font-weight: 600; }
+.ma200-legend .md { font-weight: 600; }
+.ma200-legend .mt { color: var(--muted-2); }
+.ma200-legend .up { color: var(--up); }
+.ma200-legend .down { color: var(--down); }
+.ma200-legend.err { color: #7c3aed; border-color: #7c3aed; background: rgba(124, 58, 237, .08); }
+
 /* ---------- ★ K线下方：四格交易提示 ---------- */
 .sig-cards-wrap { margin-top: 12px; padding-top: 11px; border-top: 1px dashed var(--line); }
 .sc-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
@@ -541,6 +561,41 @@ button { font-family: inherit; }
 .hist-actions { text-align: right; }
 
 .bt-head { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 11px; }
+
+/* ---------- 数据有效性自检（tab-chk） ---------- */
+.chk-head { display: flex; align-items: flex-start; gap: 12px; justify-content: space-between; flex-wrap: wrap; font-size: 12px; color: var(--muted); line-height: 1.7; margin-bottom: 10px; }
+.chk-head > div:first-child { max-width: 720px; }
+.chk-act { display: flex; align-items: center; gap: 10px; flex: none; }
+.chk-auto { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted-2); white-space: nowrap; cursor: pointer; }
+.chk-sum { font-size: 12px; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 7px 10px; margin-bottom: 10px; background: #fafbfc; }
+.chk-sum.ok { border-color: rgba(10, 143, 78, .35); background: rgba(10, 143, 78, .05); }
+.chk-sum.bad { border-color: rgba(217, 44, 44, .45); background: rgba(217, 44, 44, .06); }
+.chk-sum .ok-t { color: var(--down); font-weight: 600; }
+.chk-sum .bad-t { color: var(--up); font-weight: 600; }
+.chk-sum .warn-t { color: #b45309; }
+.chk-sum .mute-t { color: var(--muted-2); }
+.chk-wait { font-size: 12px; color: var(--muted-2); padding: 10px 2px; }
+.chk-grp { margin-bottom: 12px; }
+.chk-gh { font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 5px; padding-left: 2px; }
+.chk-row { display: grid; grid-template-columns: 190px 118px 62px 56px 84px minmax(0, 1fr); gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--line-soft); font-size: 11px; }
+.chk-row:hover { background: #fafbfc; }
+.chk-n { color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.chk-h { color: var(--muted-2); font-size: 10px; }
+.chk-s { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; }
+.chk-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; display: inline-block; }
+.chk-dot.ok { background: #0a8f4e; }
+.chk-dot.bad { background: #d92c2c; }
+.chk-dot.aux { background: #d97706; }
+.chk-dot.skip { background: #9ca3af; }
+.chk-ms, .chk-f { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 10px; }
+.chk-i { color: var(--muted-2); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chk-row.bad .chk-i { color: var(--up); }
+.chk-doc { padding-left: 19px; font-size: 11px; color: #374151; line-height: 1.75; margin-top: 4px; }
+.chk-doc code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; font-size: 10px; }
+@media (max-width: 900px) {
+  .chk-row { grid-template-columns: 140px 62px 52px minmax(0, 1fr); }
+  .chk-h, .chk-f { display: none; }
+}
 .bt-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap: 9px; margin-bottom: 12px; }
 .bt-card { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px; }
 .bt-card .k { font-size: 10px; color: var(--muted); }

@@ -486,6 +486,122 @@ function loadAppSignalCore() {
     }
   }
 
+  /* ========== 22 · 200 日均线（日线 SMA200） ========== */
+  /* 这一组针对「长均线画到短周期图上」最容易踩的三个坑：
+     ① 算法本身算错  ② 日线点超出 K 线时间轴导致 fitContent 把图压扁  ③ 窗口太窄时点数不足画不出线 */
+  {
+    head('22. 200 日均线（日线 SMA200）');
+    const N = 200;
+    /* smaCalc：用一段已知序列独立验证 */
+    {
+      const vals = [];
+      for (let i = 1; i <= 250; i++) vals.push(i);          // 1..250
+      const r = S.smaCalc(vals, N);
+      ok(r.length === 250, 'smaCalc 输出长度与原序列一致');
+      let nullBad = 0;
+      for (let i = 0; i < N - 1; i++) if (r[i] !== null) nullBad++;
+      ok(nullBad === 0, 'smaCalc 前 199 根为 null（窗口不足不产出）', `越界 ${nullBad} 个`);
+      /* 第 200 根起：均值 = (i-N+1 .. i) 的平均 */
+      let worst = 0;
+      for (let i = N - 1; i < 250; i++) {
+        let s = 0; for (let j = i - N + 1; j <= i; j++) s += vals[j];
+        worst = Math.max(worst, Math.abs(s / N - r[i]));
+      }
+      ok(worst < 1e-9, 'smaCalc 数值与逐项重算一致', `最大偏差 ${worst.toExponential(2)}`);
+    }
+    /* ma200FromDaily：构造 260 根日线 */
+    const daily = [];
+    for (let i = 0; i < 260; i++) {
+      const t = 1700000000 + i * 86400;
+      daily.push({ time: t, close: 1000 + i });            // 线性上升，均值可解析验证
+    }
+    {
+      const r = S.ma200FromDaily(daily, N);
+      ok(r.points.length === 260 - N + 1, 'ma200FromDaily 点数 = 根数 − 窗口 + 1',
+        `${daily.length} 根 → ${r.points.length} 点`);
+      /* 末点 = 最后 200 根收盘均值 */
+      let s = 0;
+      for (let i = daily.length - N; i < daily.length; i++) s += daily[i].close;
+      ok(Math.abs(s / N - r.last) < 1e-9, 'ma200FromDaily 末点与独立重算一致',
+        `实现 ${r.last.toFixed(6)} vs 重算 ${(s / N).toFixed(6)}`);
+      ok(Math.abs(r.points[r.points.length - 1].time - daily[daily.length - 1].time) === 0,
+        '末点时间取最新一根日线');
+      /* 窗口不足时应诚实返回空，而不是硬凑 */
+      ok(S.ma200FromDaily(daily.slice(0, 120), N).points.length === 0,
+        '日线不足 200 根时返回空（页面会显示取不到的原因）');
+    }
+    /* maWindowProject：三种真实跨度的 K 线窗口 */
+    const pts = S.ma200FromDaily(daily, N).points;
+    {
+      /* 日线点的时间轴：第 i 个点对应 daily[i+N-1].time */
+      const dailySpan = pts[pts.length - 1].time - pts[0].time;
+      ok(dailySpan > 0, '日线 MA200 点按时间升序');
+      let asc = true;
+      for (let i = 1; i < pts.length; i++) if (pts[i].time <= pts[i - 1].time) asc = false;
+      ok(asc, 'MA200 点严格升序（LightweightCharts 要求，否则不画线）');
+    }
+    {
+      /* ① 宽窗口（1h × 300 ≈ 12.5 天）→ 应取日线原始点 */
+      const wide = [];
+      for (let i = 0; i < 300; i++) wide.push({ time: daily[40].time + i * 3600 });
+      const w = S.maWindowProject(pts, wide, 86400);
+      ok(w.length >= 2, '宽窗口返回足够点数', `${w.length} 点`);
+      const kSpan = wide[wide.length - 1].time - wide[0].time;
+      ok(w[w.length - 1].time - w[0].time <= kSpan + 2 * 86400 * 1.5,
+        '宽窗口下 MA200 不超出 K 线时间轴（fitContent 安全）');
+      /* ② 窄窗口（5m × 300 ≈ 1 天）→ 日线点不足，必须退化为前向填充而不是返回单点 */
+      const narrow = [];
+      for (let i = 0; i < 300; i++) narrow.push({ time: daily[daily.length - 1].time + i * 300 });
+      const nw = S.maWindowProject(pts, narrow, 86400);
+      ok(nw.length >= 2, '窄窗口下仍返回 ≥2 点（单点 line series 是不显示的）', `${nw.length} 点`);
+      let nasc = true;
+      for (let i = 1; i < nw.length; i++) if (nw[i].time <= nw[i - 1].time) nasc = false;
+      ok(nasc, '窄窗口退化结果仍按时间升序');
+      const nv = nw[nw.length - 1].value;
+      ok(nv != null && isFinite(nv), '窄窗口退化结果数值有效', `value ${nv}`);
+      /* ③ 落在 K 线之前的历史日线必须被裁掉 —— 这正是 fitContent 被拉宽的元凶 */
+      const recent = [{ time: pts[pts.length - 1].time }, { time: pts[pts.length - 1].time + 3600 }];
+      const r2 = S.maWindowProject(pts, recent, 86400);
+      const tooOld = r2.filter(p => p.time < recent[0].time - 86400 * 1.5);
+      ok(tooOld.length === 0, '投影结果不含远早于 K 线的历史点', `残留 ${tooOld.length} 个`);
+      /* ④ 极端入参不得抛错 */
+      let threw = false;
+      try { S.maWindowProject([], [], 86400); S.maWindowProject(null, null); } catch (e) { threw = true; }
+      ok(!threw, '空输入不抛错（图例走「取不到」分支）');
+    }
+  }
+
+  /* ========== 23 · 数据源抓取口径回归 ========== */
+  /* 这些是实测踩出来的坑，写成断言防止以后回退 */
+  {
+    head('23. 数据源抓取口径');
+    const fs = require('fs');
+    const appSrc = fs.readFileSync(__dirname + '/simtrader/app.js', 'utf8');
+    /* Gate 的 create_time_ms 与 create_time 同为秒，按毫秒读会得到 1970 年 */
+    ok(!/create_time_ms/.test(appSrc.replace(/create_time_ms 同为秒|create_time_ms 与 create_time/g, '')),
+      '逐笔成交不再按毫秒解释 create_time_ms',
+      'Gate 实测：该字段与 create_time 同为秒，只保留注释提及 ' +
+      (/create_time_ms/.test(appSrc) ? '（另有注释说明）' : '（已完全移除）'));
+    ok(/Math\.round\(\+t\.create_time \* 1000\)/.test(appSrc), '逐笔时间戳统一按 create_time（秒）×1000');
+    /* liq_orders 有硬限制：单次请求的 from/to 窗口不得超过 1 小时，否则 INVALID_PARAM_VALUE。
+       liq-map.js 的写法是 from = to − 3599，窗口时长 3599 秒，正好卡在限制内。 */
+    const lm = fs.readFileSync(__dirname + '/simtrader/liq-map.js', 'utf8');
+    const m = lm.match(/to - (\d+)/);
+    const winSec = m ? (3600 - (+m[1])) : null;
+    ok(winSec != null && winSec > 0 && winSec <= 3600,
+      '清算图单次请求窗口 ≤1 小时（接口硬限制，超了直接 400）',
+      winSec != null ? `窗口时长 ${winSec} 秒` : '未匹配到窗口参数');
+    /* 自检面板的存在性 */
+    ok(/CHK_DEFS/.test(appSrc) && /async function runSrcCheck/.test(appSrc),
+      '页面内置数据有效性自检（CHK_DEFS + runSrcCheck）');
+    ok(/state\.wsLastTickRaw/.test(appSrc), 'WebSocket 检查看「最后一条推送」而不只看连接状态');
+    const htmlSrc = fs.readFileSync(__dirname + '/simtrader/index.html', 'utf8');
+    ok(/id="tab-chk"/.test(htmlSrc) && /btnSrcCheck/.test(htmlSrc), 'index.html 含自检标签页与按钮');
+    ok(/ma200Legend/.test(htmlSrc), 'index.html 含 MA200 图例容器');
+    const cssSrc = fs.readFileSync(__dirname + '/simtrader/style.css', 'utf8');
+    ok(/\.ma200-legend \{/.test(cssSrc) && /\.chk-row \{/.test(cssSrc), 'style.css 含两个新组件的样式');
+  }
+
   console.log('\n' + '='.repeat(64));
   console.log(fail === 0 ? `✅ 全部通过（${pass} 项）` : `❌ ${fail} 项失败 / ${pass} 项通过`);
   console.log('='.repeat(64));
