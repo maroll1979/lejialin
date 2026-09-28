@@ -136,6 +136,18 @@ window.LightweightCharts = {
   chk('投票 UI 函数存在（paintVote / refreshVote / voteMaArr）',
     typeof win.paintVote === 'function' && typeof win.refreshVote === 'function' && typeof win.voteMaArr === 'function');
 
+  /* ---- 回测表单：1m 撮合 / 信号周期 / 手动百分比止盈止损 ---- */
+  const q = s => doc.querySelector(s);
+  chk('回测表单含撮合粒度与信号周期选择', !!q('#btBase') && !!q('#btSig'));
+  chk('回测表单含年限与止损/止盈输入', !!q('#btYears') && !!q('#btStop') && !!q('#btTp'));
+  chk('回测表单含 1:1 / 1:2 / 1:3 预设按钮', doc.querySelectorAll('.bt-ps').length >= 3);
+  chk('回测表单含保本胜率展示容器', !!q('#btBE'));
+  if (win.Strategy && win.Strategy.breakevenWinRate) {
+    const bk = win.Strategy.breakevenWinRate(0.01, 0.01, 0.001);
+    chk('保本胜率可在页面算出（1%:1% 需 60%）',
+      !!bk && Math.abs(bk.breakeven - 0.60) < 0.005, bk ? (bk.breakeven * 100).toFixed(1) + '%' : 'null');
+  }
+
   /* ---- 真实跑一遍 MA200 全链路：取日线 → 算 → 投影到三种周期 ---- */
   if (win.Strategy && win.Strategy.ma200FromDaily) {
     try {

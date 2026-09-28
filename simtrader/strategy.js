@@ -29,7 +29,7 @@
   /* 各源单次请求根数上限：Gate 单段 2000、全局仅最近 10000；币安现货单段 1000、无全局上限 */
   const SRC_LIMIT = { binance: 1000, gate: 2000 };
   const GATE_MAX_POINTS = 10000;
-  const TF_SEC = { '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
+  const TF_SEC = { '1m': 60, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
   /* 八因子权重（与 app.js SIG_W 逐字一致，和为 1.00） */
   const SIG_W = { trend: 0.15, macd: 0.14, adx: 0.13, rsi: 0.11, kdj: 0.10, boll: 0.10, obv: 0.13, vol: 0.14 };
   /* 与看板实盘窗口保持一致：app.js 的 runSignals → ensureCandles → fetchKlines(sym, tf, 200)，
@@ -512,6 +512,19 @@
       while (j + 1 < tfT.length && tfT[j + 1] <= baseT[i]) j++;
       if (j < 0) { m[i] = -1; continue; }
       m[i] = (baseT[i] + baseSec >= tfT[j] + tfSec) ? j : j - 1;
+    }
+    return m;
+  }
+  /* 粗周期序列索引 → 该周期内最后一根细粒度 K 线的索引。
+     用途：信号判定在 5m 上做，但撮合要用 1m 逐根走 —— 需要把「第 i 根 5m 收线」
+     精确落到这一根 5m 的最后一根 1m 上，然后从它的下一根 1m 开盘成交。 */
+  function mapLastBase(sigT, sigSec, baseT, baseSec) {
+    const m = new Int32Array(sigT.length);
+    let j = -1;
+    for (let i = 0; i < sigT.length; i++) {
+      const lim = sigT[i] + sigSec - baseSec;      // 该粗周期内最后一根 base 的起始时刻
+      while (j + 1 < baseT.length && baseT[j + 1] <= lim) j++;
+      m[i] = j;
     }
     return m;
   }
@@ -1042,49 +1055,72 @@
 
   function backtestCore(s5, opt) {
     const tpslFn = opt.tpslFn || defaultTpsl;
-    const maxHold = opt.maxHold || 2016;          // 最多持仓 2016 根 5m（7 天），超时按市价平
+    /* ★ 回测基础粒度。默认 5m；传 baseSec:60 即按 1m 复算。
+       15m / 1h 都由基础序列聚合而来，所以换粒度只影响「入场价精度 + 出场路径」，
+       不改变三个信号周期本身的方向判定。 */
+    const baseSec = opt.baseSec || TF_SEC['5m'];
+    const maxHold = opt.maxHold || Math.round(7 * 86400 / baseSec);   // 最多持仓 7 天
+    const baseLbl = (opt.baseLabel) || (baseSec === 60 ? '1m' : baseSec === 300 ? '5m' : Math.round(baseSec / 60) + 'm');
+    /* ★ 百分比止盈止损：入场价 × 百分比，完全取代 ATR 倍数。
+       两者互斥 —— 传了 stopPct/tpPct 就不再调 tpslFn。 */
+    const PCT = (opt.stopPct > 0 && opt.tpPct > 0) ? {
+      stop: opt.stopPct, tp: opt.tpPct,
+      tp2: opt.tp2Pct,                       // 分批模式下的第二档，缺省 = tp 的两倍
+      mode: opt.tpMode === 'split' ? 'split' : 'single',   // single=到 tp 全平；split=tp 减半、余仓推到 tp2
+    } : null;
     /* 费率可调：同一批入场点换成 Maker / VIP 费率，用来分离「策略」与「摩擦」的贡献 */
     const feeRate = opt.feeRate == null ? FEE_RATE : opt.feeRate;
     const onProgress = opt.onProgress || function () {};
     /* opt.cache：多配置对比时复用「聚合 + 三周期方向序列 + 结构序列」这些与配置无关的重活 */
     const C = opt.cache || null;
 
+    /* ★ 信号周期与撮合粒度分离。
+       baseSec = 撮合粒度（逐根判定先撞止损还是撞止盈）；sigSec = 信号判定的最低周期。
+       两者默认相同。若 baseSec=60(1m) 而 sigSec=300(5m)，意思就是：
+       「信号仍按 1h+15m+5m 判定，但出场用 1m 逐根走」——这样能把
+       「分辨率提升的收益」和「信号层变敏感」两个变量彻底分开观察。 */
+    const sigSec = opt.sigSec || baseSec;
+    const sA = (sigSec === baseSec) ? s5 : aggregate(s5, sigSec);
+    const baseMap = (sigSec === baseSec) ? null : mapLastBase(sA.t, sigSec, s5.t, baseSec);
+    const V = opt.vote || null;
+    const cacheOk = C && (C.sigSec === sigSec)
+      && (C.votesKey === (V ? V.thz + '|' + V.bufPct + '|' + V.minVotes : ''));
+
     onProgress(0, '聚合 15m / 1h');
-    const s15 = C ? C.s15 : aggregate(s5, TF_SEC['15m']);
-    const s1h = C ? C.s1h : aggregate(s5, TF_SEC['1h']);
+    const s15 = cacheOk ? C.s15 : aggregate(sA, TF_SEC['15m']);
+    const s1h = cacheOk ? C.s1h : aggregate(sA, TF_SEC['1h']);
 
     onProgress(0.1, '计算三周期信号序列');
-    /* opt.vote —— 九指标投票制（传入即启用，此时 5m/15m/1h 都由票数定方向）。
-       投票制下 5m 参与方向投票，不再走第 6 节的「结构扣扳机」，两者互斥。 */
-    const V = opt.vote || null;
+    /* opt.vote —— 九指标投票制（传入即启用，此时三周期都由票数定方向）。
+       投票制下最低周期参与方向投票，不再走第 6 节的「结构扣扳机」，两者互斥。 */
     let r5, r15, r1h, s1d = null, ma5 = null, ma15 = null, ma1h = null;
     if (V) {
       onProgress(0.12, '日线 MA200 → 各周期（严格用已收盘日线）');
-      s1d = (C && C.s1d) ? C.s1d : aggregate(s5, TF_SEC['1d']);
-      ma5 = (C && C.ma5) ? C.ma5 : dailyMa200Lookup(s5, s1d, V.period || 200, TF_SEC['5m']);
-      ma15 = (C && C.ma15) ? C.ma15 : dailyMa200Lookup(s15, s1d, V.period || 200, TF_SEC['15m']);
-      ma1h = (C && C.ma1h) ? C.ma1h : dailyMa200Lookup(s1h, s1d, V.period || 200, TF_SEC['1h']);
+      s1d = cacheOk ? C.s1d : aggregate(sA, TF_SEC['1d']);
+      ma5 = cacheOk ? C.ma5 : dailyMa200Lookup(sA, s1d, V.period || 200, sigSec);
+      ma15 = cacheOk ? C.ma15 : dailyMa200Lookup(s15, s1d, V.period || 200, TF_SEC['15m']);
+      ma1h = cacheOk ? C.ma1h : dailyMa200Lookup(s1h, s1d, V.period || 200, TF_SEC['1h']);
       onProgress(0.2, '九指标投票');
-      r5 = (C && C.r5) ? C.r5 : voteSeries(s5, ma5, V);
-      r15 = (C && C.r15) ? C.r15 : voteSeries(s15, ma15, V);
-      r1h = (C && C.r1h) ? C.r1h : voteSeries(s1h, ma1h, V);
+      r5 = cacheOk ? C.r5 : voteSeries(sA, ma5, V);
+      r15 = cacheOk ? C.r15 : voteSeries(s15, ma15, V);
+      r1h = cacheOk ? C.r1h : voteSeries(s1h, ma1h, V);
     } else {
-      r5 = C ? C.r5 : dirSeries(s5);
-      r15 = C ? C.r15 : dirSeries(s15);
-      r1h = C ? C.r1h : dirSeries(s1h);
+      r5 = cacheOk ? C.r5 : dirSeries(sA);
+      r15 = cacheOk ? C.r15 : dirSeries(s15);
+      r1h = cacheOk ? C.r1h : dirSeries(s1h);
     }
-    /* 回测必须用「已收线」映射：buildMap 给出的是包含当前 5m 的那根 15m/1h，
+    /* 回测必须用「已收线」映射：buildMap 给出的是包含当前 bar 的那根 15m/1h，
        它尚未走完，用它的 high/low/close 等于偷看未来（未来函数）。
        opt.live=true 可切回实盘口径做对照。 */
-    const m15 = opt.live ? buildMap(s5.t, s15.t) : buildClosedMap(s5.t, s15.t, TF_SEC['5m'], TF_SEC['15m']);
-    const m1h = opt.live ? buildMap(s5.t, s1h.t) : buildClosedMap(s5.t, s1h.t, TF_SEC['5m'], TF_SEC['1h']);
+    const m15 = opt.live ? buildMap(sA.t, s15.t) : buildClosedMap(sA.t, s15.t, sigSec, TF_SEC['15m']);
+    const m1h = opt.live ? buildMap(sA.t, s1h.t) : buildClosedMap(sA.t, s1h.t, sigSec, TF_SEC['1h']);
 
-    /* 5m 市场结构（第 6 节）。msMode === false 时退回旧的「三周期共振沿」口径做对照。 */
+    /* 市场结构（第 6 节）。msMode === false 时退回旧的「三周期共振沿」口径做对照。 */
     const msOpt = Object.assign({ loose: false, minScore: 0, andDir: false }, opt.ms || {});
     let ms = null;
     if (opt.msMode !== false && !V) {
-      onProgress(0.4, '计算 5m 市场结构（pivot / CHOCH / Retest / BOS）');
-      ms = (C && C.ms) ? C.ms : msSeries(s5);
+      onProgress(0.4, '计算市场结构（pivot / CHOCH / Retest / BOS）');
+      ms = cacheOk ? C.ms : msSeries(sA);
     }
 
     onProgress(0.5, '寻找入场点');
@@ -1106,56 +1142,79 @@
     let skipped = 0;
     for (let k = 0; k < trig.length; k++) {
       const tg = trig[k];
-      if (tg.i + 1 >= s5.n) { skipped++; continue; }         // 序列末尾，无从入场
+      if (tg.i + 1 >= sA.n) { skipped++; continue; }          // 信号序列末尾，无从判定下一段
+      /* 信号索引 → 撮合索引：sigSec≠baseSec 时落到该粗周期的最后一根细 K 线，
+         再从它的下一根开盘成交（与「信号在自己的粒度上已收线」完全等价） */
+      const iB = baseMap ? baseMap[tg.i] : tg.i;
+      if (iB < 0 || iB + 1 >= s5.n) { skipped++; continue; }
       /* 入场价用触发后的下一根开盘价，避免用到「未来」那根的收盘价 */
-      const entry = s5.o[tg.i + 1];
+      const entry = s5.o[iB + 1];
       if (!(entry > 0)) { skipped++; continue; }
-      const j1h = m1h[tg.i];
-      if (j1h < 30) { skipped++; continue; }             // 1h 样本不足，算不出止损止盈
-      const plan = tpslFn(tailObjects(s1h, j1h, 300), '1h', s5.c[tg.i]);
-      if (!plan) { skipped++; continue; }
-      const side = tg.dir === 'long' ? plan.long : plan.short;
-      if (!side || !(side.risk > 0)) { skipped++; continue; }
-      const stop = side.stop, tp1 = side.tp1, tp2 = side.tp2;
       const dirSign = tg.dir === 'long' ? 1 : -1;
+      let stop, tp1, tp2 = null;
+      if (PCT) {
+        /* 百分比口径：一律以「成交价」为基准 —— 这正是用户要的「手动指定 1%:1% / 1.5%:3%」 */
+        const rAbs = entry * PCT.stop;
+        stop = dirSign > 0 ? entry - rAbs : entry + rAbs;
+        tp1 = dirSign > 0 ? entry * (1 + PCT.tp) : entry * (1 - PCT.tp);
+        if (PCT.mode === 'split') {
+          const tp2Pct = (PCT.tp2 != null && PCT.tp2 > PCT.tp) ? PCT.tp2 : PCT.tp * 2;
+          tp2 = dirSign > 0 ? entry * (1 + tp2Pct) : entry * (1 - tp2Pct);
+        }
+      } else {
+        const j1h = m1h[tg.i];
+        if (j1h < 30) { skipped++; continue; }             // 1h 样本不足，算不出止损止盈
+        const plan = tpslFn(tailObjects(s1h, j1h, 300), '1h', sA.c[tg.i]);
+        if (!plan) { skipped++; continue; }
+        const side = tg.dir === 'long' ? plan.long : plan.short;
+        if (!side || !(side.risk > 0)) { skipped++; continue; }
+        stop = side.stop; tp1 = side.tp1; tp2 = side.tp2;
+      }
+      const risk = Math.abs(entry - stop);
+      if (!(risk > 0) || !(tp1 > 0) || !(stop > 0)) { skipped++; continue; }
 
-      /* 扫描后续 K 线：先到止损还是先到止盈（同一根同时触及 → 保守按止损） */
-      let exitPx = null, how = '', holdT = 0, done1 = false, r1 = 0, r2 = 0;
-      for (let j = tg.i + 1; j < s5.n && j <= tg.i + maxHold; j++) {
+      /* 扫描后续 K 线：先到止损还是先到止盈（同一根同时触及 → 保守按止损）
+         ★ 用 1m 复算的价值全在这段循环里：一根 5m 内部究竟先撞止损还是先撞止盈，
+           在 5m 数据上是无从分辨的（只能一律保守按止损算）；换 1m 后路径拆细 5 倍，
+           「同根歧义」的宽度从 5 分钟压缩到 1 分钟。 */
+      let exitPx = null, how = '', holdT = 0, done1 = false, r1 = 0;
+      const single = !!(PCT && PCT.mode === 'single');
+      const lastJ = Math.min(s5.n - 1, iB + maxHold);
+      for (let j = iB + 1; j <= lastJ; j++) {
         const hi = s5.h[j], lo = s5.l[j];
         const hitStop = dirSign > 0 ? (lo <= stop) : (hi >= stop);
         const hitTp1 = dirSign > 0 ? (hi >= tp1) : (lo <= tp1);
-        const hitTp2 = dirSign > 0 ? (hi >= tp2) : (lo <= tp2);
-        if (hitStop) { exitPx = dirSign > 0 ? Math.min(stop, s5.o[j]) : Math.max(stop, s5.o[j]); how = done1 ? '止损（半仓）' : '止损'; holdT = j - tg.i - 1; break; }
-        if (!done1 && hitTp1) { done1 = true; r1 = tp1; }
-        if (done1 && hitTp2) { exitPx = tp2; how = '止盈二'; holdT = j - tg.i - 1; break; }
-        if (j === Math.min(s5.n - 1, tg.i + maxHold)) {
-          exitPx = s5.c[j]; how = '超时平仓'; holdT = j - tg.i - 1; break;
+        if (hitStop) {
+          /* 跳空穿越止损时按开盘价成交（不利滑点），不假设能成交在止损价 */
+          exitPx = dirSign > 0 ? Math.min(stop, s5.o[j]) : Math.max(stop, s5.o[j]);
+          how = done1 ? '止损（半仓）' : '止损'; holdT = j - iB - 1; break;
         }
+        if (!done1 && hitTp1) {
+          if (single) { exitPx = tp1; how = '止盈'; holdT = j - iB - 1; break; }
+          done1 = true; r1 = tp1;                       // 分批模式：tp1 减半，余仓推到 tp2
+        }
+        if (done1 && tp2 > 0) {
+          const hitTp2 = dirSign > 0 ? (hi >= tp2) : (lo <= tp2);
+          if (hitTp2) { exitPx = tp2; how = '止盈二'; holdT = j - iB - 1; break; }
+        }
+        if (j === lastJ) { exitPx = s5.c[j]; how = '超时平仓'; holdT = j - iB - 1; break; }
       }
       if (exitPx == null) { skipped++; continue; }
 
       /* 收益（按 R 倍数，1R = 入场到止损的距离） */
-      const risk = Math.abs(entry - stop);
-      if (!(risk > 0)) { skipped++; continue; }
       let gross, fee;
-      if (how === '止损') {
-        gross = (exitPx - entry) * dirSign;
-        fee = (entry + exitPx) * feeRate;
-      } else if (how === '止损（半仓）') {
-        /* 已有一半在 tp1 止盈，剩余一半止损 */
-        gross = 0.5 * (r1 - entry) * dirSign + 0.5 * (exitPx - entry) * dirSign;
-        fee = entry * feeRate + 0.5 * r1 * feeRate + 0.5 * exitPx * feeRate;
-      } else if (how === '止盈二') {
+      if (how === '止损（半仓）' || how === '止盈二') {
+        /* 分批模式：已有一半在第一档了结，剩余一半按最终结果结算 */
         gross = 0.5 * (r1 - entry) * dirSign + 0.5 * (exitPx - entry) * dirSign;
         fee = entry * feeRate + 0.5 * r1 * feeRate + 0.5 * exitPx * feeRate;
       } else {
+        /* 一次性全平（止损 / 止盈 / 超时） */
         gross = (exitPx - entry) * dirSign;
         fee = (entry + exitPx) * feeRate;
       }
       const net = gross - fee;
       trades.push({
-        time: s5.t[tg.i + 1], dir: tg.dir, entry: entry, stop: stop, tp1: tp1, tp2: tp2,
+        time: s5.t[iB + 1], dir: tg.dir, entry: entry, stop: stop, tp1: tp1, tp2: tp2,
         exit: exitPx, how: how, hold: holdT, risk: risk,
         pnl: net, r: net / risk,
         grossR: gross / risk, feeR: fee / risk,
@@ -1166,6 +1225,7 @@
 
     onProgress(0.98, '统计');
     const res = summarize(trades, s5, trig.length, skipped, {
+      baseSec: baseSec, baseLabel: baseLbl, tpsl: PCT,
       /* 投票制的「共振强度」= 三个周期里最弱的那一环的同频票数
          （用户口径：4/9 ≈ 44% 即算确认）。越长 harness 旧 ms 体系用的是结构分。 */
       scores: trig.map(function (t) {
@@ -1177,9 +1237,12 @@
       }),
       ms: ms, msOpt: msOpt,
     });
-    /* 供多配置对比复用（不含 trades，避免重复占内存） */
+    /* 供多配置对比复用（不含 trades，避免重复占内存）。
+       必须带 sigSec / votesKey：cache 里的 ma5/r5 属于 sA 域，
+       只有「信号周期 + 投票参数」都相同才可复用。 */
     res.cache = { s15: s15, s1h: s1h, r5: r5, r15: r15, r1h: r1h, ms: ms, V: V,
-      s1d: s1d, ma5: ma5, ma15: ma15, ma1h: ma1h };
+      s1d: s1d, ma5: ma5, ma15: ma15, ma1h: ma1h,
+      sigSec: sigSec, votesKey: V ? V.thz + '|' + V.bufPct + '|' + V.minVotes : '' };
     return res;
   }
 
@@ -1238,7 +1301,9 @@
       maxDD: maxDD, ddStart: ddStart, ddEnd: ddEnd,
       finalEq: finalEq, annRet: annRet,
       years: years, spanDays: spanDays,
-      avgHoldBars: avgHold, avgHoldHours: avgHold * 5 / 60,
+      avgHoldBars: avgHold, avgHoldHours: avgHold * (meta && meta.baseSec ? meta.baseSec : 300) / 3600,
+      baseSec: (meta && meta.baseSec) || 300, baseLabel: (meta && meta.baseLabel) || '5m',
+      tpsl: (meta && meta.tpsl) || null,
       longCount: longs.length, longWin: longs.filter(t => t.win).length,
       shortCount: shorts.length, shortWin: shorts.filter(t => t.win).length,
       trigCount: trigCount, skipped: skipped,
@@ -1274,11 +1339,36 @@
     return out;
   }
 
+  /* ============================================================
+     百分比止盈止损的「保本胜率」
+     用户直觉的「50% 胜率配 1:1」是零手续费下的结论。真实双边费率下必须更高。
+     推导（所有量除以入场价，S=止损%、T=止盈%、f=单边费率）：
+         净赢一笔 = T − f(2+T)          净输一笔 = −(S + f(2−S))
+         p·净赢 + (1−p)·净输 = 0   →   p = (S + f(2−S)) / ((T+S)(1−f))
+     1%:1% 在双边 0.1% 下需要 55.0% 而不是 50%；1.5%:3% 需要 35.6% 而不是 33%。  */
+  function breakevenWinRate(stopPct, tpPct, feeSide) {
+    const f = feeSide == null ? FEE_RATE : feeSide;
+    if (!(stopPct > 0) || !(tpPct > 0)) return null;
+    const winNet = tpPct - f * (2 + tpPct);
+    const lossNet = -(stopPct + f * (2 - stopPct));
+    if (winNet <= 0) return null;                  // 止盈连手续费都覆盖不住，无解
+    const p = -lossNet / (winNet - lossNet);
+    const winR = winNet / stopPct, lossR = lossNet / stopPct;
+    return {
+      stopPct: stopPct, tpPct: tpPct, feeSide: f, rr: tpPct / stopPct,
+      breakeven: p, winR: winR, lossR: lossR,
+      feeR: 2 * f / stopPct,                       // 每笔手续费折合几个 R
+      expR: function (wr) { return wr * winR + (1 - wr) * lossR; },
+    };
+  }
+
   async function backtest(sym, years, opt) {
     opt = opt || {};
     const onPhase = opt.onPhase || function () {};
-    onPhase('fetch', 0, '拉取 ' + years + ' 年 5m K线（分段并发）');
-    const h = await fetchHistory(sym, '5m', years, {
+    const baseSec = opt.baseSec || TF_SEC['5m'];
+    const baseLbl = opt.baseLabel || (baseSec === 60 ? '1m' : Math.round(baseSec / 60) + 'm');
+    onPhase('fetch', 0, '拉取 ' + years + ' 年 ' + baseLbl + ' K线（分段并发）');
+    const h = await fetchHistory(sym, baseLbl, years, {
       src: opt.src || 'binance',
       onProgress: p => onPhase('fetch', p * 0.6, '拉取中 ' + Math.round(p * 100) + '%'),
     });
@@ -1287,6 +1377,9 @@
     const res = backtestCore(h.series, {
       tpslFn: opt.tpslFn, maxHold: opt.maxHold, live: opt.live,
       ms: opt.ms, msMode: opt.msMode, vote: opt.vote, cache: opt.cache,
+      baseSec: baseSec, baseLabel: baseLbl,
+      stopPct: opt.stopPct, tpPct: opt.tpPct, tp2Pct: opt.tp2Pct, tpMode: opt.tpMode,
+      feeRate: opt.feeRate,
       onProgress: (p, txt) => onPhase('calc', 0.6 + 0.4 * p, txt),
     });
     res.live = !!opt.live;
@@ -1307,7 +1400,7 @@
     toSeries: toSeries,
     tailObjects: tailObjects,
     buildMap: buildMap,
-    buildClosedMap: buildClosedMap,
+    buildClosedMap: buildClosedMap, mapLastBase: mapLastBase,
     alignTime: alignTime,
     /* 第 6 节 · 5m 市场结构触发 */
     MsStream: MsStream,
@@ -1330,7 +1423,7 @@
     backtestCore: backtestCore,
     backtest: backtest,
     summarize: summarize,
-    defaultTpsl: defaultTpsl,
+    defaultTpsl: defaultTpsl, breakevenWinRate: breakevenWinRate, FEE_RATE: FEE_RATE,
 
     /* ---------- 长周期均线（200 日均线） ----------
        这段口径放在这里而不是 app.js，是为了让它能被离线测试覆盖；

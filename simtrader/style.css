@@ -652,6 +652,29 @@ button { font-family: inherit; }
 
 /* ---------- 开单逻辑回测 ---------- */
 .bt-panel { margin-top: 10px; }
+.bt-form {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  margin-bottom: 8px; padding: 8px 10px;
+  background: var(--bg-soft, #f8fafc); border: 1px solid var(--line); border-radius: 6px;
+}
+.bt-fld { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+.bt-fld select, .bt-fld input {
+  font-size: 11px; padding: 3px 6px; border: 1px solid var(--line);
+  border-radius: 4px; background: var(--bg-card, #fff); color: var(--text); font-variant-numeric: tabular-nums;
+}
+.bt-fld input { width: 64px; }
+.bt-fld select option:disabled { color: var(--muted-2); }
+.bt-presets { display: flex; gap: 5px; }
+.bt-ps { font-size: 10px; padding: 3px 8px; }
+.bt-be {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; width: 100%;
+  margin-top: 2px; padding-top: 7px; border-top: 1px dashed var(--line);
+  font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.be-item b { color: var(--text); font-weight: 700; }
+.be-key { padding: 2px 8px; border-radius: 4px; background: rgba(37, 99, 235, .09); }
+.be-key b { color: #1d4ed8; font-weight: 700; }
+.be-est { margin-left: auto; color: var(--muted-2); font-size: 10px; }
 .bt-ctrl { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; flex-wrap: wrap; }
 .bt-run { padding: 5px 12px; font-size: 11px; }
 .bt-run:disabled { opacity: .55; cursor: progress; }

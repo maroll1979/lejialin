@@ -2258,33 +2258,84 @@ function setBtProg(txt) { const el = $('#btProg'); if (el) el.textContent = txt;
 function bindBacktest() {
   const btn = $('#btRun');
   if (!btn || !window.Strategy) return;
+  const baseSel = $('#btBase'), sigSel = $('#btSig'), yrSel = $('#btYears');
+  const stopIn = $('#btStop'), tpIn = $('#btTp'), beBox = $('#btBE');
+
+  function readPlan() {
+    const baseSec = +baseSel.value;
+    let sigSec = +sigSel.value;
+    if (sigSec < baseSec) sigSec = baseSec;          // 信号周期不能细于撮合粒度
+    return {
+      baseSec: baseSec, sigSec: sigSec, years: +yrSel.value,
+      stopPct: Math.max(0.0005, (+stopIn.value || 0) / 100),
+      tpPct: Math.max(0.0005, (+tpIn.value || 0) / 100),
+    };
+  }
+  function syncSig() {
+    const b = +baseSel.value;
+    Array.prototype.forEach.call(sigSel.options, o => { o.disabled = (+o.value < b); });
+    if (+sigSel.value < b) sigSel.value = String(b);
+  }
+  /* ★ 实时算出「扣掉手续费后真正需要的胜率」。
+     用户直觉的「1:1 配 50% 胜率」是零手续费下的结论，现实里要更高。 */
+  function paintBE() {
+    if (!beBox || !window.Strategy) return;
+    const p = readPlan();
+    const bk = window.Strategy.breakevenWinRate(p.stopPct, p.tpPct, FEE_TAKER);
+    if (!bk) { beBox.innerHTML = '<b class="txt-down">止盈幅度连手续费都盖不住</b>'; return; }
+    const bars = Math.round(p.years * 365 * 24 * 3600 / p.baseSec);
+    const warn = bars > 1200000
+      ? ' · <em class="txt-down">' + bars.toLocaleString('en-US') + ' 根，浏览器可能吃不消</em>' : '';
+    beBox.innerHTML =
+      '<span class="be-item">盈亏比 <b>1:' + bk.rr.toFixed(2) + '</b></span>'
+      + '<span class="be-item">进出费用 <b>' + bk.feeR.toFixed(3) + 'R</b></span>'
+      + '<span class="be-item">赢 <b class="txt-up">+' + bk.winR.toFixed(3) + 'R</b></span>'
+      + '<span class="be-item">输 <b class="txt-down">' + bk.lossR.toFixed(3) + 'R</b></span>'
+      + '<span class="be-item be-key">保本胜率 <b>' + (bk.breakeven * 100).toFixed(1) + '%</b></span>'
+      + '<span class="be-est">预计 ' + bars.toLocaleString('en-US') + ' 根 K线' + warn + '</span>';
+  }
+  [baseSel, sigSel, yrSel, stopIn, tpIn].forEach(function (e2) {
+    if (!e2) return;
+    e2.addEventListener('change', function () { syncSig(); paintBE(); });
+    e2.addEventListener('input', paintBE);
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.bt-ps'), function (b2) {
+    b2.addEventListener('click', function () {
+      stopIn.value = b2.dataset.stop; tpIn.value = b2.dataset.tp; paintBE();
+    });
+  });
+  syncSig(); paintBE();
+
   btn.addEventListener('click', async () => {
     if (state._btRunning) return;
     const inst = instOf(state.current);
     if (!inst.sym) { setBtProg('该品种无对应可回测的交易对'); return; }
+    const p = readPlan();
     state._btRunning = true;
     btn.disabled = true;
     btn.textContent = '回测中…';
     const bar = $('#btBar');
     if (bar) bar.style.width = '0%';
     try {
-      const res = await window.Strategy.backtest(inst.sym, 5, {
-        tpslFn: tpSlPlan,
-        ms: msOpts(),
-        onPhase: (ph, p, txt) => {
+      const res = await window.Strategy.backtest(inst.sym, p.years, {
+        /* ★ 必须与面板同口径：走九指标投票制，而不是旧的 5m 结构口径 */
+        vote: voteOpt(), msMode: false,
+        baseSec: p.baseSec, baseLabel: (p.baseSec === 60 ? '1m' : '5m'), sigSec: p.sigSec,
+        stopPct: p.stopPct, tpPct: p.tpPct, tpMode: 'single',
+        onPhase: (ph, pg, txt) => {
           setBtProg(txt);
-          if (bar) bar.style.width = Math.max(2, Math.round(p * 100)) + '%';
+          if (bar) bar.style.width = Math.max(2, Math.round(pg * 100)) + '%';
         },
       });
       state._btResult = res;
       renderBacktest(res, inst);
-      setBtProg(`完成 · ${res.count} 笔交易 · ${res.bars.toLocaleString('en-US')} 根 5m K线`);
+      setBtProg(`完成 · ${res.count} 笔交易 · ${res.bars.toLocaleString('en-US')} 根 ${res.baseLabel || '5m'} K线`);
     } catch (e) {
       setBtProg('回测失败：' + (e && e.message ? e.message : e));
     } finally {
       state._btRunning = false;
       btn.disabled = false;
-      btn.textContent = '开始回测（5 年）';
+      btn.textContent = '开始回测';
     }
   });
 }
@@ -2301,7 +2352,7 @@ function renderBacktest(r, inst) {
     <div class="rc"><span class="k">最大回撤</span><b class="txt-down">${pct(r.maxDD)}</b><small>固定风险 2% / 笔</small></div>
     <div class="rc"><span class="k">盈亏因子</span><b>${pf}</b><small>毛利 ÷ 毛损</small></div>
     <div class="rc"><span class="k">年化</span><b class="${cls(r.annRet)}">${r.annRet >= 0 ? '+' : ''}${(r.annRet * 100).toFixed(1)}%</b><small>${r.years.toFixed(1)} 年</small></div>
-    <div class="rc"><span class="k">平均持仓</span><b>${r.avgHoldHours.toFixed(1)} 小时</b><small>${r.avgHoldBars.toFixed(0)} 根 5m</small></div>
+    <div class="rc"><span class="k">平均持仓</span><b>${r.avgHoldHours.toFixed(1)} 小时</b><small>${r.avgHoldBars.toFixed(0)} 根 ${r.baseLabel || '5m'}</small></div>
     <div class="rc"><span class="k">样本区间</span><b>${r.spanDays.toFixed(0)} 天</b><small>${ts(r.from * 1000).slice(0, 10)} → ${ts(r.to * 1000).slice(0, 10)}</small></div>
     <div class="rc"><span class="k">5m 结构触发</span><b>${(r.msEvCount || 0).toLocaleString('en-US')}</b><small>${(r.msEvPerDay || 0).toFixed(2)} 次/天（未过 1h·15m 滤网）</small></div>
     <div class="rc"><span class="k">入场时结构分</span><b>${(r.msAvgScore || 0).toFixed(1)} / 25</b><small>${r.msLoose ? '宽松档（核心≥2）' : '严格档（CHOCH+回踩+BOS）'}${r.msMinScore ? ' · 底线 ≥' + r.msMinScore : ''}</small></div>
@@ -2325,16 +2376,28 @@ function renderBacktest(r, inst) {
   }
   if (note) {
     const srcLine = r.src === 'binance'
-      ? `K线来源 <b>币安现货 ${r.market} 5m</b>（分段 ${r.segTotal} 次，失败 ${r.segFailed}）。
+      ? `K线来源 <b>币安现货 ${r.market} ${r.baseLabel || '5m'}</b>（分段 ${r.segTotal} 次，失败 ${r.segFailed}）。
          Gate.io 永续免费接口只保留<b>最近 10000 根</b>（5m 仅约 ${r.cappedDays ? r.cappedDays.toFixed(0) : 35} 天），
          做不了 5 年，故长周期回测改用币安现货；实盘信号仍走 Gate 永续，两者存在<b>基差</b>（通常 &lt;0.1%，对 ATR 百分比止损影响可忽略）。`
-      : `K线来源 <b>Gate.io 永续 ${r.market} 5m</b>（分段 ${r.segTotal} 次，失败 ${r.segFailed}）${r.capped ? `，该源上限最近 10000 根 ≈ ${r.cappedDays.toFixed(0)} 天，已自动截断` : ''}。`;
+      : `K线来源 <b>Gate.io 永续 ${r.market} ${r.baseLabel || '5m'}</b>（分段 ${r.segTotal} 次，失败 ${r.segFailed}）${r.capped ? `，该源上限最近 10000 根 ≈ ${r.cappedDays.toFixed(0)} 天，已自动截断` : ''}。`;
+    const tpCfg = r.tpsl;
+    const bk = (tpCfg && window.Strategy) ? window.Strategy.breakevenWinRate(tpCfg.stop, tpCfg.tp, FEE_TAKER) : null;
+    const exitLine = tpCfg
+      ? `出场 = 手动指定的百分比：<b>止损 ${(tpCfg.stop * 100).toFixed(2)}% / 止盈 ${(tpCfg.tp * 100).toFixed(2)}%</b>，
+          一次性全平，盈亏比 <b>1:${(tpCfg.tp / tpCfg.stop).toFixed(2)}</b>。`
+      : `出场 = ATR 止损 + 止盈二分批（旧口径，平均止损宽度约入场价的 ${(r.avgRiskPct * 100).toFixed(2)}%）。`;
+    const beLine = bk
+      ? `<br><b>保本线</b>：扣掉手续费后，这套参数需要 <b>${(bk.breakeven * 100).toFixed(1)}%</b> 胜率才能不亏
+          （每笔进出费用 ${bk.feeR.toFixed(3)}R）；本次实测胜率
+          <b class="${r.winRate >= bk.breakeven ? 'txt-up' : 'txt-down'}">${(r.winRate * 100).toFixed(1)}%</b>，
+          ${r.winRate >= bk.breakeven ? '已过线' : '差 ' + ((bk.breakeven - r.winRate) * 100).toFixed(1) + ' 个百分点'}。`
+      : '';
     note.innerHTML = `<b>数据源</b>：${srcLine}
-      <br><b>口径</b>：入场 = 1h 定方向 + 15m 共振 + 5m 市场结构触发（CHOCH + 回踩守住 + BOS，严格档），
-      一次共振只开一次仓；回测中 1h/15m 只取<b>已收线</b>的 K 线（避免未来函数），
-      按<b>下一根 5m 开盘价</b>成交；出场 = 看板同款止盈止损（1h 方案：ATR 止损 + 止盈一/二分批），
-      同一根 K 线内同时触及止盈与止损时<b>保守按止损计</b>；已扣 <b>0.10%</b> 市价手续费（开平各一次）。
-      <b>R</b> = 净收益 ÷ 入场到止损的距离。权益曲线按「每笔风险 = 当前权益 2%」滚动。
+      <br><b>口径</b>：入场 = 九指标投票定方向（1h 定方向 + 15m 与最低周期同向），跃变沿只触发一次；
+      回测中 1h/15m 只取<b>已收线</b>的 K 线（避免未来函数），按<b>下一根 ${r.baseLabel || '5m'} 开盘价</b>成交；
+      ${exitLine}同一根 K 线内同时触及止盈与止损时<b>保守按止损计</b>；
+      已扣 <b>0.10%</b> 市价手续费（<b>进出各一次，合计 0.20%</b>）。
+      <b>R</b> = 净收益 ÷ 入场到止损的距离。权益曲线按「每笔风险 = 当前权益 2%」滚动。${beLine}
       <br><b>盈亏拆解</b>：毛利 <b class="${r.grossR >= 0 ? 'txt-up' : 'txt-down'}">${r.grossR >= 0 ? '+' : ''}${r.grossR.toFixed(1)}R</b>（${(r.grossR / Math.max(1, r.count)).toFixed(3)}R/笔）
       − 手续费 <b class="txt-down">${(-r.feeR).toFixed(1)}R</b>（${r.avgFeeR.toFixed(3)}R/笔）
       = 净 ${r.totalR.toFixed(1)}R；平均止损宽度约为入场价的 <b>${(r.avgRiskPct * 100).toFixed(2)}%</b>。
@@ -3957,7 +4020,7 @@ function selectInstrument(id) {
   if (btSym) btSym.textContent = inst.sym ? `${inst.short} · ${GATE_FUT_PAIR[inst.sym] || ''}` : `${inst.short} · 无永续合约`;
   ['#btCards', '#btList', '#btNote'].forEach(s => { const e = $(s); if (e) e.innerHTML = ''; });
   const bb = $('#btBar'); if (bb) bb.style.width = '0%';
-  setBtProg(inst.sym ? '未运行 · 点击「开始回测」跑 5 年真实 5m K线（首次约 1～4 分钟）' : '该品种无 Gate 永续合约，无法回测');
+  setBtProg(inst.sym ? '未运行 · 先在上方选粒度 / 年限 / 止损止盈，再点「开始回测」' : '该品种无 Gate 永续合约，无法回测');
   loadChart();
   updatePricePanel();
   refreshVenues(true);       // 切换品种后立即拉取该品种的多平台比价

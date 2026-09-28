@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260928a">
+<link rel="stylesheet" href="style.css?v=20260928b">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -112,11 +112,41 @@
   <section class="panel bt-panel">
     <div class="sc-head">
       <h3>开单逻辑回测 · <span id="btSym">—</span></h3>
-      <span class="sc-sub">1h 定方向 · 15m 与 5m 共振沿入场 · 看板同款止盈止损出场 · 5 年真实 5m K线（币安现货，Gate 永续只保留近 35 天）</span>
+      <span class="sc-sub">九指标投票定方向（1h 定方向 + 15m 与最低周期同向）· 撮合粒度与信号周期可分别指定（1m / 5m）· 止损止盈按成交价百分比手动设定</span>
+    </div>
+    <div class="bt-form">
+      <label class="bt-fld">撮合粒度
+        <select id="btBase">
+          <option value="60">1m</option>
+          <option value="300" selected>5m</option>
+        </select>
+      </label>
+      <label class="bt-fld">信号最低周期
+        <select id="btSig">
+          <option value="60">1m</option>
+          <option value="300" selected>5m</option>
+        </select>
+      </label>
+      <label class="bt-fld">年限
+        <select id="btYears">
+          <option value="1">1 年</option>
+          <option value="2" selected>2 年</option>
+          <option value="3">3 年</option>
+          <option value="5">5 年</option>
+        </select>
+      </label>
+      <label class="bt-fld">止损 %<input id="btStop" type="number" value="1.5" min="0.05" max="30" step="0.1"></label>
+      <label class="bt-fld">止盈 %<input id="btTp" type="number" value="3" min="0.05" max="60" step="0.1"></label>
+      <span class="bt-presets">
+        <button class="btn-xs bt-ps" data-stop="1" data-tp="1">1:1 (1%:1%)</button>
+        <button class="btn-xs bt-ps" data-stop="1.5" data-tp="3">1:2 (1.5%:3%)</button>
+        <button class="btn-xs bt-ps" data-stop="1" data-tp="3">1:3 (1%:3%)</button>
+      </span>
+      <div class="bt-be" id="btBE"></div>
     </div>
     <div class="bt-ctrl">
-      <button class="btn-xs bt-run" id="btRun">开始回测（5 年）</button>
-      <span class="bt-tip" id="btProg">未运行 · 首次约需 2～5 分钟（5 年 5m K线约 53 万根，分 526 段并发拉取）</span>
+      <button class="btn-xs bt-run" id="btRun">开始回测</button>
+      <span class="bt-tip" id="btProg">未运行</span>
     </div>
     <div class="bt-bar"><i id="btBar"></i></div>
     <div class="bt-cards" id="btCards"></div>
@@ -484,7 +514,7 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260928a · 九指标投票定方向（EMA/MACD/ADX/RSI/KDJ/BOLL/OBV/VOL + MA200 位置，赢家≥4票且多于反方）· 1H 定方向 + 15m·5m 同向 → 刚凑齐那一根触发一次 · K线叠加200日均线 · 数据有效性自检页 · 5m市场结构（CHOCH·Retest·BOS）· Gate.io 永续实盘 / 币安现货 5m 5年回测（无未来函数）</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260928b · 九指标投票定方向（EMA/MACD/ADX/RSI/KDJ/BOLL/OBV/VOL + MA200 位置，赢家≥4票且多于反方）· 1H 定方向 + 15m 与最低周期同向 → 刚凑齐那一根触发一次 · 回测支持 1m 撮合、信号/撮合粒度分离、止损止盈按百分比手动指定并实时算扣费后的保本胜率 · K线叠加200日均线 · 数据有效性自检页 · Gate.io 永续实盘 / 币安现货历史（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
 
@@ -504,9 +534,9 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260928a"></script>
-<script src="lsmap.js?v=20260928a"></script>
-<script src="strategy.js?v=20260928a"></script>
-<script src="app.js?v=20260928a"></script>
+<script src="liq-map.js?v=20260928b"></script>
+<script src="lsmap.js?v=20260928b"></script>
+<script src="strategy.js?v=20260928b"></script>
+<script src="app.js?v=20260928b"></script>
 </body>
 </html>
