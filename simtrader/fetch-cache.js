@@ -1,7 +1,7 @@
 /* 5m 历史缓存：避免每轮实验重复拉 80s */
 const fs = require('fs');
 const path = require('path');
-const S = require('./strategy.js');
+const S = require('./simtrader/strategy.js');
 
 const DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DIR)) fs.mkdirSync(DIR, { recursive: true });

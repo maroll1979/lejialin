@@ -329,6 +329,32 @@ button { font-family: inherit; }
 .v21-verdict.off { background: #f4f6f9; color: var(--muted-2); }
 .v21-note { font-size: 9px; color: var(--muted-2); line-height: 1.55; }
 
+/* 第 7 节总分区间条（0-49 / 50-69 / 70-79 / 80-89 / 90-100） */
+.v21-band { display: flex; align-items: baseline; gap: 8px; margin: 0 0 7px; padding: 3px 7px;
+  border-radius: var(--r-sm); font-size: 9px; border: 1px solid var(--line); }
+.v21-band-n { font-size: 10px; font-weight: 700; color: var(--text); }
+.v21-band-a { color: var(--muted-2); }
+.v21-band.b00 { background: #f7f8fa; }
+.v21-band.b50 { background: rgba(38, 122, 255, .06); border-color: rgba(38, 122, 255, .18); }
+.v21-band.b70 { background: rgba(255, 168, 38, .08); border-color: rgba(255, 168, 38, .22); }
+.v21-band.b70 .v21-band-n { color: #c47f00; }
+.v21-band.b80 { background: rgba(217, 44, 44, .07); border-color: rgba(217, 44, 44, .2); }
+.v21-band.b80 .v21-band-n { color: var(--up); }
+.v21-band.b90 { background: rgba(217, 44, 44, .13); border-color: rgba(217, 44, 44, .3); }
+.v21-band.b90 .v21-band-n { color: var(--up); }
+
+/* 第 9 节 Confirmed / Live 双状态 */
+.v21-dual { display: grid; gap: 4px; margin: 5px 0 2px; }
+.v21-d { display: grid; gap: 1px; padding: 4px 7px; border-radius: var(--r-sm);
+  background: #f4f6f9; border: 1px solid var(--line); }
+.v21-d.on { background: rgba(217, 44, 44, .07); border-color: rgba(217, 44, 44, .22); }
+.v21-d.warn { background: rgba(255, 168, 38, .1); border-color: rgba(255, 168, 38, .28); }
+.v21-dt { font-size: 9px; color: var(--muted-2); }
+.v21-d > b { font-size: 10px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+.v21-d.on > b { color: var(--up); }
+.v21-d.warn > b { color: #c47f00; }
+.v21-d > em { font-size: 9px; font-style: normal; color: var(--muted-2); }
+
 .ind-panel { margin-top: 12px; }
 .ind-empty { font-size: 11px; color: var(--muted-2); padding: 6px 0; }
 .ind-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 7px; }

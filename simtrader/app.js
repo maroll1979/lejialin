@@ -1729,6 +1729,15 @@ function paintV21(r, err) {
   const gHtml = gates.map(x => `<div class="v21-g ${x[1] ? 'on' : 'off'}"><i></i><span>${x[0]}</span><b>${x[2]}</b></div>`).join('');
   const pass = long ? d.long : d.short;
 
+  /* 第 9 节双状态：Live（进行中那根，只能预警）vs Confirmed（已收线，可正式翻方向） */
+  const dc = r.confirmed || d;
+  const longC = dc.longScore >= dc.shortScore;
+  const totC = longC ? dc.longScore : dc.shortScore;
+  const passC = longC ? dc.long : dc.short;
+  const bandC = r.bandC || V.scoreBand(totC);
+  const sameDir = longC === long;
+  const band = V.scoreBand(tot);
+
   box.innerHTML = `
     <div class="v21-head">
       <span class="v21-title">多周期层级评分 v2.1（第 7 节 100 分制）·
@@ -1740,18 +1749,36 @@ function paintV21(r, err) {
         </label>
       </span>
     </div>
+    <div class="v21-band ${band.cls}">
+      <span class="v21-band-n">${band.name}</span>
+      <span class="v21-band-a">${band.act}</span>
+    </div>
     <div class="v21-body">
       <div class="v21-rows">${rows}</div>
       <div class="v21-side">
         <div class="v21-kv"><span>总分 / 门槛</span><b class="${tot >= thr ? 'up' : ''}">${tot.toFixed(1)} / ${thr}</b></div>
         <div class="v21-kv"><span>另一侧</span><b>${(long ? d.shortScore : d.longScore).toFixed(1)} / ${long ? d.sThr : d.lThr}</b></div>
         <div class="v21-kv"><span>5m ATR(14)</span><b>${r.atr5 ? fmt(r.atr5, dec) : '—'}</b></div>
+        <div class="v21-dual">
+          <div class="v21-d ${passC ? 'on' : ''}">
+            <span class="v21-dt">Confirmed · 已收线</span>
+            <b>${totC.toFixed(1)} / 100 · ${passC ? (longC ? 'LONG' : 'SHORT') + ' 成立' : '未成立'}</b>
+            <em>${bandC.name}</em>
+          </div>
+          <div class="v21-d ${pass && !passC ? 'warn' : (pass ? 'on' : '')}">
+            <span class="v21-dt">Live · 进行中 K</span>
+            <b>${tot.toFixed(1)} / 100 · ${pass ? 'Gate 已过（仅预警）' : '未达'}</b>
+            <em>${sameDir ? '与 Confirmed 同向' : '方向有分歧 —— Live 不得单独翻向'}</em>
+          </div>
+        </div>
         <div class="v21-gates">${gHtml}</div>
         <div class="v21-verdict ${pass ? 'on' : 'off'}">${pass
           ? (long ? 'LONG 信号成立' : 'SHORT 信号成立')
           : (tot >= thr ? '分数够了，但 Gate 未过 —— 不开仓' : '还差 ' + (thr - tot).toFixed(1) + ' 分到门槛')}</div>
         <div class="v21-note">周期不是投票，是层级状态机：<b>4H 背景 → 1H 方向 → 30m 衰竭 → 15m Setup → 5m 扳机</b>。
           评分只解决质量，Gate 解决是否允许开仓，两者同时满足才出信号。</div>
+        <div class="v21-note">第 9 节双状态：<b>Confirmed</b>（已收线）才能正式翻转主趋势并开仓；
+          <b>Live</b>（进行中 K + 低周期 nowcast）只能预警 / 停止追单 / 收紧风险。</div>
       </div>
     </div>`;
   bindV21Ctrl();

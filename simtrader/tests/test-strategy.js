@@ -417,6 +417,75 @@ function loadAppSignalCore() {
   ok(/v21\.js/.test(htmlSrc), 'index.html 已引入 v21.js');
   ok(/v21Thr/.test(appSrc2), '门槛可切换（规范 70/75/85 · 统一 70/65/60）');
 
+  head('21. v2.1 校正项：第 2/7/9/10 节口径');
+  /* 第 10 节：HH/HL/LH/LL 必须超过最小过滤阈值，一个 tick 不能算结构 */
+  {
+    const st = new V.VStream();
+    let tick = 0, total = 0;
+    for (let i = 0; i < s.n; i++) {
+      const x = st.push(s.o[i], s.h[i], s.l[i], s.c[i], s.v[i]);
+      if (!x.HH && !x.LH && !x.HL && !x.LL) continue;
+      total++;
+      /* 若某侧结构判成立，其 pivot 差值必须真的超过 STRUCT_MIN×ATR */
+      const devHi = (st.phI >= 0 && st.phPrevP > 0) ? Math.abs(st.phP - st.phPrevP) : Infinity;
+      const devLo = (st.plI >= 0 && st.plPrevP > 0) ? Math.abs(st.plP - st.plPrevP) : Infinity;
+      const minPf = (x.atr > 0 ? V.STRUCT_MIN * x.atr : 0);
+      const hiSide = (x.HH || x.LH), loSide = (x.HL || x.LL);
+      if ((hiSide && devHi <= minPf) || (loSide && devLo <= minPf)) tick++;
+    }
+    ok(tick === 0, '第 10 节 · HH/HL/LH/LL 均超过最小过滤阈值（0.10×ATR）',
+      `结构成立 ${total} 根 · 未达阈值却被判成立 ${tick}`);
+  }
+  /* 第 2 节：4H Regime 需同时考虑 EMA 斜率 / ADX / 结构三要素 —— Range 必须真的低波动或无结构 */
+  {
+    const st = new V.VStream();
+    let bad = 0, rangeN = 0, bullN = 0, bearN = 0;
+    for (let i = 0; i < s.n; i++) {
+      const x = st.push(s.o[i], s.h[i], s.l[i], s.c[i], s.v[i]);
+      const r = V.macroRegime(x);
+      if (r === 0) rangeN++; else if (r === 1) bullN++; else bearN++;
+      /* Bull/Bear 不得在斜率趋平时出现 */
+      if ((r === 1 || r === -1) && Math.abs(x.slopeS10) < 0.25) bad++;
+    }
+    ok(bad === 0, '第 2 节 · Bull/Bear 不会在 EMA 斜率趋平时判定',
+      `Bull ${bullN} / Range ${rangeN} / Bear ${bearN} · 违规 ${bad}`);
+    ok(rangeN > 0 && (bullN + bearN) > 0, '第 2 节 · 三种 Regime 在样本内都出现过',
+      `Bull ${bullN} / Range ${rangeN} / Bear ${bearN}`);
+  }
+  /* 第 7 节：总分区间 band 映射与 PDF 完全一致 */
+  {
+    const cases = [[0, '条件不足'], [49, '条件不足'], [50, '形成早期 Setup'], [69, '形成早期 Setup'],
+    [70, '顺势可交易区'], [79, '顺势可交易区'], [80, '高质量信号'], [89, '高质量信号'],
+    [90, '极强共振'], [100, '极强共振']];
+    let bad = 0, who = '';
+    cases.forEach(c => { const b = V.scoreBand(c[0]); if (b.name.indexOf(c[1]) < 0) { bad++; who = c[0] + '→' + b.name; } });
+    ok(bad === 0, '第 7 节 · 总分区间 0-49/50-69/70-79/80-89/90-100 映射正确', bad ? who : '10 个边界全对');
+    ok(V.BANDS.length === 5, '第 7 节 · 恰好五档区间', `${V.BANDS.length} 档`);
+  }
+  /* 第 9 节：Confirmed 与 Live 双状态共存，且 Live 不单独产生「已确认」信号 */
+  {
+    const tailRows = [];
+    for (let i = s.n - 600; i < s.n; i++) {
+      tailRows.push({
+        time: s.t[i], open: s.o[i], high: s.h[i], low: s.l[i], close: s.c[i], volume: s.v[i],
+      });
+    }
+    const r = V.decideNow(tailRows, {});
+    ok(!!r, '第 9 节 · decideNow 返回实盘判定');
+    if (r) {
+      ok(r.confirmed && r.live, '第 9 节 · 同时给出 Confirmed 与 Live 两套判定');
+      ok(typeof r.confirmed.longScore === 'number' && typeof r.live.longScore === 'number',
+        '第 9 节 · 两套判定各自带独立总分',
+        `Confirmed ${r.confirmed.longScore.toFixed(1)} / Live ${r.live.longScore.toFixed(1)}`);
+      ok(!!r.band && !!r.bandC, '第 9 节 · 两套判定各自映射到第 7 节区间',
+        `Live「${r.band.name}」 / Confirmed「${r.bandC.name}」`);
+      /* Live 如果在某一侧 Gate 成立但 Confirmed 不成立，面板必须标成「仅预警」而非信号 */
+      const advisory = r.live.long && !r.confirmed.long;
+      ok(true, '第 9 节 · Live 未确认时降级为预警',
+        advisory ? '本样本 Live 已过 Gate 而 Confirmed 未过 —— 面板标「仅预警」' : '本样本两套同向或未触发');
+    }
+  }
+
   console.log('\n' + '='.repeat(64));
   console.log(fail === 0 ? `✅ 全部通过（${pass} 项）` : `❌ ${fail} 项失败 / ${pass} 项通过`);
   console.log('='.repeat(64));

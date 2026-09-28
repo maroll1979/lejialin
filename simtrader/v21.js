@@ -64,6 +64,7 @@
   const DIV_KEEP = 16, DIV_VALID = 40;   // 背离有效期（根）：16 根内满分，40 根后失效
   const FB_KEEP = 8, FB_VALID = 20;      // 假突破有效期
   const STRUCT_FRESH = 12;               // HL / LH 雏形新鲜度上限（根）
+  const STRUCT_MIN = 0.10;               // 第 10 节：HH/HL/LH/LL 最小过滤阈值（× ATR），避免一个 tick 也算结构
 
   /* 七状态机（第 4 节 30m Transition） */
   const ST = { STRONG_BEAR: -3, BEAR: -2, BEAR_EXH: -1, TRANSITION: 0, BULL_EXH: 1, BULL: 2, STRONG_BULL: 3 };
@@ -308,10 +309,13 @@
         this.phR = rAt; this.phD = dAt; this.phO = oAt;
       }
     }
-    const HH = (this.phI >= 0 && this.phPrevP > 0) ? this.phP > this.phPrevP : false;
-    const LH = (this.phI >= 0 && this.phPrevP > 0) ? this.phP < this.phPrevP : false;
-    const HL = (this.plI >= 0 && this.plPrevP > 0) ? this.plP > this.plPrevP : false;
-    const LL = (this.plI >= 0 && this.plPrevP > 0) ? this.plP < this.plPrevP : false;
+    /* 第 10 节：HH/HL/LH/LL 必须超过「最小过滤阈值」，差值小于阈值视为结构无有效变化
+       （HH 与 LH 同时为 false，而不是各判一半） */
+    const MF = atr > 0 ? STRUCT_MIN * atr : 0;
+    const dHi = (this.phI >= 0 && this.phPrevP > 0) ? (this.phP - this.phPrevP) : 0;
+    const dLo = (this.plI >= 0 && this.plPrevP > 0) ? (this.plP - this.plPrevP) : 0;
+    const HH = dHi > MF, LH = dHi < -MF;
+    const HL = dLo > MF, LL = dLo < -MF;
     const hlFresh = this.plT >= 0 && (i - this.plT) <= STRUCT_FRESH;
     const lhFresh = this.phT >= 0 && (i - this.phT) <= STRUCT_FRESH;
     /* 背离有效分（带淡出） */
@@ -420,6 +424,7 @@
     const Sp = at ? clampN(emaS + macdS + adxS + rsiS + msS, 0, 20) : 0;
     return {
       long: L, short: Sp,
+      signed: L - Sp,                       // 第 3 节输出建议：trend_score_1h ∈ [-20, +20]
       ema: emaL, emaS: emaS, macd: macdL, macdS: macdS,
       adx: adxL, adxS: adxS, rsi: rsiL, rsiS: rsiS, ms: msL, msS: msS,
     };
@@ -474,13 +479,15 @@
     const L = okA ? clampN(h1L + acL + decL + exL + vcL + obvL + atL, 0, 25) : 0;
     const Sp = okA ? clampN(h1S + acS + decS + exS + vcS + obvS + atS, 0, 25) : 0;
 
-    /* 七状态机 */
+    /* 七状态机（第 4 节）：Strong = 趋势强 + 结构完整 + 动能仍增强，三者缺一只能算普通 Bull/Bear */
     const bull = x.e12 > x.e26 && x.dif > x.dea;
     const bear = x.e12 < x.e26 && x.dif < x.dea;
     const strong = x.adx != null && x.adx > 30 && x.adxSpd > 0;
+    const structBull = x.HH || x.HL;      // 多头结构完整（HH 或 HL）
+    const structBear = x.LH || x.LL;      // 空头结构完整（LH 或 LL）
     let state;
-    if (bear) state = strong ? ST.STRONG_BEAR : (L >= 12 ? ST.BEAR_EXH : ST.BEAR);
-    else if (bull) state = strong ? ST.STRONG_BULL : (Sp >= 12 ? ST.BULL_EXH : ST.BULL);
+    if (bear) state = (strong && structBear) ? ST.STRONG_BEAR : (L >= 12 ? ST.BEAR_EXH : ST.BEAR);
+    else if (bull) state = (strong && structBull) ? ST.STRONG_BULL : (Sp >= 12 ? ST.BULL_EXH : ST.BULL);
     else state = ST.TRANSITION;
 
     return {
@@ -541,8 +548,16 @@
   function macroRegime(x) {
     const upStruct = (x.HH ? 1 : 0) + (x.HL ? 1 : 0);
     const dnStruct = (x.LH ? 1 : 0) + (x.LL ? 1 : 0);
-    if (x.slopeS10 > 0.25 && upStruct >= 1 && upStruct >= dnStruct) return REG.BULL;
-    if (x.slopeS10 < -0.25 && dnStruct >= 1 && dnStruct >= upStruct) return REG.BEAR;
+    /* Range 三要素：EMA 斜率趋平 / ADX 低或下降 / 结构无连续 HH-HL 或 LH-LL，命中两条即判震荡 */
+    const flat = Math.abs(x.slopeS10) < 0.25;
+    const adxLow = x.adx == null || x.adx < 20 || x.adxSpd < 0;
+    const noStruct = upStruct === 0 && dnStruct === 0;
+    if ((flat && adxLow) || (flat && noStruct) || (adxLow && noStruct)) return REG.RANGE;
+    /* Bull / Bear 还需第三个要素：动能不得「明显反着走」 */
+    const momUp = !(x.hist < 0 && x.h1N < 0);        // 多头：动能非明显恶化
+    const momDn = !(x.hist > 0 && x.h1N > 0);        // 空头：动能非明显修复
+    if (x.slopeS10 > 0.25 && upStruct >= 1 && upStruct >= dnStruct && momUp) return REG.BULL;
+    if (x.slopeS10 < -0.25 && dnStruct >= 1 && dnStruct >= upStruct && momDn) return REG.BEAR;
     return REG.RANGE;
   }
 
@@ -585,6 +600,20 @@
   function thresholdFor(reg, dir) {
     if (reg === REG.RANGE) return TH_RANGE;
     return (reg === dir) ? TH_WITH : TH_AGAINST;
+  }
+
+  /* 第 7 节 · 总分区间 → 系统解释与动作建议 */
+  const BANDS = [
+    { lo: 90, name: '极强共振', act: '仍需遵守风险与止损，不代表必胜', cls: 'b90' },
+    { lo: 80, name: '高质量信号', act: '可作为主信号', cls: 'b80' },
+    { lo: 70, name: '顺势可交易区', act: '需要 5m Trigger 完整', cls: 'b70' },
+    { lo: 50, name: '形成早期 Setup', act: '观察；不主动追单', cls: 'b50' },
+    { lo: 0, name: '条件不足 / 噪声为主', act: '不交易', cls: 'b00' },
+  ];
+  function scoreBand(v) {
+    if (!isFinite(v)) return BANDS[4];
+    for (let k = 0; k < BANDS.length; k++) if (v >= BANDS[k].lo) return BANDS[k];
+    return BANDS[4];
   }
 
   /* 单点判定。p 为各层取值（已按回测/实盘口径取好索引） */
@@ -719,29 +748,52 @@
     const s5 = toSeries(candles.map(c => ({
       time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0,
     })));
+    /* 第 9 节：Confirmed State（已收线，可翻方向的正式标签）与 Live Transition（进行中，只能预警）
+       两套口径共用同一份 decideAt，只是粗周期取「已收线」还是「进行中」那根 */
     const V = build(s5, { live: true, cache: opt.cache, tfs: opt.tfs });
+    /* Confirmed 口径复用同一份 tfScores（评分与 live 与否无关），只重建「已收线」索引映射，
+       避免为第二套状态机再跑一遍 32 万根 VStream */
+    const VC = {
+      s15: V.s15, s30: V.s30, s1h: V.s1h, s4h: V.s4h,
+      v15: V.v15, v30: V.v30, v1h: V.v1h, v4h: V.v4h, ms: V.ms,
+      m15: buildClosedMap(s5.t, V.s15.t, TF_SEC['5m'], TF_SEC['15m']),
+      m30: buildClosedMap(s5.t, V.s30.t, TF_SEC['5m'], TF_SEC['30m']),
+      m1h: buildClosedMap(s5.t, V.s1h.t, TF_SEC['5m'], TF_SEC['1h']),
+      m4h: buildClosedMap(s5.t, V.s4h.t, TF_SEC['5m'], TF_SEC['4h']),
+      live: false,
+    };
     const i = n - 1;
     const ms = msReplay(candles);
-    const j15 = V.m15[i], j30 = V.m30[i], j1h = V.m1h[i], j4h = V.m4h[i];
-    if (j15 < 0 || j30 < 0 || j1h < 0 || j4h < 0) return null;
-    const P = {
-      tL: V.v1h.tL[j1h], tS: V.v1h.tS[j1h],
-      rL: V.v30.rL[j30], rS: V.v30.rS[j30],
-      st1: V.v1h.stt[j1h], st30: V.v30.stt[j30],
-      uL: V.v15.uL[j15], uS: V.v15.uS[j15],
-      reg: V.v4h.reg[j4h],
-      trigL: ms.lsc[i], trigS: ms.ssc[i],
-      lsf: ms.lsf[i], ssf: ms.ssf[i],
-      lLvl: ms.llv[i], sLvl: ms.slv[i],
-      c5: s5.c[i], atr5: ms.atr[i],
-    };
-    const d = decideAt(P, opt);
+    function pack(B) {
+      const j15 = B.m15[i], j30 = B.m30[i], j1h = B.m1h[i], j4h = B.m4h[i];
+      if (j15 < 0 || j30 < 0 || j1h < 0 || j4h < 0) return null;
+      return {
+        tL: B.v1h.tL[j1h], tS: B.v1h.tS[j1h],
+        rL: B.v30.rL[j30], rS: B.v30.rS[j30],
+        st1: B.v1h.stt[j1h], st30: B.v30.stt[j30],
+        uL: B.v15.uL[j15], uS: B.v15.uS[j15],
+        reg: B.v4h.reg[j4h],
+        trigL: ms.lsc[i], trigS: ms.ssc[i],
+        lsf: ms.lsf[i], ssf: ms.ssf[i],
+        lLvl: ms.llv[i], sLvl: ms.slv[i],
+        c5: s5.c[i], atr5: ms.atr[i],
+      };
+    }
+    const P = pack(V);
+    if (!P) return null;
+    const PC = pack(VC) || P;
+    const d = decideAt(P, opt);          // Live（实时）
+    const dc = decideAt(PC, opt);        // Confirmed（已收线）
     const msSnap = msCopy(ms.last || {});
     return {
       i: i, d: d, P: P, reg: P.reg, regName: REG_NAME[P.reg],
       st1: P.st1, st1Name: ST_NAME[P.st1], st30: P.st30, st30Name: ST_NAME[P.st30],
       v15: tfLast(V.s15), v30: tfLast(V.s30), v1h: tfLast(V.s1h), v4h: tfLast(V.s4h),
       ms: msSnap, atr5: P.atr5, c5: P.c5,
+      /* 第 9 节双状态：Confirmed 可正式翻方向；Live 只能触发预警 / 停止追单 / 收紧风险 */
+      confirmed: dc, live: d, PC: PC,
+      band: scoreBand(Math.max(d.longScore, d.shortScore)),
+      bandC: scoreBand(Math.max(dc.longScore, dc.shortScore)),
       V: V, s5: s5,
     };
   }
@@ -928,6 +980,8 @@
     macroRegime: macroRegime,
     tfScores: tfScores, tfLast: tfLast,
     thresholdFor: thresholdFor, decideAt: decideAt,
+    BANDS: BANDS, scoreBand: scoreBand,
+    STRUCT_MIN: STRUCT_MIN, PIV: PIV, DIV_VALID: DIV_VALID, FB_VALID: FB_VALID,
     build: build, findSignals: findSignals, decideNow: decideNow,
     simulate: simulate, stats: stats, byRegime: byRegime,
     leadStats: leadStats, chainStats: chainStats,
