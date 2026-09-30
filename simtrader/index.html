@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 多品种模拟交易终端 · SimTrader</title>
-<link rel="stylesheet" href="style.css?v=20260928c">
+<link rel="stylesheet" href="style.css?v=20260930a">
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -59,7 +59,8 @@
         <div class="ch-zoom" title="缩放与复位；也可鼠标滚轮上下缩放、按住图表左右拖动、Shift+滚轮横向平移">
           <button id="zoomOut" title="缩小">－</button>
           <button id="zoomIn" title="放大">＋</button>
-          <button id="zoomReset" title="复位到铺满">复位</button>
+          <button id="zoomReset" title="复位到最近一段视野">复位</button>
+          <button id="viewAll" title="铺满全部已加载K线（5分钟图约 3.5 天），用来回看历史信号触发点">全景</button>
         </div>
         <button id="liqToggle" class="liq-sw" title="显示/隐藏 K线左侧的「多空清算图」：Gate.io 永续真实强平订单，按价位聚合">清算图</button>
         <span class="liq-win" id="liqWin">
@@ -531,9 +532,12 @@
   </div>
 </section>
 
-<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260928c · 九指标投票定方向（EMA/MACD/ADX/RSI/KDJ/BOLL/OBV/VOL + MA200 位置，赢家≥4票且多于反方）· 1H 定方向 + 15m 与最低周期同向 → 刚凑齐那一根触发一次 · 回测支持 1m 撮合、信号/撮合粒度分离、止损止盈按百分比手动指定并实时算扣费后的保本胜率 · 多空热力图增加「量能结构带」（POC / 中间聚集的价值区 / 上下最薄带 + 左侧价位轴）· K线叠加200日均线 · 数据有效性自检页 · Gate.io 永续实盘 / 币安现货历史（无未来函数）</span></footer>
+<footer class="foot">SimTrader · 模拟交易研究终端 · 数据延迟取决于上游数据源 · 不构成投资建议 · <span id="buildTag" style="color:#94a3b8">构建 v20260930a · 九指标投票定方向（EMA/MACD/ADX/RSI/KDJ/BOLL/OBV/VOL + MA200 位置，赢家≥4票且多于反方）· 1H 定方向 + 15m 与最低周期同向 → 刚凑齐那一根触发一次 · 回测支持 1m 撮合、信号/撮合粒度分离、止损止盈按百分比手动指定并实时算扣费后的保本胜率 · 多空热力图增加「量能结构带」（POC / 中间聚集的价值区 / 上下最薄带 + 左侧价位轴）· 信号窗口拉长到 3.5 天并给出触发历史列表（点击跳到该根K线）· 新触发走横幅+声音+桌面通知+标题四路提醒 · K线叠加200日均线 · 数据有效性自检页 · Gate.io 永续实盘 / 币安现货历史（无未来函数）</span></footer>
 
 <div id="toast" class="toast"></div>
+
+<!-- ★ 新信号提醒横幅：信号只在「三周期刚凑齐那一根」出现一次，静默刷新必然错过 -->
+<div id="sigAlert" class="sig-alert" hidden></div>
 
 <!-- 二次确认弹窗 -->
 <div class="modal-mask" id="modalMask">
@@ -551,9 +555,9 @@
   </div>
 </div>
 
-<script src="liq-map.js?v=20260928c"></script>
-<script src="lsmap.js?v=20260928c"></script>
-<script src="strategy.js?v=20260928c"></script>
-<script src="app.js?v=20260928c"></script>
+<script src="liq-map.js?v=20260930a"></script>
+<script src="lsmap.js?v=20260930a"></script>
+<script src="strategy.js?v=20260930a"></script>
+<script src="app.js?v=20260930a"></script>
 </body>
 </html>

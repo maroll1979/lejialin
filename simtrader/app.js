@@ -41,6 +41,18 @@ const MMR = 0.005;            // 维持保证金率（用于计算强平价）
 const LEVERS = [1, 10, 20, 50];          // 简化窗口：去掉 2x / 3x / 5x，只保留 1x / 10x / 20x / 50x
 const LEVER_DEFAULT = 10;
 
+/* ---------- K线加载深度 与 图表默认视野（2026-09-30）
+   为什么要拉长：信号只在「三周期刚凑齐同向的那一根」响一次，页面原本只加载
+   200~300 根，等于只有十几小时的历史，用户打开页面时触发点早就滑出窗口了 ——
+   于是「明明回测里有 1772 次，页面上却从没见过」。5m 拉到 1000 根 ≈ 3.5 天，
+   15m / 1h 同步加深，保证 5m 窗口里每一根都能映射到已收线的粗周期
+   （映射不上会被判成「无表态」，白白丢样本）。
+   图表的默认视野仍保持紧凑（DEF_VIEW_BARS），否则 1000 根会被压成一团看不清；
+   想回看点「全景」按钮或拖动即可。 */
+const BARS_BY_TF = { '5m': 1000, '15m': 600, '1h': 300, '1d': 300 };
+const DEF_VIEW_BARS = 260;                // 图表默认可视根数（5m ≈ 22 小时，15m ≈ 2.7 天）
+function barsForTf(tf) { return BARS_BY_TF[tf] || 300; }
+
 /* ---------- 右上角刷新档位
    仅控制「行情/分析数据」的刷新节奏（K线、信号、涨跌热力矩阵、成交热力图、止盈止损方案）。
    实时价格轮询（5s）与逐笔成交撮合/强平检查不随档位变化 —— 它们是交易核心，
@@ -1305,6 +1317,10 @@ function initChart() {
   bind('#zoomIn', () => zoomChart(1 / 1.5));
   bind('#zoomOut', () => zoomChart(1.5));
   bind('#zoomReset', () => resetChartZoom());
+  bind('#viewAll', () => showAllBars());      // 铺满全部已加载 K 线，回看历史触发点
+  /* 浏览器的自动播放策略：必须先有用户交互才能出声。任意一次点击/按键后解锁音频上下文 */
+  document.addEventListener('pointerdown', unlockAudio);
+  document.addEventListener('keydown', unlockAudio);
   /* 清算图统计窗口：24h / 3天 / 7天 */
   const winBox = $('#liqWin');
   if (winBox) {
@@ -1365,7 +1381,36 @@ function zoomChart(factor) {
 }
 function resetChartZoom() {
   if (!state.chart) return;
+  clampChartView();                       // 复位到「最近一段」而不是全部，避免 1000 根被压成一团
+}
+/* 把可视范围限制到最后 DEF_VIEW_BARS 根。
+   setData 之后立刻设置可能还没布局完成，所以同步设一次 + 下一帧再设一次。 */
+function clampChartView(n) {
+  if (!state.chart) return;
+  const ts = state.chart.timeScale();
+  const total = n || (state.candles[state.current + '_' + state.tf] || []).length;
+  if (!total) return;
+  if (total <= DEF_VIEW_BARS) { try { ts.fitContent(); } catch (e) {} return; }
+  const rng = { from: total - DEF_VIEW_BARS - 2, to: total + 2 };
+  try { ts.setVisibleLogicalRange(rng); } catch (e) {}
+  requestAnimationFrame(() => { try { ts.setVisibleLogicalRange(rng); } catch (e) {} });
+}
+/* 「全景」：铺满全部已加载 K 线（5m 约 3.5 天），用于回看历史触发点 */
+function showAllBars() {
+  if (!state.chart) return;
   try { state.chart.timeScale().fitContent(); } catch (e) {}
+}
+/* 把视图移到某根 K 线（触发历史列表点击后跳转） */
+function jumpToTime(epochSec) {
+  if (!state.chart || !epochSec) return;
+  const bars = state.candles[state.current + '_' + state.tf] || [];
+  if (!bars.length) return;
+  let idx = bars.length - 1;
+  for (let i = bars.length - 1; i >= 0; i--) { if (bars[i].time <= epochSec) { idx = i; break; } }
+  let lr = null;
+  try { lr = state.chart.timeScale().getVisibleLogicalRange(); } catch (e) {}
+  const span = (lr && isFinite(lr.to - lr.from)) ? Math.max(20, lr.to - lr.from) : DEF_VIEW_BARS;
+  try { state.chart.timeScale().setVisibleLogicalRange({ from: idx - span * 0.7, to: idx + span * 0.3 }); } catch (e) {}
 }
 /* 键盘微调：↑↓ 放大/缩小、←→ 左右平移（输入框内不接管），配合滚轮与拖动一起用 */
 function bindChartHotkeys() {
@@ -1400,7 +1445,7 @@ async function loadChart(force) {
       note.textContent = `美债收益率为日频官方数据，三周期视图显示同一日线序列`;
       if (candles.length > 260) candles = candles.slice(-260);
     } else {
-      candles = force ? await fetchKlines(inst.sym, state.tf, 300) : await ensureCandles(inst, state.tf);
+      candles = force ? await fetchKlines(inst.sym, state.tf, barsForTf(state.tf)) : await ensureCandles(inst, state.tf);
       note.textContent = `数据源：${srcKindText()} · ${TF_NAME[state.tf]}K线 · 黄金取 XAUUSDT 黄金永续`;
     }
     state.candles[state.current + '_' + state.tf] = candles;
@@ -1801,6 +1846,7 @@ function paintChart(candles) {
   if (state.chartFitKey !== fitKey) {
     state.chartFitKey = fitKey;
     state.chart.timeScale().fitContent();
+    clampChartView(candles.length);      // 数据变深了，默认视野仍保持紧凑，历史靠拖动/全景回看
   }
   if (window.LiqMap) { window.LiqMap.setCandles(candles); window.LiqMap.render(); }   // 清算图随 K 线重绘
 }
@@ -2051,12 +2097,19 @@ async function ensureVoteCandles(inst) {
   const key = inst.id + '_vote';
   if (state.candlesVote && state.candlesVoteTs && Date.now() - state.candlesVoteTs < 120000
     && state.candlesVoteKey === key) return state.candlesVote;
-  const get = async tf => { try { return await fetchKlines(inst.sym, tf, 300); } catch (e) { return null; } };
+  /* 粗周期同样要加深：5m 有 1000 根（≈3.5 天），15m 只有 300 根（≈3.1 天）时，
+     窗口最前面那一截 5m 会映射不到已收线的 15m，被判成「无表态」而白白丢样本。 */
+  const get = async tf => { try { return await fetchKlines(inst.sym, tf, barsForTf(tf)); } catch (e) { return null; } };
   const [a, b] = await Promise.all([get('15m'), get('1h')]);
+  /* 5m 复用主流程已缓存的那份（runSignals 会按 BARS_BY_TF 拉满），取不到再自己拉 */
+  let c5 = state.candles[inst.id + '_5m'] || [];
+  if (c5.length < 80) {
+    try { c5 = await fetchKlines(inst.sym, '5m', BARS_BY_TF['5m']); state.candles[inst.id + '_5m'] = c5; } catch (e) { c5 = []; }
+  }
   /* MA200 走已有的日线缓存（30 分钟），返回 { points, last, prevDay, n } */
   let ma = null;
   try { ma = await ensureMa200(inst); } catch (e) { ma = null; }
-  const pack = { c5: state.candles[inst.id + '_5m'] || [], c15: a, c1h: b, ma: ma };
+  const pack = { c5: c5, c15: a, c1h: b, ma: ma };
   state.candlesVote = pack; state.candlesVoteKey = key; state.candlesVoteTs = Date.now();
   return pack;
 }
@@ -2095,7 +2148,15 @@ async function refreshVote() {
       d1h: voteLast(s1h, ma1h, V),
     };
     state.vote = { s5: s5, s15: s15, s1h: s1h, r5: r5, r15: r15, r1h: r1h, trig: trig, cur: cur, V: V };
+    /* ★ 历史触发点落到 K 线标记 —— 这才是「不用守着屏幕」的关键：
+       过去 3.5 天里每一次三周期共振都画在图上，打开页面就能看到，而不是只显示当下的那一瞬。 */
+    state.voteTrig = trig.map(t => ({
+      time: s5.t[t.i], dir: t.dir, i: t.i, price: s5.o[t.i],
+      up5: t.up5, dn5: t.dn5, up15: t.up15, dn15: t.dn15, up1h: t.up1h, dn1h: t.dn1h,
+    }));
+    paintTriggers();
     paintVote(state.vote, '');
+    alertVote(state.vote);          // 新触发 → 横幅/声音/桌面通知/标题栏
   } catch (e) {
     paintVote(null, '计算失败：' + (e && e.message || e));
   } finally { voteBusy = false; }
@@ -2162,16 +2223,37 @@ function paintVote(vp, err) {
   const agoBars = tg ? (vp.s5.n - 1 - tg.i) : null;
   const fresh = tg && agoBars <= 3;
   const nowDir = st.voteTriple(dirOf(vp.cur.d1h), dirOf(vp.cur.d15), dirOf(vp.cur.d5));
+  const inst = instOf(state.current);
+  const dec = inst ? (inst.dec == null ? 2 : inst.dec) : 2;
+  const winDays = (vp.s5.n - 1) * 300 / 86400;          // 窗口覆盖天数（5m 口径）
+  const hhmm = t => {
+    const d = new Date(t * 1000);
+    return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} `
+      + `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  };
 
   /* 实时三周期是否同向 —— 注意这是 live 状态，可以提示，不等同于已触发 */
   const trioTxt = nowDir
     ? `<b class="${nowDir === 'long' ? 'up' : 'down'}">${nowDir === 'long' ? 'LONG 三周期同向' : 'SHORT 三周期同向'}</b>`
     : '<b class="flat">三周期未同向</b>';
+  /* ★ 常驻「距上次触发」：不看屏幕也能知道最近一次信号是什么时候、隔了多久 */
   const trigTxt = tg
     ? `最近触发 <b class="${tg.dir === 'long' ? 'up' : 'down'}">${tg.dir === 'long' ? '买入' : '卖出'}</b>
-        · ${new Date(vp.s5.t[tg.i] * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
-        · 距今 ${agoBars} 根 5m${fresh ? ' · <em class="hot">刚发生</em>' : ''}`
-    : '样本内无触发';
+        · ${hhmm(vp.s5.t[tg.i])} · 距今 ${agoBars} 根 5m（约 ${(agoBars * 5 / 60).toFixed(1)} 小时）
+        · 触发价 ${fmt(vp.s5.o[tg.i], dec)}${fresh ? ' · <em class="hot">刚发生</em>' : ''}`
+    : `最近 <b>${winDays.toFixed(1)} 天</b>（${vp.s5.n} 根 5m）窗口内无触发`;
+
+  /* 触发历史：回测里平均约每 10 小时一次，窗口拉到 3.5 天后通常能看到若干次。
+     直接列出来 + 点击跳到该根 K 线，比守着屏幕等有用得多。 */
+  const logRows = vp.trig.slice(-12).reverse().map(t => {
+    const ag = vp.s5.n - 1 - t.i;
+    return `<a class="vt-row ${t.dir === 'long' ? 'up' : 'down'}" data-t="${vp.s5.t[t.i]}" title="点击跳到该根 K 线">
+      <b>${t.dir === 'long' ? '▲ 买' : '▼ 卖'}</b>
+      <span>${hhmm(vp.s5.t[t.i])}</span>
+      <span>${fmt(vp.s5.o[t.i], dec)}</span>
+      <span>${t.up1h}多/${t.dn1h}空</span>
+      <span>${ag} 根前</span></a>`;
+  }).join('');
 
   box.innerHTML = `
     <div class="v-hd">
@@ -2181,11 +2263,22 @@ function paintVote(vp, err) {
         <label class="v-ctl">门槛
           <select id="voteMinV">${VOTE_MINV.map(o => `<option value="${o.v}"${mv === o.v ? ' selected' : ''}>${o.t}</option>`).join('')}</select>
         </label>
+        <span class="v-alerts">提醒
+          <label><input type="checkbox" id="alBanner"${alertOpt.banner ? ' checked' : ''}>横幅</label>
+          <label><input type="checkbox" id="alSound"${alertOpt.sound ? ' checked' : ''}>声音</label>
+          <label><input type="checkbox" id="alTitle"${alertOpt.title ? ' checked' : ''}>标题</label>
+          <button class="btn-xs" id="alNotify">${notifyLabel()}</button>
+        </span>
       </span>
     </div>
     <div class="v-verdict ${nowDir ? 'on' : 'off'}">
       <span class="v-v-now">${trioTxt}</span>
       <span class="v-v-trig">${trigTxt}</span>
+    </div>
+    <div class="v-log">
+      <div class="v-log-hd">窗口内触发 <b>${vp.trig.length}</b> 次 · 覆盖最近 ${winDays.toFixed(1)} 天 ·
+        <em>点击任一行跳到该根 K 线，或在图上点「全景」一次看全</em></div>
+      ${logRows || '<div class="v-log-empty">窗口内没有触发 —— 这是常见状态，不是故障。历史统计平均约每 10 小时一次，横盘时会连续几天没有。</div>'}
     </div>
     <table class="v-table">
       <thead><tr><th class="v-name">指标</th><th>1H</th><th>15m</th><th>5m</th></tr></thead>
@@ -2214,6 +2307,16 @@ function bindVoteCtrl() {
       refreshVote();
     });
   }
+  /* 触发历史列表：点一行 → 图表移到那一根 */
+  const box = $('#votePanel');
+  if (box) {
+    Array.prototype.forEach.call(box.querySelectorAll('.vt-row'), el => {
+      if (el._b) return;
+      el._b = 1;
+      el.addEventListener('click', () => jumpToTime(+el.getAttribute('data-t')));
+    });
+  }
+  bindAlertCtrl();
 }
 
 /* 把触发点画成 K 线上的标记（同一根 K 线多次触发只保留最后一次） */
@@ -2225,8 +2328,10 @@ function paintTriggers() {
   const bars = state.candles[state.current + '_' + state.tf] || [];
   if (!bars.length) return;
   const t0 = bars[0].time, t1 = bars[bars.length - 1].time;
+  /* 优先画九票投票的触发点（现行口径）；拿不到才回退到旧的市场结构触发点 */
+  const src = (state.voteTrig && state.voteTrig.length) ? state.voteTrig : (state.triggers || []);
   const seen = new Map();
-  (state.triggers || []).forEach(t => {
+  src.forEach(t => {
     const tt = st.alignTime(t.time, state.tf);
     if (tt < t0 || tt > t1) return;
     seen.set(tt, t.dir);
@@ -2266,6 +2371,166 @@ function alertResonance(c5) {
   let msg = (isLong ? '🟢 买入信号' : '🔴 卖出信号') + ` · ${inst.short}：1h 定方向，15m 共振，5m 市场结构触发（${state.msMode === 'loose' ? '宽松·核心≥2' : '严格·CHOCH+回踩+BOS'}）` + sc;
   if (side) msg += ` · 参考止损 ${fmt(side.stop, inst.dec)} / 止盈一 ${fmt(side.tp1, inst.dec)} / 止盈二 ${fmt(side.tp2, inst.dec)}`;
   toast(msg);
+}
+
+/* ============================================================
+   信号提醒（2026-09-30）
+   ------------------------------------------------------------
+   信号只在「三周期刚凑齐的那一根」出现一次，页面又是静默刷新 ——
+   只要不盯着屏幕就一定错过。这里把四个可感知通道都接上：
+   横幅 / 声音 / 桌面通知 / 标题栏，并把「距上次触发多久」做成常驻。
+   ============================================================ */
+const ALERT_KEY = 'simtrader_alert_v1';
+const ALERT_SEEN_KEY = 'simtrader_vote_alerted_v1';
+const alertOpt = (function () {
+  const d = { banner: true, sound: true, title: true, notify: false };
+  try {
+    const s = JSON.parse(localStorage.getItem(ALERT_KEY) || '{}');
+    Object.keys(d).forEach(k => { if (typeof s[k] === 'boolean') d[k] = s[k]; });
+  } catch (e) {}
+  return d;
+})();
+function saveAlertOpt() { try { localStorage.setItem(ALERT_KEY, JSON.stringify(alertOpt)); } catch (e) {} }
+
+let _audioCtx = null;
+function audioCtx() {
+  try {
+    if (!_audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      _audioCtx = new AC();
+    }
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+    return _audioCtx;
+  } catch (e) { return null; }
+}
+/* 浏览器的自动播放策略要求先有用户交互，任意一次点击/按键后解锁音频 */
+function unlockAudio() { const ac = audioCtx(); if (ac && ac.state === 'suspended') ac.resume(); }
+
+/* 多 = 上行三音，空 = 下行三音。用振荡器合成，不依赖任何外部音频文件。 */
+function beepSignal(isLong) {
+  const ac = audioCtx();
+  if (!ac) return;
+  const t0 = ac.currentTime;
+  const seq = isLong ? [660, 880, 1180] : [1180, 880, 660];
+  seq.forEach((f, k) => {
+    try {
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      const ts = t0 + k * 0.14;
+      g.gain.setValueAtTime(0.0001, ts);
+      g.gain.linearRampToValueAtTime(0.16, ts + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ts + 0.16);
+      o.connect(g); g.connect(ac.destination);
+      o.start(ts); o.stop(ts + 0.18);
+    } catch (e) {}
+  });
+}
+
+const DOC_TITLE = document.title;
+let titleTimer = 0;
+function flashTitle(txt, ms) {
+  if (!alertOpt.title) return;
+  document.title = txt;
+  clearTimeout(titleTimer);
+  titleTimer = setTimeout(() => { document.title = DOC_TITLE; }, ms || 60000);
+}
+
+function closeSignalAlert() { const b = $('#sigAlert'); if (b) { b.hidden = true; b.innerHTML = ''; } }
+function showSignalAlert(inst, t, dec) {
+  const box = $('#sigAlert');
+  if (!box) return;
+  const isLong = t.dir === 'long';
+  const d = new Date(t.time * 1000);
+  const hh = String(d.getHours()).padStart(2, '0'), mm = String(d.getMinutes()).padStart(2, '0');
+  box.hidden = false;
+  box.className = 'sig-alert ' + (isLong ? 'up' : 'down');
+  box.innerHTML =
+    `<span class="sa-ico">${isLong ? '▲' : '▼'}</span>` +
+    `<span class="sa-txt"><b>${isLong ? '买入信号' : '卖出信号'}</b> · ${inst.short || inst.id} · ${hh}:${mm}` +
+    ` · 触发价 ${fmt(t.price, dec)}` +
+    `<em>1h ${t.up1h}多/${t.dn1h}空 · 15m ${t.up15}多/${t.dn15}空 · 5m ${t.up5}多/${t.dn5}空</em></span>` +
+    `<button class="sa-btn" id="saJump">看K线</button>` +
+    `<button class="sa-btn sa-x" id="saClose">知道了</button>`;
+  const j = $('#saJump'), c = $('#saClose');
+  if (j) j.onclick = () => { jumpToTime(t.time); closeSignalAlert(); };
+  if (c) c.onclick = closeSignalAlert;
+}
+
+function notifySignal(inst, isLong, t) {
+  try {
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    const dt = new Date(t.time * 1000);
+    const n = new Notification((isLong ? '买入信号 · ' : '卖出信号 · ') + (inst.short || inst.id), {
+      body: `${dt.getMonth() + 1}月${dt.getDate()}日 ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`
+        + ` · 1h ${t.up1h}多/${t.dn1h}空 · 15m ${t.up15}多/${t.dn15}空 · 5m ${t.up5}多/${t.dn5}空`,
+      tag: 'simtrader-vote-' + t.time,
+    });
+    setTimeout(() => { try { n.close(); } catch (e) {} }, 20000);
+  } catch (e) {}
+}
+function notifyLabel() {
+  if (typeof Notification === 'undefined') return '桌面通知（不支持）';
+  if (Notification.permission === 'granted') return '桌面通知 ✓';
+  if (Notification.permission === 'denied') return '桌面通知（已拒绝）';
+  return '开启桌面通知';
+}
+
+/* 九票投票产生的新触发 → 提醒。只对「刚发生」的触发提醒（≤3 根），
+   更早的历史触发留在 K 线标记与触发列表里，不打扰。 */
+function alertVote(vp) {
+  if (!vp || !vp.trig || !vp.trig.length) return;
+  const tg = vp.trig[vp.trig.length - 1];
+  const agoBars = vp.s5.n - 1 - tg.i;
+  if (agoBars > 3) return;
+  const inst = instOf(state.current);
+  if (!inst) return;
+  /* 用 localStorage 记住报过哪一次 —— 刷新页面不会把同一个信号再报一遍 */
+  const key = state.current + '|' + vp.s5.t[tg.i] + '|' + tg.dir;
+  let seen = '';
+  try { seen = localStorage.getItem(ALERT_SEEN_KEY) || ''; } catch (e) {}
+  if (seen === key) return;
+  try { localStorage.setItem(ALERT_SEEN_KEY, key); } catch (e) {}
+
+  const isLong = tg.dir === 'long';
+  const item = {
+    time: vp.s5.t[tg.i], dir: tg.dir, price: vp.s5.o[tg.i],
+    up5: tg.up5, dn5: tg.dn5, up15: tg.up15, dn15: tg.dn15, up1h: tg.up1h, dn1h: tg.dn1h,
+  };
+  const dec = inst.dec == null ? 2 : inst.dec;
+  if (alertOpt.banner) showSignalAlert(inst, item, dec);
+  else toast((isLong ? '🟢 买入信号' : '🔴 卖出信号') + ` · ${inst.short || inst.id} · 三周期共振`);
+  if (alertOpt.sound) beepSignal(isLong);
+  if (alertOpt.title) flashTitle((isLong ? '🔔 买入 ' : '🔔 卖出 ') + (inst.short || inst.id) + ' · SimTrader');
+  if (alertOpt.notify) notifySignal(inst, isLong, item);
+}
+
+function bindAlertCtrl() {
+  const map = { alBanner: 'banner', alSound: 'sound', alTitle: 'title' };
+  Object.keys(map).forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.checked = !!alertOpt[map[id]];
+    if (el._b) return;
+    el._b = 1;
+    el.addEventListener('change', () => { alertOpt[map[id]] = el.checked; saveAlertOpt(); });
+  });
+  const nb = document.getElementById('alNotify');
+  if (nb && !nb._b) {
+    nb._b = 1;
+    nb.addEventListener('click', () => {
+      try {
+        if (typeof Notification === 'undefined') { toast('当前浏览器不支持桌面通知'); return; }
+        if (Notification.permission === 'denied') { toast('桌面通知已被浏览器拒绝，需在站点设置里放行'); return; }
+        Notification.requestPermission().then(p => {
+          alertOpt.notify = (p === 'granted');
+          saveAlertOpt();
+          nb.textContent = notifyLabel();
+          toast(p === 'granted' ? '桌面通知已开启' : '未授权桌面通知');
+        });
+      } catch (e) { toast('桌面通知不可用'); }
+    });
+  }
 }
 
 /* ---------- 开单逻辑回测 ---------- */
@@ -3340,18 +3605,21 @@ async function runBacktest() {
 
 const TF_CACHE_TTL = 60000;
 
-async function ensureCandles(inst, tf, force) {
+async function ensureCandles(inst, tf, force, limit) {
   const key = inst.id + '_' + tf;
   const tsMap = state.cacheTs;
   const cached = state.candles[key];
-  if (!force && cached && tsMap[key] && Date.now() - tsMap[key] < TF_CACHE_TTL) return cached;
+  const need = limit || barsForTf(tf);
+  /* 缓存里根数不够也要重拉 —— 否则从离线快照恢复了 200 根就再也拿不到 1000 根 */
+  if (!force && cached && tsMap[key] && Date.now() - tsMap[key] < TF_CACHE_TTL
+    && cached.length >= Math.min(need, 300)) return cached;
   let c;
   try {
     if (inst.type === 'ust') { c = await fetchUstKlines(inst, tf); if (c.length > 300) c = c.slice(-300); }
-    else c = await fetchKlines(inst.sym, tf, 200);
+    else c = await fetchKlines(inst.sym, tf, need);
     if (!c || !c.length) throw new NetError('K线为空', 'empty');
     state.candles[key] = c; tsMap[key] = Date.now();
-    snapSave('k:' + key, slimCandles(c));       // 成功即落盘，供断网时回显
+    snapSave('k:' + key, slimCandles(c.slice(-300)));   // 快照只留 300 根：够离线回显，也不撑爆 localStorage
     dataSrc.degraded = false; dataSrc.staleTs = 0;
     return c;
   } catch (e) {

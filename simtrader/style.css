@@ -359,6 +359,62 @@ button { font-family: inherit; }
 .v-note { font-size: 9px; color: var(--muted-2); line-height: 1.65; margin-top: 7px; }
 .v-note b { color: var(--muted); font-weight: 600; }
 
+/* 提醒开关（横幅 / 声音 / 标题 / 桌面通知） */
+.v-alerts { margin-left: 8px; display: inline-flex; align-items: center; gap: 6px; }
+.v-alerts label { display: inline-flex; align-items: center; gap: 2px; cursor: pointer; }
+.v-alerts input { margin: 0; width: 11px; height: 11px; cursor: pointer; }
+
+/* 触发历史：窗口内每一次三周期共振，点击跳到该根 K 线 */
+.v-log {
+  margin-bottom: 9px; padding: 6px 8px;
+  border: 1px solid var(--line-soft); border-radius: var(--r-sm); background: #fbfcfd;
+}
+.v-log-hd { font-size: 9px; color: var(--muted-2); margin-bottom: 5px; }
+.v-log-hd b { color: var(--text); font-weight: 700; }
+.v-log-hd em { font-style: normal; color: var(--accent); }
+.v-log-empty { font-size: 10px; color: var(--muted-2); line-height: 1.6; padding: 2px 0; }
+.vt-row {
+  display: grid; grid-template-columns: 46px 74px 1fr 62px 54px;
+  gap: 6px; align-items: center;
+  padding: 3px 5px; border-radius: 4px; cursor: pointer;
+  font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums;
+  text-decoration: none; border-bottom: 1px solid var(--line-soft);
+}
+.vt-row:last-child { border-bottom: none; }
+.vt-row:hover { background: #f1f5f9; }
+.vt-row b { font-weight: 700; font-size: 10px; }
+.vt-row.up b { color: var(--up); }
+.vt-row.down b { color: var(--down); }
+.vt-row span:nth-child(5) { color: var(--muted-2); font-size: 9px; text-align: right; }
+
+/* ---------- 新信号提醒横幅 ----------
+   信号只在「刚凑齐那一根」出现一次，页面又是静默刷新，必须给一个不可能被忽略的提示 */
+.sig-alert {
+  position: fixed; left: 50%; top: 14px; transform: translateX(-50%);
+  z-index: 3000; display: flex; align-items: center; gap: 12px;
+  max-width: 92vw; padding: 10px 14px;
+  border-radius: 10px; border: 1px solid var(--up-line);
+  background: var(--up-soft); color: var(--text);
+  box-shadow: 0 6px 24px rgba(15, 23, 42, .18);
+  animation: sa-in .28s ease-out;
+}
+.sig-alert[hidden] { display: none; }
+.sig-alert.down { border-color: var(--down-line); background: var(--down-soft); }
+.sig-alert .sa-ico { font-size: 18px; font-weight: 700; color: var(--up); }
+.sig-alert.down .sa-ico { color: var(--down); }
+.sig-alert .sa-txt { font-size: 12px; line-height: 1.5; }
+.sig-alert .sa-txt b { font-size: 13px; font-weight: 700; color: var(--up); }
+.sig-alert.down .sa-txt b { color: var(--down); }
+.sig-alert .sa-txt em { display: block; font-style: normal; font-size: 10px; color: var(--muted-2); margin-top: 2px; }
+.sig-alert .sa-btn {
+  padding: 4px 10px; font-size: 11px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--accent); background: #fff; color: var(--accent); white-space: nowrap;
+}
+.sig-alert .sa-btn:hover { background: var(--accent); color: #fff; }
+.sig-alert .sa-x { border-color: var(--line); color: var(--muted-2); }
+.sig-alert .sa-x:hover { background: var(--line); color: var(--text); }
+@keyframes sa-in { from { opacity: 0; transform: translateX(-50%) translateY(-14px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+
 .ind-panel { margin-top: 12px; }
 .ind-empty { font-size: 11px; color: var(--muted-2); padding: 6px 0; }
 .ind-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 7px; }
